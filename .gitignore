@@ -1,0 +1,35 @@
+# ---- Rust / Cargo ----
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---- 构建产物 ----
+*.dmg
+*.app
+*.exe
+*.o
+*.so
+*.dylib
+
+# ---- 运行时日志与数据 ----
+/logs/
+*.sqlite3
+*.sqlite3-journal
+*.jsonl
+
+# ---- 配置文件（含敏感信息，请勿提交真实密钥）----
+# 如需共享配置示例，请使用 config.example.yaml
+config.yaml
+config.local.yaml
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- 环境变量 ----
+.env
+.env.*
