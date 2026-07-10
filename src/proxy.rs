@@ -8,13 +8,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bytes::Bytes;
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
+use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -23,7 +26,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -32,6 +36,18 @@ struct AppState {
     config: Arc<AppConfig>,
     client: Client,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TokenUsage {
+    input: i64,
+    output: i64,
+}
+
+struct ProviderResult {
+    response: Response,
+    upstream_model: String,
+    usage: TokenUsage,
 }
 
 #[derive(Debug)]
@@ -204,23 +220,38 @@ async fn responses(
         let mut upstream_body = with_model(body.clone(), &request_model);
         apply_model_mapping(&provider, &mut upstream_body);
 
-        let force_chat = provider.responses_mode == "chat" || provider.provider_type == "anthropic";
+        let force_chat = provider.responses_mode == "chat"
+            || provider.provider_type == "anthropic"
+            || matches!(provider.capabilities.get("supports_responses"), Some(false));
         if force_chat {
             match forward_responses_as_chat(&state, &provider, &headers, upstream_body, stream)
                 .await
             {
-                Ok(resp) => {
-                    log_usage(
+                Ok(result) => {
+                    log_success(
+                        &state.config,
+                        "responses",
+                        &provider.name,
+                        &model,
+                        &result.upstream_model,
+                        result.usage,
+                        started,
+                        stream,
+                    );
+                    return Ok(result.response);
+                }
+                Err(err) => {
+                    let message = err.message;
+                    log_error(
                         &state.config,
                         "responses",
                         &provider.name,
                         &request_model,
                         started,
-                        None,
+                        &message,
                     );
-                    return Ok(resp);
+                    last_error = Some(message);
                 }
-                Err(err) => last_error = Some(err.message),
             }
             continue;
         }
@@ -235,16 +266,18 @@ async fn responses(
         )
         .await
         {
-            Ok(resp) => {
-                log_usage(
+            Ok(result) => {
+                log_success(
                     &state.config,
                     "responses",
                     &provider.name,
-                    &request_model,
+                    &model,
+                    &result.upstream_model,
+                    result.usage,
                     started,
-                    None,
+                    stream,
                 );
-                return Ok(resp);
+                return Ok(result.response);
             }
             Err(err)
                 if provider.responses_mode == "auto"
@@ -255,25 +288,51 @@ async fn responses(
                 match forward_responses_as_chat(&state, &provider, &headers, chat_body, stream)
                     .await
                 {
-                    Ok(resp) => {
-                        log_usage(
+                    Ok(result) => {
+                        log_success(
+                            &state.config,
+                            "responses",
+                            &provider.name,
+                            &model,
+                            &result.upstream_model,
+                            result.usage,
+                            started,
+                            stream,
+                        );
+                        return Ok(result.response);
+                    }
+                    Err(chat_err) => {
+                        let message = chat_err.message;
+                        log_error(
                             &state.config,
                             "responses",
                             &provider.name,
                             &request_model,
                             started,
-                            None,
+                            &message,
                         );
-                        return Ok(resp);
+                        last_error = Some(message);
                     }
-                    Err(chat_err) => last_error = Some(chat_err.message),
                 }
             }
             Err(err) => {
-                if !retryable_status(err.status) {
-                    return Err(err);
+                let retryable = retryable_status(err.status);
+                let status = err.status;
+                let message = err.message;
+                log_error(
+                    &state.config,
+                    "responses",
+                    &provider.name,
+                    &request_model,
+                    started,
+                    &message,
+                );
+                if !retryable {
+                    return Err(ProxyError::new(status, message));
                 }
-                last_error = Some(err.message);
+                if retryable {
+                    last_error = Some(message);
+                }
             }
         }
     }
@@ -313,22 +372,35 @@ async fn forward_openai(
         )
         .await
         {
-            Ok(resp) => {
-                log_usage(
+            Ok(result) => {
+                log_success(
+                    &state.config,
+                    api,
+                    &provider.name,
+                    &model,
+                    &result.upstream_model,
+                    result.usage,
+                    started,
+                    stream,
+                );
+                return Ok(result.response);
+            }
+            Err(err) => {
+                let retryable = retryable_status(err.status);
+                let status = err.status;
+                let message = err.message;
+                log_error(
                     &state.config,
                     api,
                     &provider.name,
                     &request_model,
                     started,
-                    None,
+                    &message,
                 );
-                return Ok(resp);
-            }
-            Err(err) => {
-                if !retryable_status(err.status) {
-                    return Err(err);
+                if !retryable {
+                    return Err(ProxyError::new(status, message));
                 }
-                last_error = Some(err.message);
+                last_error = Some(message);
             }
         }
     }
@@ -345,16 +417,20 @@ async fn forward_responses_as_chat(
     headers: &HeaderMap,
     body: Value,
     stream: bool,
-) -> Result<Response, ProxyError> {
+) -> Result<ProviderResult, ProxyError> {
     let chat_body = responses_to_chat_body(&body)?;
     if stream {
-        return send_to_provider(
+        let request_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return send_chat_stream_as_responses(
             &state.client,
             provider,
-            "/chat/completions",
             headers,
             chat_body,
-            true,
+            request_model,
         )
         .await;
     }
@@ -373,7 +449,347 @@ async fn forward_responses_as_chat(
             .and_then(Value::as_str)
             .unwrap_or_default(),
     );
-    Ok((StatusCode::OK, Json(wrapped)).into_response())
+    let upstream_model = response_model(&wrapped).unwrap_or_else(|| {
+        body.get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
+    let usage = extract_token_usage(&wrapped);
+    Ok(ProviderResult {
+        response: (StatusCode::OK, Json(wrapped)).into_response(),
+        upstream_model,
+        usage,
+    })
+}
+
+async fn send_chat_stream_as_responses(
+    client: &Client,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    body: Value,
+    request_model: String,
+) -> Result<ProviderResult, ProxyError> {
+    let url = upstream_url(provider, "/chat/completions");
+    let req = client
+        .post(url)
+        .timeout(Duration::from_secs(provider.timeout.max(1)))
+        .headers(upstream_headers(provider, request_headers, true))
+        .json(&body);
+
+    for attempt in 0..=provider.max_retries {
+        match req.try_clone().unwrap().send().await {
+            Ok(resp) if resp.status().is_success() => {
+                return chat_stream_to_responses(resp, request_model);
+            }
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let text = resp.text().await.unwrap_or_default();
+                if attempt < provider.max_retries && retryable_status(status) {
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(ProxyError::new(status, truncate(&text)));
+            }
+            Err(err) if attempt < provider.max_retries => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                if err.is_timeout() || err.is_connect() || err.is_request() {
+                    continue;
+                }
+                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()));
+            }
+            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string())),
+        }
+    }
+    Err(ProxyError::new(StatusCode::BAD_GATEWAY, "上游请求失败"))
+}
+
+fn chat_stream_to_responses(
+    resp: reqwest::Response,
+    request_model: String,
+) -> Result<ProviderResult, ProxyError> {
+    let model = if request_model.is_empty() {
+        "unknown".to_string()
+    } else {
+        request_model
+    };
+    let result_model = model.clone();
+    let stream_model = model.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let response_id = format!("resp-{}", Uuid::new_v4().simple());
+        let item_id = format!("msg-{}", Uuid::new_v4().simple());
+        let created_at = chrono::Utc::now().timestamp();
+        let model = stream_model;
+        let _ = send_response_sse(
+            &tx,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": created_at,
+                    "status": "in_progress",
+                    "model": model,
+                    "output": []
+                }
+            }),
+        )
+        .await;
+        let _ = send_response_sse(
+            &tx,
+            "response.in_progress",
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": created_at,
+                    "status": "in_progress",
+                    "model": model,
+                    "output": []
+                }
+            }),
+        )
+        .await;
+        let _ = send_response_sse(
+            &tx,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        )
+        .await;
+        let _ = send_response_sse(
+            &tx,
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+        )
+        .await;
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut full_text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some((event, consumed)) = next_sse_event(&buffer) {
+                        buffer.drain(..consumed);
+                        let Some(data) = sse_data(&event) else {
+                            continue;
+                        };
+                        if data.trim() == "[DONE]" {
+                            send_response_stream_done(
+                                &tx,
+                                &response_id,
+                                &item_id,
+                                &model,
+                                created_at,
+                                &full_text,
+                            )
+                            .await;
+                            return;
+                        }
+                        if let Some(delta) = chat_stream_delta(&data) {
+                            full_text.push_str(&delta);
+                            let _ = send_response_sse(
+                                &tx,
+                                "response.output_text.delta",
+                                json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": delta
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = send_response_sse(
+                        &tx,
+                        "response.failed",
+                        json!({
+                            "type": "response.failed",
+                            "response": {
+                                "id": response_id,
+                                "status": "failed",
+                                "model": model,
+                                "error": {"message": err.to_string()}
+                            }
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        send_response_stream_done(&tx, &response_id, &item_id, &model, created_at, &full_text)
+            .await;
+    });
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .map_err(|err| ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    Ok(ProviderResult {
+        response,
+        upstream_model: result_model,
+        usage: TokenUsage::default(),
+    })
+}
+
+async fn send_response_stream_done(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    response_id: &str,
+    item_id: &str,
+    model: &str,
+    created_at: i64,
+    full_text: &str,
+) {
+    let _ = send_response_sse(
+        tx,
+        "response.output_text.done",
+        json!({
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": full_text
+        }),
+    )
+    .await;
+    let _ = send_response_sse(
+        tx,
+        "response.content_part.done",
+        json!({
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": full_text}
+        }),
+    )
+    .await;
+    let _ = send_response_sse(
+        tx,
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": full_text}]
+            }
+        }),
+    )
+    .await;
+    let _ = send_response_sse(
+        tx,
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "completed",
+                "model": model,
+                "output": [{
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": full_text}]
+                }],
+                "output_text": full_text
+            }
+        }),
+    )
+    .await;
+    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+}
+
+async fn send_response_sse(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    event: &str,
+    data: Value,
+) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    tx.send(Ok(Bytes::from(format!("event: {event}\ndata: {data}\n\n"))))
+        .await
+}
+
+fn next_sse_event(buffer: &str) -> Option<(String, usize)> {
+    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+    let (idx, sep_len) = match (lf, crlf) {
+        (Some(left), Some(right)) => {
+            if left.0 <= right.0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => return None,
+    };
+    Some((buffer[..idx].to_string(), idx + sep_len))
+}
+
+fn sse_data(event: &str) -> Option<String> {
+    let data = event
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        None
+    } else {
+        Some(data)
+    }
+}
+
+fn chat_stream_delta(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .or_else(|| choice.get("text"))
+        })
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn send_to_provider(
@@ -383,8 +799,13 @@ async fn send_to_provider(
     request_headers: &HeaderMap,
     body: Value,
     stream: bool,
-) -> Result<Response, ProxyError> {
+) -> Result<ProviderResult, ProxyError> {
     if stream {
+        let upstream_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let url = upstream_url(provider, path);
         let req = client
             .post(url)
@@ -401,7 +822,11 @@ async fn send_to_provider(
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .body(Body::from_stream(resp.bytes_stream()))
                         .map_err(|e| ProxyError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    return Ok(response);
+                    return Ok(ProviderResult {
+                        response,
+                        upstream_model,
+                        usage: TokenUsage::default(),
+                    });
                 }
                 Ok(resp) => {
                     let status = StatusCode::from_u16(resp.status().as_u16())
@@ -426,8 +851,19 @@ async fn send_to_provider(
         unreachable!();
     }
 
+    let request_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let value = send_json_to_provider(client, provider, path, request_headers, body).await?;
-    Ok((StatusCode::OK, Json(value)).into_response())
+    let upstream_model = response_model(&value).unwrap_or(request_model);
+    let usage = extract_token_usage(&value);
+    Ok(ProviderResult {
+        response: (StatusCode::OK, Json(value)).into_response(),
+        upstream_model,
+        usage,
+    })
 }
 
 async fn send_json_to_provider(
@@ -709,7 +1145,7 @@ fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| {
+            .map(|item| {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let content = match item.get("content") {
                     Some(Value::String(text)) => Value::String(text.clone()),
@@ -727,7 +1163,7 @@ fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                     }
                     _ => Value::String(String::new()),
                 };
-                Some(json!({"role": role, "content": content}))
+                json!({"role": role, "content": content})
             })
             .collect(),
         _ => vec![json!({"role": "user", "content": ""})],
@@ -763,6 +1199,32 @@ fn chat_to_response(chat: Value, request_model: &str) -> Value {
         "output_text": text,
         "usage": chat.get("usage").cloned().unwrap_or(Value::Null)
     })
+}
+
+fn response_model(value: &Value) -> Option<String> {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_token_usage(value: &Value) -> TokenUsage {
+    let Some(usage) = value.get("usage") else {
+        return TokenUsage::default();
+    };
+    TokenUsage {
+        input: usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        output: usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    }
 }
 
 fn upstream_url(provider: &ProviderConfig, path: &str) -> String {
@@ -874,21 +1336,108 @@ fn display_host(host: &str) -> &str {
     }
 }
 
-fn log_usage(
+struct UsageLogEvent<'a> {
+    api: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    upstream_model: &'a str,
+    status: &'a str,
+    error: Option<&'a str>,
+    usage: TokenUsage,
+    token_source: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_success(
+    config: &AppConfig,
+    api: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    usage: TokenUsage,
+    started: Instant,
+    stream: bool,
+) {
+    log_usage(
+        config,
+        started,
+        UsageLogEvent {
+            api,
+            provider,
+            model,
+            upstream_model,
+            status: if stream { "stream_started" } else { "ok" },
+            error: None,
+            usage,
+            token_source: None,
+        },
+    );
+}
+
+fn log_error(
     config: &AppConfig,
     api: &str,
     provider: &str,
     model: &str,
     started: Instant,
-    token_source: Option<&str>,
+    error: &str,
 ) {
+    log_usage(
+        config,
+        started,
+        UsageLogEvent {
+            api,
+            provider,
+            model,
+            upstream_model: "",
+            status: "error",
+            error: Some(error),
+            usage: TokenUsage::default(),
+            token_source: None,
+        },
+    );
+}
+
+fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
+    let ts = chrono::Local::now()
+        .format("%Y年%m月%d日 %H:%M:%S")
+        .to_string();
+    let latency_ms = started.elapsed().as_millis() as i64;
+    let error = event.error.unwrap_or("");
+    let token_source = event.token_source.unwrap_or("upstream_or_unknown");
+
+    if config.usage_log.backend.eq_ignore_ascii_case("sqlite")
+        && log_usage_sqlite(
+            &config.usage_log.sqlite_path,
+            &ts,
+            event.api,
+            event.status,
+            event.provider,
+            event.model,
+            event.upstream_model,
+            latency_ms,
+            error,
+            event.usage.input,
+            event.usage.output,
+            token_source,
+        )
+        .is_ok()
+    {
+        return;
+    }
+
     let record = json!({
-        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string(),
-        "api": api,
-        "channel": provider,
-        "request_model": model,
-        "latency_ms": started.elapsed().as_millis(),
-        "token_source": token_source.unwrap_or("upstream_or_unknown"),
+        "ts": ts,
+        "api": event.api,
+        "status": event.status,
+        "channel": event.provider,
+        "request_model": event.model,
+        "upstream_model": event.upstream_model,
+        "latency_ms": latency_ms,
+        "input_tokens": event.usage.input,
+        "output_tokens": event.usage.output,
+        "error": error,
+        "token_source": token_source,
     });
     let path = PathBuf::from(&config.usage_log.path);
     if let Some(parent) = path.parent() {
@@ -897,6 +1446,97 @@ fn log_usage(
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{}", record);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_usage_sqlite(
+    path: &str,
+    ts: &str,
+    api: &str,
+    status: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    latency_ms: i64,
+    error: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    token_source: &str,
+) -> rusqlite::Result<()> {
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let conn = Connection::open(path)?;
+    ensure_usage_log_schema(&conn)?;
+    conn.execute(
+        r#"
+        INSERT INTO usage_logs
+            (
+                ts, api, status, channel, request_model, upstream_model,
+                latency_ms, input_tokens, output_tokens, error, token_source
+            )
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+        params![
+            ts,
+            api,
+            status,
+            provider,
+            model,
+            upstream_model,
+            latency_ms,
+            input_tokens,
+            output_tokens,
+            error,
+            token_source
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            api TEXT NOT NULL,
+            status TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            request_model TEXT NOT NULL,
+            upstream_model TEXT NOT NULL DEFAULT '',
+            latency_ms INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown'
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_ts ON usage_logs(ts);
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(status);
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_channel ON usage_logs(channel);
+        "#,
+    )?;
+    ensure_column(conn, "upstream_model", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, name: &str, definition: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(usage_logs)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == name {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE usage_logs ADD COLUMN {name} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 pub fn validate_config(config: &AppConfig) -> Result<()> {

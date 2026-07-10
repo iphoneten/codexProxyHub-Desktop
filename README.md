@@ -23,7 +23,7 @@ Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的
 - 按模型匹配、优先级、权重和模型 fallback 选择 provider。
 - 上游 429、5xx、网络错误时重试和故障转移。
 - `/v1/responses` 对 `responses_mode: chat` 或上游不支持 Responses API 的情况做基础 Chat Completions 兼容包装。
-- JSONL 用量日志。
+- SQLite 用量日志（`usage_log.backend: sqlite`），并保留 JSONL 兼容写入模式。
 
 ## 启动
 
@@ -71,6 +71,18 @@ dist/recodexProxyHub.dmg
 ```text
 http://127.0.0.1:8000/v1
 ```
+
+## 日志
+
+默认配置使用 SQLite 保存请求日志：
+
+```yaml
+usage_log:
+  backend: sqlite
+  sqlite_path: logs/proxy_usage.sqlite3
+```
+
+桌面端“日志”页会按当前 backend 读取最近 200 条请求记录。若将 `backend` 改为其他值，则使用 `usage_log.path` 写入/读取 JSONL。
 
 Codex 示例：
 

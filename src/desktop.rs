@@ -4,7 +4,8 @@ use crate::{
 };
 use eframe::egui;
 use parking_lot::Mutex;
-use std::{path::PathBuf, sync::Arc};
+use rusqlite::Connection;
+use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
 pub struct HubApp {
@@ -15,7 +16,10 @@ pub struct HubApp {
     message: String,
     runtime: Option<Runtime>,
     server: Arc<Mutex<ServerHandle>>,
-    new_key: String,
+    new_key_name: String,
+    provider_mapping_drafts: Vec<TextDraft>,
+    provider_header_drafts: Vec<TextDraft>,
+    log_view: LogViewState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,7 @@ enum AppView {
     Providers,
     Auth,
     Routing,
+    Logs,
 }
 
 #[derive(Default)]
@@ -32,6 +37,21 @@ struct ServerHandle {
     endpoint: String,
     shutdown: Option<oneshot::Sender<()>>,
     last_error: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct TextDraft {
+    text: String,
+    source: String,
+}
+
+#[derive(Default)]
+struct LogViewState {
+    rows: Vec<LogRow>,
+    loaded_path: String,
+    page: usize,
+    total: usize,
+    last_refresh: Option<Instant>,
 }
 
 impl HubApp {
@@ -47,7 +67,10 @@ impl HubApp {
             message: String::new(),
             runtime,
             server: Arc::new(Mutex::new(ServerHandle::default())),
-            new_key: String::new(),
+            new_key_name: String::new(),
+            provider_mapping_drafts: Vec::new(),
+            provider_header_drafts: Vec::new(),
+            log_view: LogViewState::default(),
         };
         app.load_config();
         app
@@ -58,10 +81,16 @@ impl HubApp {
             Ok(config) => {
                 self.config = Some(config);
                 self.selected_provider = Some(0);
+                self.provider_mapping_drafts.clear();
+                self.provider_header_drafts.clear();
+                self.log_view = LogViewState::default();
                 self.message = "配置已加载".to_string();
             }
             Err(err) => {
                 self.config = None;
+                self.provider_mapping_drafts.clear();
+                self.provider_header_drafts.clear();
+                self.log_view = LogViewState::default();
                 self.message = err.to_string();
             }
         }
@@ -184,16 +213,19 @@ impl eframe::App for HubApp {
                                         &mut self.view,
                                     );
                                 }
-                                AppView::Providers => {
-                                    provider_section(
-                                        ui,
-                                        config,
-                                        &mut self.selected_provider,
-                                        &mut self.message,
-                                    )
-                                }
-                                AppView::Auth => auth_section(ui, config, &mut self.new_key),
+                                AppView::Providers => provider_section(
+                                    ui,
+                                    config,
+                                    &mut self.selected_provider,
+                                    &mut self.message,
+                                    &mut self.provider_mapping_drafts,
+                                    &mut self.provider_header_drafts,
+                                ),
+                                AppView::Auth => auth_section(ui, config, &mut self.new_key_name),
                                 AppView::Routing => routing_section(ui, config),
+                                AppView::Logs => {
+                                    logs_section(ui, config, &mut self.log_view, &mut self.message)
+                                }
                             }
                         });
                 });
@@ -280,6 +312,7 @@ fn side_navigation(ui: &mut egui::Ui, app: &mut HubApp) {
             nav_item(ui, &mut next_view, AppView::Providers, "渠道");
             nav_item(ui, &mut next_view, AppView::Auth, "鉴权");
             nav_item(ui, &mut next_view, AppView::Routing, "路由");
+            nav_item(ui, &mut next_view, AppView::Logs, "日志");
             ui.add_space(18.0);
             ui.separator();
             ui.add_space(10.0);
@@ -683,23 +716,43 @@ fn border() -> egui::Color32 {
     egui::Color32::from_rgb(226, 232, 240)
 }
 
-fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key: &mut String) {
+/// 生成随机 API Key，格式与既有配置保持一致：`sk-proxy-` + 32 位小写字母数字。
+fn generate_api_key() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..32)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect();
+    format!("sk-proxy-{}", suffix)
+}
+
+fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut String) {
     section(ui, "鉴权", |ui| {
         ui.horizontal(|ui| {
             switch(ui, &mut config.auth.enabled);
             ui.label("启用 Bearer API Key 鉴权");
         });
         ui.horizontal(|ui| {
-            ui.label("新 Key");
-            ui.text_edit_singleline(new_key);
-            if ui.button("添加").clicked() && !new_key.trim().is_empty() {
+            ui.label("新 Key 名称");
+            ui.text_edit_singleline(new_key_name);
+            if ui.button("添加").clicked() && !new_key_name.trim().is_empty() {
+                let name = new_key_name.trim().to_string();
+                let final_name = if name.is_empty() {
+                    format!("key-{}", config.auth.api_keys.len() + 1)
+                } else {
+                    name
+                };
                 config.auth.api_keys.push(ApiKeyConfig {
-                    key: new_key.trim().to_string(),
-                    name: format!("key-{}", config.auth.api_keys.len() + 1),
+                    key: generate_api_key(),
+                    name: final_name,
                     enabled: true,
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                 });
-                new_key.clear();
+                new_key_name.clear();
             }
         });
 
@@ -734,41 +787,440 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key: &mut String)
 }
 
 fn routing_section(ui: &mut egui::Ui, config: &mut AppConfig) {
-    section(ui, "模型降级", |ui| {
+    section(ui, "模型映射", |ui| {
         if config.routing.model_fallbacks.is_empty() {
-            ui.label("未配置 fallback");
+            ui.label("未配置映射");
         }
-        let keys: Vec<String> = config.routing.model_fallbacks.keys().cloned().collect();
-        for key in keys {
-            let mut delete = false;
+        // 取出 entries 到 Vec，使两侧均可编辑（HashMap 遍历时无法修改 key）。
+        let mut entries: Vec<(String, Vec<String>)> = config
+            .routing
+            .model_fallbacks
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut to_remove: Option<usize> = None;
+        for (idx, (src, dsts)) in entries.iter_mut().enumerate() {
+            let mut dst_text = dsts.join(", ");
             ui.horizontal(|ui| {
-                ui.label(&key);
-                if let Some(values) = config.routing.model_fallbacks.get_mut(&key) {
-                    let mut text = values.join(", ");
-                    if ui.text_edit_singleline(&mut text).changed() {
-                        *values = text
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToOwned::to_owned)
-                            .collect();
-                    }
+                ui.text_edit_singleline(src);
+                ui.label("→");
+                if ui.text_edit_singleline(&mut dst_text).changed() {
+                    *dsts = dst_text
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
                 }
                 if ui.button("删除").clicked() {
-                    delete = true;
+                    to_remove = Some(idx);
                 }
             });
-            if delete {
-                config.routing.model_fallbacks.remove(&key);
+        }
+        if let Some(idx) = to_remove {
+            entries.remove(idx);
+        }
+        if ui.button("新增映射").clicked() {
+            entries.push(("model-name".to_string(), vec!["target-model".to_string()]));
+        }
+        // 写回 HashMap，空 key 丢弃。
+        config.routing.model_fallbacks.clear();
+        for (k, v) in entries {
+            let key = k.trim().to_string();
+            if !key.is_empty() {
+                config.routing.model_fallbacks.insert(key, v);
             }
         }
-        if ui.button("新增 fallback").clicked() {
-            config
-                .routing
-                .model_fallbacks
-                .insert("model-name".to_string(), vec!["fallback-model".to_string()]);
-        }
     });
+}
+
+fn logs_section(
+    ui: &mut egui::Ui,
+    config: &AppConfig,
+    log_view: &mut LogViewState,
+    message: &mut String,
+) {
+    const LOG_PAGE_SIZE: usize = 20;
+    let backend = config.usage_log.backend.to_ascii_lowercase();
+    let path = if backend == "sqlite" {
+        config.usage_log.sqlite_path.clone()
+    } else {
+        config.usage_log.path.clone()
+    };
+    let source_key = format!("{backend}:{path}");
+    if log_view.loaded_path != source_key {
+        log_view.page = 0;
+        refresh_logs(config, log_view, Some(message));
+    } else if log_view
+        .last_refresh
+        .map(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+        .unwrap_or(true)
+    {
+        // 定时静默刷新：保留当前分页与状态栏消息
+        refresh_logs(config, log_view, None);
+    }
+
+    section(ui, "请求日志", |ui| {
+        ui.horizontal(|ui| {
+            if soft_button(ui, "刷新").clicked() {
+                refresh_logs(config, log_view, Some(message));
+            }
+            if soft_button(ui, "清空").clicked() {
+                match clear_logs(config) {
+                    Ok(()) => {
+                        log_view.page = 0;
+                        refresh_logs(config, log_view, None);
+                        *message = "已清空日志".to_string();
+                    }
+                    Err(err) => *message = err,
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let total_pages = log_view.total.div_ceil(LOG_PAGE_SIZE).max(1);
+            if ui
+                .add_enabled(log_view.page > 0, egui::Button::new("上一页"))
+                .clicked()
+            {
+                log_view.page = log_view.page.saturating_sub(1);
+                refresh_logs(config, log_view, Some(message));
+            }
+            ui.label(format!(
+                "第 {} / {} 页，共 {} 条",
+                log_view.page + 1,
+                total_pages,
+                log_view.total
+            ));
+            if ui
+                .add_enabled(log_view.page + 1 < total_pages, egui::Button::new("下一页"))
+                .clicked()
+            {
+                log_view.page += 1;
+                refresh_logs(config, log_view, Some(message));
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "{} 后端，每页显示 {} 条请求记录",
+                backend, LOG_PAGE_SIZE
+            ))
+            .size(12.0)
+            .color(muteds()),
+        );
+        ui.add_space(8.0);
+
+        if log_view.rows.is_empty() {
+            ui.label(egui::RichText::new("暂无日志").color(muteds()));
+            return;
+        }
+
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(248, 250, 252))
+            .stroke(egui::Stroke::new(1.0, border()))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("usage_logs")
+                            .striped(true)
+                            .min_col_width(80.0)
+                            .show(ui, |ui| {
+                                table_header(ui, "时间");
+                                table_header(ui, "状态");
+                                table_header(ui, "接口");
+                                table_header(ui, "渠道");
+                                table_header(ui, "模型");
+                                table_header(ui, "Token");
+                                table_header(ui, "耗时(秒)");
+                                table_header(ui, "错误");
+                                ui.end_row();
+
+                                for row in &log_view.rows {
+                                    ui.monospace(&row.ts);
+                                    ui.label(status_text(&row.status));
+                                    ui.label(&row.api);
+                                    ui.label(&row.channel);
+                                    model_cell(ui, row);
+                                    ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
+                                    ui.label(&row.latency);
+                                    ui.label(egui::RichText::new(&row.error).color(muteds()));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+    });
+}
+
+fn refresh_logs(
+    config: &AppConfig,
+    log_view: &mut LogViewState,
+    message: Option<&mut String>,
+) {
+    const LOG_PAGE_SIZE: usize = 20;
+    let backend = config.usage_log.backend.to_ascii_lowercase();
+    let path = if backend == "sqlite" {
+        config.usage_log.sqlite_path.clone()
+    } else {
+        config.usage_log.path.clone()
+    };
+    log_view.loaded_path = format!("{backend}:{path}");
+    log_view.last_refresh = Some(Instant::now());
+    let (final_rows, final_total, note) =
+        match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
+            Ok((rows, total)) => {
+                let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
+                if log_view.page >= total_pages {
+                    log_view.page = total_pages - 1;
+                    match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
+                        Ok((rows2, total2)) => {
+                            let count = rows2.len();
+                            (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
+                        }
+                        Err(err) => (Vec::new(), 0, Err(err)),
+                    }
+                } else {
+                    let count = rows.len();
+                    (rows, total, Ok(format!("已加载 {} 条日志", count)))
+                }
+            }
+            Err(err) => (Vec::new(), 0, Err(err)),
+        };
+    log_view.total = final_total;
+    log_view.rows = final_rows;
+    if let Some(msg) = message {
+        match note {
+            Ok(text) | Err(text) => *msg = text,
+        }
+    }
+}
+
+fn clear_logs(config: &AppConfig) -> Result<(), String> {
+    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
+        clear_sqlite_logs(&config.usage_log.sqlite_path)
+    } else {
+        clear_jsonl_logs(&config.usage_log.path)
+    }
+}
+
+fn clear_jsonl_logs(path: &str) -> Result<(), String> {
+    let path_buf = PathBuf::from(path);
+    if !path_buf.exists() {
+        return Ok(());
+    }
+    fs::write(&path_buf, "").map_err(|err| format!("清空日志失败: {err}"))
+}
+
+fn clear_sqlite_logs(path: &str) -> Result<(), String> {
+    let path_buf = PathBuf::from(path);
+    if !path_buf.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open(&path_buf).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    proxy::ensure_usage_log_schema(&conn)
+        .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
+    conn.execute("DELETE FROM usage_logs", [])
+        .map_err(|err| format!("清空 SQLite 日志失败: {err}"))?;
+    Ok(())
+}
+
+fn read_log_page(
+    config: &AppConfig,
+    page: usize,
+    page_size: usize,
+) -> Result<(Vec<LogRow>, usize), String> {
+    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
+        read_sqlite_log_page(&config.usage_log.sqlite_path, page, page_size)
+    } else {
+        read_jsonl_log_page(&config.usage_log.path, page, page_size)
+    }
+}
+
+fn read_jsonl_log_page(
+    path: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<(Vec<LogRow>, usize), String> {
+    if !PathBuf::from(path).exists() {
+        return Ok((Vec::new(), 0));
+    }
+    let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
+    let all_lines: Vec<_> = content.lines().collect();
+    let total = all_lines.len();
+    let offset = page.saturating_mul(page_size);
+    let mut lines: Vec<String> = all_lines
+        .into_iter()
+        .rev()
+        .skip(offset)
+        .take(page_size)
+        .map(ToOwned::to_owned)
+        .collect();
+    lines.reverse();
+    Ok((
+        lines.iter().map(|line| parse_log_line(line)).collect(),
+        total,
+    ))
+}
+
+fn read_sqlite_log_page(
+    path: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<(Vec<LogRow>, usize), String> {
+    if !PathBuf::from(path).exists() {
+        return Ok((Vec::new(), 0));
+    }
+    let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    proxy::ensure_usage_log_schema(&conn)
+        .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
+    let total = conn
+        .query_row("SELECT COUNT(*) FROM usage_logs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|err| format!("读取 SQLite 日志数量失败: {err}"))? as usize;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                ts, status, api, channel, request_model, upstream_model,
+                latency_ms, input_tokens, output_tokens, error
+            FROM usage_logs
+            ORDER BY id DESC
+            LIMIT ?1
+            OFFSET ?2
+            "#,
+        )
+        .map_err(|err| format!("读取 SQLite 日志失败: {err}"))?;
+    let rows = stmt
+        .query_map(
+            [page_size as i64, page.saturating_mul(page_size) as i64],
+            |row| {
+                let latency_ms: i64 = row.get(6)?;
+                Ok(LogRow {
+                    ts: row.get(0)?,
+                    status: row.get(1)?,
+                    api: row.get(2)?,
+                    channel: row.get(3)?,
+                    model: row.get(4)?,
+                    upstream_model: row.get(5)?,
+                    latency: format!("{:.2}", latency_ms as f64 / 1000.0),
+                    input_tokens: row.get(7)?,
+                    output_tokens: row.get(8)?,
+                    error: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|err| format!("读取 SQLite 日志失败: {err}"))?;
+    let mut out = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("解析 SQLite 日志失败: {err}"))?;
+    out.reverse();
+    Ok((out, total))
+}
+
+#[derive(Clone)]
+struct LogRow {
+    ts: String,
+    status: String,
+    api: String,
+    channel: String,
+    model: String,
+    upstream_model: String,
+    latency: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    error: String,
+}
+
+fn parse_log_line(line: &str) -> LogRow {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return LogRow {
+            ts: "-".to_string(),
+            status: "raw".to_string(),
+            api: "-".to_string(),
+            channel: "-".to_string(),
+            model: "-".to_string(),
+            upstream_model: "-".to_string(),
+            latency: "-".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            error: line.to_string(),
+        };
+    };
+    LogRow {
+        ts: json_string(&value, "ts"),
+        status: json_string(&value, "status"),
+        api: json_string(&value, "api"),
+        channel: json_string(&value, "channel"),
+        model: json_string(&value, "request_model"),
+        upstream_model: json_string(&value, "upstream_model"),
+        latency: value
+            .get("latency_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| format!("{:.2}", value as f64 / 1000.0))
+            .unwrap_or_else(|| "-".to_string()),
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default(),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default(),
+        error: json_string(&value, "error"),
+    }
+}
+
+fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
+    ui.vertical(|ui| {
+        ui.label(&row.model);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            forward_arrow(ui);
+            ui.label(
+                egui::RichText::new(&row.upstream_model)
+                    .size(11.0)
+                    .color(muteds()),
+            );
+        });
+    });
+}
+
+fn forward_arrow(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let stroke = egui::Stroke::new(1.2, muteds());
+    let bend = egui::pos2(rect.left() + 2.0, rect.center().y);
+    let tip = egui::pos2(rect.right() - 2.0, rect.center().y);
+    ui.painter()
+        .line_segment([egui::pos2(bend.x, rect.top() + 1.0), bend], stroke);
+    ui.painter().line_segment([bend, tip], stroke);
+    ui.painter()
+        .line_segment([egui::pos2(tip.x - 3.0, tip.y - 3.0), tip], stroke);
+    ui.painter()
+        .line_segment([tip, egui::pos2(tip.x - 3.0, tip.y + 3.0)], stroke);
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn status_text(status: &str) -> egui::RichText {
+    let color = if status == "ok" || status == "stream_started" {
+        good()
+    } else if status == "-" || status == "raw" {
+        muteds()
+    } else {
+        egui::Color32::from_rgb(176, 54, 64)
+    };
+    egui::RichText::new(status).strong().color(color)
 }
 
 fn provider_section(
@@ -776,7 +1228,12 @@ fn provider_section(
     config: &mut AppConfig,
     selected: &mut Option<usize>,
     message: &mut String,
+    mapping_drafts: &mut Vec<TextDraft>,
+    header_drafts: &mut Vec<TextDraft>,
 ) {
+    resize_drafts(mapping_drafts, config.providers.len());
+    resize_drafts(header_drafts, config.providers.len());
+
     if config.providers.is_empty() {
         section(ui, "渠道", |ui| {
             ui.label(egui::RichText::new("暂无渠道").color(muteds()));
@@ -811,7 +1268,13 @@ fn provider_section(
                 }
                 *selected = Some(idx);
                 let provider = &mut config.providers[idx];
-            provider_detail_panel(ui, provider, message);
+                provider_detail_panel(
+                    ui,
+                    provider,
+                    message,
+                    &mut mapping_drafts[idx],
+                    &mut header_drafts[idx],
+                );
             },
         );
     });
@@ -899,7 +1362,13 @@ fn provider_list_panel(ui: &mut egui::Ui, config: &mut AppConfig, selected: &mut
         });
 }
 
-fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, message: &mut String) {
+fn provider_detail_panel(
+    ui: &mut egui::Ui,
+    provider: &mut ProviderConfig,
+    message: &mut String,
+    mapping_draft: &mut TextDraft,
+    header_draft: &mut TextDraft,
+) {
     section(ui, "渠道详情", |ui| {
         ui.horizontal_wrapped(|ui| {
             switch(ui, &mut provider.enabled);
@@ -1026,7 +1495,8 @@ fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, messa
                         Ok(models) => {
                             let count = models.len();
                             provider.models = models;
-                            *message = format!("已同步渠道 [{}] 的 {} 个模型", provider.name, count);
+                            *message =
+                                format!("已同步渠道 [{}] 的 {} 个模型", provider.name, count);
                         }
                         Err(err) => {
                             *message = format!("同步渠道 [{}] 模型失败: {err}", provider.name);
@@ -1053,18 +1523,13 @@ fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, messa
                     .size(12.0)
                     .color(muteds()),
             );
-            let mut mapping_text = provider
-                .model_mapping
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            sync_draft_from_source(mapping_draft, serialize_model_mapping(provider));
             if ui
-                .add(egui::TextEdit::multiline(&mut mapping_text).desired_rows(5))
+                .add(egui::TextEdit::multiline(&mut mapping_draft.text).desired_rows(5))
                 .changed()
             {
                 provider.model_mapping.clear();
-                for line in mapping_text.lines() {
+                for line in mapping_draft.text.lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         let k = k.trim();
                         let v = v.trim();
@@ -1073,6 +1538,7 @@ fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, messa
                         }
                     }
                 }
+                mapping_draft.source = serialize_model_mapping(provider);
             }
 
             ui.add_space(8.0);
@@ -1081,18 +1547,13 @@ fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, messa
                     .size(12.0)
                     .color(muteds()),
             );
-            let mut headers_text = provider
-                .extra_headers
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            sync_draft_from_source(header_draft, serialize_extra_headers(provider));
             if ui
-                .add(egui::TextEdit::multiline(&mut headers_text).desired_rows(4))
+                .add(egui::TextEdit::multiline(&mut header_draft.text).desired_rows(4))
                 .changed()
             {
                 provider.extra_headers.clear();
-                for line in headers_text.lines() {
+                for line in header_draft.text.lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         let k = k.trim();
                         let v = v.trim();
@@ -1101,9 +1562,46 @@ fn provider_detail_panel(ui: &mut egui::Ui, provider: &mut ProviderConfig, messa
                         }
                     }
                 }
+                header_draft.source = serialize_extra_headers(provider);
             }
         });
     });
+}
+
+fn resize_drafts(drafts: &mut Vec<TextDraft>, len: usize) {
+    drafts.resize_with(len, TextDraft::default);
+}
+
+fn sync_draft_from_source(draft: &mut TextDraft, source: String) {
+    if draft.text.is_empty() && draft.source.is_empty() {
+        draft.text = source.clone();
+        draft.source = source;
+        return;
+    }
+    if draft.source != source && draft.text == draft.source {
+        draft.text = source.clone();
+        draft.source = source;
+    }
+}
+
+fn serialize_model_mapping(provider: &ProviderConfig) -> String {
+    let mut entries: Vec<_> = provider.model_mapping.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn serialize_extra_headers(provider: &ProviderConfig) -> String {
+    let mut entries: Vec<_> = provider.extra_headers.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn form_group(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -1174,10 +1672,11 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         }
     } else if let Some(data) = payload.get("models").and_then(|value| value.as_array()) {
         for item in data {
-            if let Some(id) = item
-                .as_str()
-                .or_else(|| item.get("id").or_else(|| item.get("name")).and_then(|value| value.as_str()))
-            {
+            if let Some(id) = item.as_str().or_else(|| {
+                item.get("id")
+                    .or_else(|| item.get("name"))
+                    .and_then(|value| value.as_str())
+            }) {
                 push_unique(&mut models, id);
             }
         }
