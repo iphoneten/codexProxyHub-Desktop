@@ -83,6 +83,11 @@ usage_log:
 ```
 
 桌面端“日志”页会按当前 backend 读取最近 200 条请求记录。若将 `backend` 改为其他值，则使用 `usage_log.path` 写入/读取 JSONL。
+相对日志路径会按当前加载的配置文件所在目录解析；DMG 首次启动后默认写入：
+
+```text
+~/Library/Application Support/recodexProxyHub/logs/
+```
 
 Codex 示例：
 

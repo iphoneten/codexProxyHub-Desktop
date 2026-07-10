@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    #[serde(skip)]
+    config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,8 +162,9 @@ impl AppConfig {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("读取配置失败: {}", path.display()))?;
-        let cfg = serde_yaml::from_str(&content)
+        let mut cfg: Self = serde_yaml::from_str(&content)
             .with_context(|| format!("解析 YAML 失败: {}", path.display()))?;
+        cfg.config_dir = config_parent_dir(path);
         Ok(cfg)
     }
 
@@ -175,6 +178,33 @@ impl AppConfig {
         let content = serde_yaml::to_string(self)?;
         fs::write(path, content).with_context(|| format!("保存配置失败: {}", path.display()))
     }
+
+    pub fn usage_log_sqlite_path(&self) -> PathBuf {
+        self.resolve_runtime_path(&self.usage_log.sqlite_path)
+    }
+
+    pub fn usage_log_jsonl_path(&self) -> PathBuf {
+        self.resolve_runtime_path(&self.usage_log.path)
+    }
+
+    fn resolve_runtime_path(&self, path: &str) -> PathBuf {
+        let path_buf = PathBuf::from(path);
+        if path_buf.is_absolute() || path.trim().is_empty() {
+            return path_buf;
+        }
+        self.config_dir
+            .as_ref()
+            .map(|dir| dir.join(path_buf.clone()))
+            .unwrap_or(path_buf)
+    }
+}
+
+fn config_parent_dir(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent.to_path_buf())
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -279,4 +309,55 @@ fn default_max_bytes() -> u64 {
 }
 fn default_max_chunks() -> usize {
     20
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_usage_log_paths_resolve_from_config_directory() {
+        let mut cfg: AppConfig = serde_yaml::from_str(
+            r#"
+usage_log:
+  backend: sqlite
+  sqlite_path: logs/proxy_usage.sqlite3
+  path: logs/proxy_usage.jsonl
+"#,
+        )
+        .unwrap();
+        cfg.config_dir = Some(PathBuf::from("/tmp/recodexProxyHub"));
+
+        assert_eq!(
+            cfg.usage_log_sqlite_path(),
+            PathBuf::from("/tmp/recodexProxyHub/logs/proxy_usage.sqlite3")
+        );
+        assert_eq!(
+            cfg.usage_log_jsonl_path(),
+            PathBuf::from("/tmp/recodexProxyHub/logs/proxy_usage.jsonl")
+        );
+    }
+
+    #[test]
+    fn absolute_usage_log_paths_are_preserved() {
+        let mut cfg: AppConfig = serde_yaml::from_str(
+            r#"
+usage_log:
+  backend: sqlite
+  sqlite_path: /var/tmp/proxy_usage.sqlite3
+  path: /var/tmp/proxy_usage.jsonl
+"#,
+        )
+        .unwrap();
+        cfg.config_dir = Some(PathBuf::from("/tmp/recodexProxyHub"));
+
+        assert_eq!(
+            cfg.usage_log_sqlite_path(),
+            PathBuf::from("/var/tmp/proxy_usage.sqlite3")
+        );
+        assert_eq!(
+            cfg.usage_log_jsonl_path(),
+            PathBuf::from("/var/tmp/proxy_usage.jsonl")
+        );
+    }
 }

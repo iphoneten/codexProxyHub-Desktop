@@ -2767,7 +2767,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
 
     if config.usage_log.backend.eq_ignore_ascii_case("sqlite")
         && log_usage_sqlite(
-            &config.usage_log.sqlite_path,
+            config.usage_log_sqlite_path(),
             &ts,
             event.api,
             event.status,
@@ -2798,7 +2798,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
         "error": error,
         "token_source": token_source,
     });
-    let path = PathBuf::from(&config.usage_log.path);
+    let path = config.usage_log_jsonl_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2809,7 +2809,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
 
 #[allow(clippy::too_many_arguments)]
 fn log_usage_sqlite(
-    path: &str,
+    path: PathBuf,
     ts: &str,
     api: &str,
     status: &str,
@@ -2822,7 +2822,6 @@ fn log_usage_sqlite(
     output_tokens: i64,
     token_source: &str,
 ) -> rusqlite::Result<()> {
-    let path = PathBuf::from(path);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

@@ -868,11 +868,11 @@ fn logs_section(
     const LOG_PAGE_SIZE: usize = 20;
     let backend = config.usage_log.backend.to_ascii_lowercase();
     let path = if backend == "sqlite" {
-        config.usage_log.sqlite_path.clone()
+        config.usage_log_sqlite_path()
     } else {
-        config.usage_log.path.clone()
+        config.usage_log_jsonl_path()
     };
-    let source_key = format!("{backend}:{path}");
+    let source_key = format!("{backend}:{}", path.display());
     if log_view.loaded_path != source_key {
         log_view.page = 0;
         refresh_logs(config, log_view, Some(message));
@@ -997,40 +997,36 @@ fn logs_section(
     });
 }
 
-fn refresh_logs(
-    config: &AppConfig,
-    log_view: &mut LogViewState,
-    message: Option<&mut String>,
-) {
+fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut String>) {
     const LOG_PAGE_SIZE: usize = 20;
     let backend = config.usage_log.backend.to_ascii_lowercase();
     let path = if backend == "sqlite" {
-        config.usage_log.sqlite_path.clone()
+        config.usage_log_sqlite_path()
     } else {
-        config.usage_log.path.clone()
+        config.usage_log_jsonl_path()
     };
-    log_view.loaded_path = format!("{backend}:{path}");
+    log_view.loaded_path = format!("{backend}:{}", path.display());
     log_view.last_refresh = Some(Instant::now());
-    let (final_rows, final_total, note) =
-        match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
-            Ok((rows, total)) => {
-                let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
-                if log_view.page >= total_pages {
-                    log_view.page = total_pages - 1;
-                    match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
-                        Ok((rows2, total2)) => {
-                            let count = rows2.len();
-                            (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
-                        }
-                        Err(err) => (Vec::new(), 0, Err(err)),
+    let (final_rows, final_total, note) = match read_log_page(config, log_view.page, LOG_PAGE_SIZE)
+    {
+        Ok((rows, total)) => {
+            let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
+            if log_view.page >= total_pages {
+                log_view.page = total_pages - 1;
+                match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
+                    Ok((rows2, total2)) => {
+                        let count = rows2.len();
+                        (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
                     }
-                } else {
-                    let count = rows.len();
-                    (rows, total, Ok(format!("已加载 {} 条日志", count)))
+                    Err(err) => (Vec::new(), 0, Err(err)),
                 }
+            } else {
+                let count = rows.len();
+                (rows, total, Ok(format!("已加载 {} 条日志", count)))
             }
-            Err(err) => (Vec::new(), 0, Err(err)),
-        };
+        }
+        Err(err) => (Vec::new(), 0, Err(err)),
+    };
     log_view.total = final_total;
     log_view.rows = final_rows;
     // 聚合 token 总量。读失败保留旧值，避免闪回 0
@@ -1046,14 +1042,14 @@ fn refresh_logs(
 
 fn read_log_totals(config: &AppConfig) -> Result<LogTotals, String> {
     if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        read_sqlite_log_totals(&config.usage_log.sqlite_path)
+        read_sqlite_log_totals(config.usage_log_sqlite_path())
     } else {
-        read_jsonl_log_totals(&config.usage_log.path)
+        read_jsonl_log_totals(config.usage_log_jsonl_path())
     }
 }
 
-fn read_sqlite_log_totals(path: &str) -> Result<LogTotals, String> {
-    if !PathBuf::from(path).exists() {
+fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
+    if !path.exists() {
         return Ok(LogTotals::default());
     }
     let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
@@ -1072,8 +1068,8 @@ fn read_sqlite_log_totals(path: &str) -> Result<LogTotals, String> {
     })
 }
 
-fn read_jsonl_log_totals(path: &str) -> Result<LogTotals, String> {
-    if !PathBuf::from(path).exists() {
+fn read_jsonl_log_totals(path: PathBuf) -> Result<LogTotals, String> {
+    if !path.exists() {
         return Ok(LogTotals::default());
     }
     let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
@@ -1117,22 +1113,20 @@ fn format_compact_tokens(n: i64) -> String {
 
 fn clear_logs(config: &AppConfig) -> Result<(), String> {
     if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        clear_sqlite_logs(&config.usage_log.sqlite_path)
+        clear_sqlite_logs(config.usage_log_sqlite_path())
     } else {
-        clear_jsonl_logs(&config.usage_log.path)
+        clear_jsonl_logs(config.usage_log_jsonl_path())
     }
 }
 
-fn clear_jsonl_logs(path: &str) -> Result<(), String> {
-    let path_buf = PathBuf::from(path);
+fn clear_jsonl_logs(path_buf: PathBuf) -> Result<(), String> {
     if !path_buf.exists() {
         return Ok(());
     }
     fs::write(&path_buf, "").map_err(|err| format!("清空日志失败: {err}"))
 }
 
-fn clear_sqlite_logs(path: &str) -> Result<(), String> {
-    let path_buf = PathBuf::from(path);
+fn clear_sqlite_logs(path_buf: PathBuf) -> Result<(), String> {
     if !path_buf.exists() {
         return Ok(());
     }
@@ -1150,18 +1144,18 @@ fn read_log_page(
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
     if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        read_sqlite_log_page(&config.usage_log.sqlite_path, page, page_size)
+        read_sqlite_log_page(config.usage_log_sqlite_path(), page, page_size)
     } else {
-        read_jsonl_log_page(&config.usage_log.path, page, page_size)
+        read_jsonl_log_page(config.usage_log_jsonl_path(), page, page_size)
     }
 }
 
 fn read_jsonl_log_page(
-    path: &str,
+    path: PathBuf,
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
-    if !PathBuf::from(path).exists() {
+    if !path.exists() {
         return Ok((Vec::new(), 0));
     }
     let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
@@ -1183,11 +1177,11 @@ fn read_jsonl_log_page(
 }
 
 fn read_sqlite_log_page(
-    path: &str,
+    path: PathBuf,
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
-    if !PathBuf::from(path).exists() {
+    if !path.exists() {
         return Ok((Vec::new(), 0));
     }
     let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
