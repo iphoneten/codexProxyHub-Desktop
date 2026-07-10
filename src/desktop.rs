@@ -1,9 +1,9 @@
 use crate::{
     config::{default_config_path, ApiKeyConfig, AppConfig, ProviderConfig},
-    proxy,
+    proxy::{self, ConfigHandle},
 };
 use eframe::egui;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
 use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
@@ -20,6 +20,8 @@ pub struct HubApp {
     provider_mapping_drafts: Vec<TextDraft>,
     provider_header_drafts: Vec<TextDraft>,
     log_view: LogViewState,
+    // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
+    config_handle: Option<ConfigHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,13 @@ struct LogViewState {
     page: usize,
     total: usize,
     last_refresh: Option<Instant>,
+    totals: LogTotals,
+}
+
+#[derive(Default, Clone, Copy)]
+struct LogTotals {
+    input_tokens: i64,
+    output_tokens: i64,
 }
 
 impl HubApp {
@@ -71,6 +80,7 @@ impl HubApp {
             provider_mapping_drafts: Vec::new(),
             provider_header_drafts: Vec::new(),
             log_view: LogViewState::default(),
+            config_handle: None,
         };
         app.load_config();
         app
@@ -138,9 +148,12 @@ impl HubApp {
             server.shutdown = Some(tx);
             server.last_error = None;
         }
+        // 建立配置句柄：UI 与运行中的 server 共享同一 Arc<RwLock<Arc<AppConfig>>>
+        let handle: ConfigHandle = Arc::new(RwLock::new(Arc::new(config)));
+        self.config_handle = Some(Arc::clone(&handle));
         let server_state = Arc::clone(&self.server);
         runtime.spawn(async move {
-            let result = proxy::run_server(config, rx).await;
+            let result = proxy::run_server(handle, rx).await;
             let mut server = server_state.lock();
             server.running = false;
             server.shutdown = None;
@@ -157,14 +170,26 @@ impl HubApp {
             let _ = tx.send(());
             server.running = false;
             self.message = "正在停止代理".to_string();
+            drop(server);
+            self.config_handle = None;
         } else {
             self.message = "代理未运行".to_string();
+        }
+    }
+
+    // 若代理在跑，把 UI 侧最新配置推送到运行时。每帧调用一次即可
+    fn sync_config_to_runtime(&self) {
+        if let (Some(handle), Some(cfg)) = (self.config_handle.as_ref(), self.config.as_ref()) {
+            *handle.write() = Arc::new(cfg.clone());
         }
     }
 }
 
 impl eframe::App for HubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 把 UI 修改推送到运行中的代理，确保 provider.enabled 等改动即时生效
+        self.sync_config_to_runtime();
+
         egui::TopBottomPanel::top("top")
             .exact_height(74.0)
             .show(ctx, |ui| {
@@ -876,6 +901,32 @@ fn logs_section(
                 }
             }
         });
+        // Token 使用统计（当前日志表/文件全部记录合计）
+        let totals = log_view.totals;
+        ui.horizontal_wrapped(|ui| {
+            metric_tile(
+                ui,
+                "输入",
+                &format_compact_tokens(totals.input_tokens),
+                "累计 prompt tokens",
+                accent(),
+            );
+            metric_tile(
+                ui,
+                "输出",
+                &format_compact_tokens(totals.output_tokens),
+                "累计 completion tokens",
+                egui::Color32::from_rgb(110, 106, 220),
+            );
+            metric_tile(
+                ui,
+                "总 Token",
+                &format_compact_tokens(totals.input_tokens + totals.output_tokens),
+                "",
+                good(),
+            );
+        });
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             let total_pages = log_view.total.div_ceil(LOG_PAGE_SIZE).max(1);
             if ui
@@ -899,16 +950,7 @@ fn logs_section(
                 refresh_logs(config, log_view, Some(message));
             }
         });
-        ui.label(
-            egui::RichText::new(format!(
-                "{} 后端，每页显示 {} 条请求记录",
-                backend, LOG_PAGE_SIZE
-            ))
-            .size(12.0)
-            .color(muteds()),
-        );
         ui.add_space(8.0);
-
         if log_view.rows.is_empty() {
             ui.label(egui::RichText::new("暂无日志").color(muteds()));
             return;
@@ -991,11 +1033,86 @@ fn refresh_logs(
         };
     log_view.total = final_total;
     log_view.rows = final_rows;
+    // 聚合 token 总量。读失败保留旧值，避免闪回 0
+    if let Ok(totals) = read_log_totals(config) {
+        log_view.totals = totals;
+    }
     if let Some(msg) = message {
         match note {
             Ok(text) | Err(text) => *msg = text,
         }
     }
+}
+
+fn read_log_totals(config: &AppConfig) -> Result<LogTotals, String> {
+    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
+        read_sqlite_log_totals(&config.usage_log.sqlite_path)
+    } else {
+        read_jsonl_log_totals(&config.usage_log.path)
+    }
+}
+
+fn read_sqlite_log_totals(path: &str) -> Result<LogTotals, String> {
+    if !PathBuf::from(path).exists() {
+        return Ok(LogTotals::default());
+    }
+    let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    proxy::ensure_usage_log_schema(&conn)
+        .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
+    let (input_tokens, output_tokens) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM usage_logs",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|err| format!("汇总 SQLite Token 失败: {err}"))?;
+    Ok(LogTotals {
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn read_jsonl_log_totals(path: &str) -> Result<LogTotals, String> {
+    if !PathBuf::from(path).exists() {
+        return Ok(LogTotals::default());
+    }
+    let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
+    let mut totals = LogTotals::default();
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        totals.input_tokens = totals.input_tokens.saturating_add(
+            value
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        );
+        totals.output_tokens = totals.output_tokens.saturating_add(
+            value
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        );
+    }
+    Ok(totals)
+}
+
+// Token 紧凑显示：< 1K 原样；≥ 1K 用 K；≥ 1M 用 M，均保留 2 位小数
+// 采用整数除法向下截断，避免浮点四舍五入导致边界值跨单位（如 999999 变 1000.00K）
+fn format_compact_tokens(n: i64) -> String {
+    let sign = if n < 0 { "-" } else { "" };
+    let abs = n.unsigned_abs();
+    if abs < 1_000 {
+        return format!("{sign}{abs}");
+    }
+    if abs < 1_000_000 {
+        // 每 1K 拆成 100 份小数位；abs/10 直接得到小数位总数
+        let hundredths = abs / 10;
+        return format!("{sign}{}.{:02}K", hundredths / 100, hundredths % 100);
+    }
+    let hundredths = abs / 10_000;
+    format!("{sign}{}.{:02}M", hundredths / 100, hundredths % 100)
 }
 
 fn clear_logs(config: &AppConfig) -> Result<(), String> {
@@ -1051,14 +1168,14 @@ fn read_jsonl_log_page(
     let all_lines: Vec<_> = content.lines().collect();
     let total = all_lines.len();
     let offset = page.saturating_mul(page_size);
-    let mut lines: Vec<String> = all_lines
+    // 时间倒序：最新的一条排在最上面
+    let lines: Vec<String> = all_lines
         .into_iter()
         .rev()
         .skip(offset)
         .take(page_size)
         .map(ToOwned::to_owned)
         .collect();
-    lines.reverse();
     Ok((
         lines.iter().map(|line| parse_log_line(line)).collect(),
         total,
@@ -1114,10 +1231,10 @@ fn read_sqlite_log_page(
             },
         )
         .map_err(|err| format!("读取 SQLite 日志失败: {err}"))?;
-    let mut out = rows
+    // 时间倒序：最新的一条排在最上面（SQL 已用 ORDER BY id DESC）
+    let out = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("解析 SQLite 日志失败: {err}"))?;
-    out.reverse();
     Ok((out, total))
 }
 
@@ -1177,15 +1294,18 @@ fn parse_log_line(line: &str) -> LogRow {
 fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
     ui.vertical(|ui| {
         ui.label(&row.model);
-        ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            forward_arrow(ui);
-            ui.label(
-                egui::RichText::new(&row.upstream_model)
-                    .size(11.0)
-                    .color(muteds()),
-            );
-        });
+        // 上游模型为空时不渲染 ↳ 那一行，避免冗余
+        if !row.upstream_model.trim().is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                forward_arrow(ui);
+                ui.label(
+                    egui::RichText::new(&row.upstream_model)
+                        .size(11.0)
+                        .color(muteds()),
+                );
+            });
+        }
     });
 }
 
@@ -1446,7 +1566,7 @@ fn provider_detail_panel(
                     form_label(ui, "Timeout");
                     ui.add(egui::DragValue::new(&mut provider.timeout).range(1..=600));
                     form_label(ui, "Retries");
-                    ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=20));
+                    ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
                     ui.end_row();
 
                     form_label(ui, "Responses");
@@ -1765,7 +1885,7 @@ fn default_provider() -> ProviderConfig {
         responses_mode: "auto".to_string(),
         client_mode: "normal".to_string(),
         timeout: 120,
-        max_retries: 0,
+        max_retries: 3,
         weight: 1,
         priority: 1,
         description: None,

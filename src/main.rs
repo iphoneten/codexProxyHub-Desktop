@@ -1,6 +1,8 @@
+mod anthropic;
 mod config;
 mod desktop;
 mod proxy;
+mod responses_api;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
