@@ -11,7 +11,10 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -359,7 +362,7 @@ pub fn responses_to_chat_response(body: Value, request_model: &str) -> Value {
                         }
                     }
                 }
-                Some("function_call") => {
+                Some("function_call") | Some("custom_tool_call") => {
                     let call_id = item
                         .get("call_id")
                         .or_else(|| item.get("id"))
@@ -371,11 +374,17 @@ pub fn responses_to_chat_response(body: Value, request_model: &str) -> Value {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("{}")
-                        .to_string();
+                    let arguments =
+                        if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                            encode_custom_tool_arguments(
+                                item.get("input").and_then(Value::as_str).unwrap_or(""),
+                            )
+                        } else {
+                            item.get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}")
+                                .to_string()
+                        };
                     tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
@@ -431,6 +440,11 @@ pub fn responses_to_chat_response(body: Value, request_model: &str) -> Value {
             "total_tokens": input_tokens + output_tokens,
         }
     })
+}
+
+fn encode_custom_tool_arguments(input: &str) -> String {
+    serde_json::to_string(&json!({"input": input}))
+        .unwrap_or_else(|_| "{\"input\":\"\"}".to_string())
 }
 
 fn map_finish_reason(
@@ -562,6 +576,9 @@ struct StreamState {
     request_model: String,
     // output_item index -> openai tool_calls slot
     tool_slots: HashMap<u64, usize>,
+    custom_tool_indexes: HashSet<u64>,
+    custom_tool_inputs: HashMap<u64, String>,
+    custom_arguments_emitted: HashSet<u64>,
     tool_slots_seq: usize,
     usage: TokenUsage,
     finish_reason: Option<String>,
@@ -576,6 +593,9 @@ impl StreamState {
             model: request_model.clone(),
             request_model,
             tool_slots: HashMap::new(),
+            custom_tool_indexes: HashSet::new(),
+            custom_tool_inputs: HashMap::new(),
+            custom_arguments_emitted: HashSet::new(),
             tool_slots_seq: 0,
             usage: TokenUsage::default(),
             finish_reason: None,
@@ -646,18 +666,28 @@ impl StreamState {
                 let index = payload.get("output_index").and_then(Value::as_u64);
                 let item = payload.get("item");
                 if let (Some(index), Some(item)) = (index, item) {
-                    if let Some("function_call") = item.get("type").and_then(Value::as_str) {
+                    let item_type = item.get("type").and_then(Value::as_str);
+                    if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
                         let slot = self.tool_slots_seq;
                         self.tool_slots_seq += 1;
                         self.tool_slots.insert(index, slot);
+                        if item_type == Some("custom_tool_call") {
+                            self.custom_tool_indexes.insert(index);
+                            if let Some(input) = item.get("input").and_then(Value::as_str) {
+                                self.custom_tool_inputs.insert(index, input.to_string());
+                            }
+                        }
                         let call_id = item
                             .get("call_id")
                             .or_else(|| item.get("id"))
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                        let initial_args =
-                            item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                        let initial_args = if item_type == Some("custom_tool_call") {
+                            ""
+                        } else {
+                            item.get("arguments").and_then(Value::as_str).unwrap_or("")
+                        };
                         out.push(self.build_chunk(
                             json!({
                                 "tool_calls": [{
@@ -672,6 +702,41 @@ impl StreamState {
                             }),
                             None,
                         ));
+                    }
+                }
+            }
+            Some("response.custom_tool_call_input.delta") => {
+                let index = payload.get("output_index").and_then(Value::as_u64);
+                let delta = payload.get("delta").and_then(Value::as_str);
+                if let (Some(index), Some(delta)) = (index, delta) {
+                    self.custom_tool_inputs
+                        .entry(index)
+                        .or_default()
+                        .push_str(delta);
+                }
+            }
+            Some("response.custom_tool_call_input.done") => {
+                let index = payload.get("output_index").and_then(Value::as_u64);
+                if let Some(index) = index {
+                    if let Some(input) = payload.get("input").and_then(Value::as_str) {
+                        self.custom_tool_inputs.insert(index, input.to_string());
+                    }
+                    if let Some(chunk) = self.custom_arguments_chunk(index) {
+                        out.push(chunk);
+                    }
+                }
+            }
+            Some("response.output_item.done") => {
+                let index = payload.get("output_index").and_then(Value::as_u64);
+                let item = payload.get("item");
+                if let (Some(index), Some(item)) = (index, item) {
+                    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                        if let Some(input) = item.get("input").and_then(Value::as_str) {
+                            self.custom_tool_inputs.insert(index, input.to_string());
+                        }
+                        if let Some(chunk) = self.custom_arguments_chunk(index) {
+                            out.push(chunk);
+                        }
                     }
                 }
             }
@@ -721,6 +786,12 @@ impl StreamState {
                 }
             }
             Some("response.completed") => {
+                let pending_custom = self.custom_tool_indexes.iter().copied().collect::<Vec<_>>();
+                for index in pending_custom {
+                    if let Some(chunk) = self.custom_arguments_chunk(index) {
+                        out.push(chunk);
+                    }
+                }
                 if let Some(resp) = payload.get("response") {
                     if let Some(u) = resp.get("usage") {
                         self.accumulate_usage(u);
@@ -770,6 +841,30 @@ impl StreamState {
             _ => {}
         }
         out
+    }
+
+    fn custom_arguments_chunk(&mut self, index: u64) -> Option<Value> {
+        if !self.custom_tool_indexes.contains(&index)
+            || !self.custom_arguments_emitted.insert(index)
+        {
+            return None;
+        }
+        let slot = self.tool_slots.get(&index).copied()?;
+        let input = self
+            .custom_tool_inputs
+            .get(&index)
+            .map(String::as_str)
+            .unwrap_or("");
+        let arguments = encode_custom_tool_arguments(input);
+        Some(self.build_chunk(
+            json!({
+                "tool_calls": [{
+                    "index": slot,
+                    "function": {"arguments": arguments}
+                }]
+            }),
+            None,
+        ))
     }
 
     fn accumulate_usage(&mut self, u: &Value) {
@@ -892,6 +987,32 @@ mod tests {
     }
 
     #[test]
+    fn response_maps_custom_tool_calls() {
+        let body = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            }]
+        });
+
+        let out = responses_to_chat_response(body, "gpt-5");
+        let call = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(call["id"], "call_patch");
+        assert_eq!(call["function"]["name"], "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap()
+                ["input"],
+            "*** Begin Patch\n*** End Patch"
+        );
+    }
+
+    #[test]
     fn stream_state_emits_text_delta() {
         let mut state = StreamState::new("gpt-5".into());
         state.handle_event(&json!({
@@ -930,6 +1051,51 @@ mod tests {
         assert_eq!(
             out[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
             "{\"q\":\""
+        );
+    }
+
+    #[test]
+    fn stream_state_emits_custom_tool_input_as_arguments() {
+        let mut state = StreamState::new("gpt-5".into());
+        let out = state.handle_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch"
+            }
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_patch"
+        );
+        assert_eq!(
+            out[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "apply_patch"
+        );
+
+        assert!(state
+            .handle_event(&json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 1,
+                "delta": "*** Begin Patch\n"
+            }))
+            .is_empty());
+        let out = state.handle_event(&json!({
+            "type": "response.custom_tool_call_input.done",
+            "output_index": 1,
+            "input": "*** Begin Patch\n*** End Patch"
+        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                out[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()["input"],
+            "*** Begin Patch\n*** End Patch"
         );
     }
 

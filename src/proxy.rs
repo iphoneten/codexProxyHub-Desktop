@@ -281,9 +281,7 @@ async fn responses(
         //   2. provider_type == "anthropic"：Anthropic 上游走 /messages（chat 翻译层再桥接）
         //   3. Google Gemini 的 OpenAI 端点：只支持 chat，不支持 /responses
         // 其它一律先尝试 native /responses；失败时下面的 auto-fallback 分支会自动降级 chat。
-        let force_chat = provider.responses_mode == "chat"
-            || provider.provider_type == "anthropic"
-            || is_google_openai_endpoint(&provider.base_url);
+        let force_chat = provider_prefers_chat_responses(&provider);
         if force_chat {
             match forward_responses_as_chat(&state, &provider, &headers, upstream_body, stream)
                 .await
@@ -421,16 +419,9 @@ fn responses_stream_with_failover(
             let started = Instant::now();
             let mut upstream_body = with_model(body.clone(), &request_model);
             apply_model_mapping(&provider, &mut upstream_body);
-            let mut chat_body = match responses_to_chat_body(&upstream_body) {
-                Ok(value) => value,
-                Err(err) => {
-                    last_error = Some(err.message);
-                    continue;
-                }
-            };
-            apply_stream_continuation(&mut chat_body, &stream_state.full_text);
+            apply_responses_stream_continuation(&mut upstream_body, &stream_state.full_text);
 
-            match open_responses_as_chat_stream(&state, &provider, &headers, chat_body).await {
+            match open_responses_as_chat_stream(&state, &provider, &headers, upstream_body).await {
                 Ok(result) => {
                     let upstream_model = result.upstream_model.clone();
                     let stream = result
@@ -498,6 +489,8 @@ fn responses_stream_with_failover(
         .map_err(|err| ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()))
 }
 
+const STREAM_CONTINUATION_PROMPT: &str = "Continue exactly from where the previous response stopped. Output only the continuation and do not repeat text already produced.";
+
 fn apply_stream_continuation(body: &mut Value, partial_text: &str) {
     if partial_text.is_empty() {
         return;
@@ -511,7 +504,45 @@ fn apply_stream_continuation(body: &mut Value, partial_text: &str) {
     }));
     messages.push(json!({
         "role": "user",
-        "content": "Continue exactly from where the previous response stopped. Output only the continuation and do not repeat text already produced."
+        "content": STREAM_CONTINUATION_PROMPT
+    }));
+}
+
+fn apply_responses_stream_continuation(body: &mut Value, partial_text: &str) {
+    if partial_text.is_empty() {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let input = obj
+        .entry("input")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !input.is_array() {
+        let original = std::mem::replace(input, Value::Array(Vec::new()));
+        let items = input
+            .as_array_mut()
+            .expect("input was replaced by an array");
+        match original {
+            Value::String(text) => items.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            })),
+            Value::Null => {}
+            other => items.push(other),
+        }
+    }
+    let items = input.as_array_mut().expect("input is an array");
+    items.push(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": partial_text}]
+    }));
+    items.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": STREAM_CONTINUATION_PROMPT}]
     }));
 }
 
@@ -519,16 +550,12 @@ async fn open_responses_as_chat_stream(
     state: &AppState,
     provider: &ProviderConfig,
     request_headers: &HeaderMap,
-    chat_body: Value,
+    responses_body: Value,
 ) -> Result<ProviderResult, ProxyError> {
-    let supports_responses =
-        !matches!(provider.capabilities.get("supports_responses"), Some(false));
-    let prefer_chat = provider.provider_type == "anthropic"
-        || provider.responses_mode == "chat"
-        || is_google_openai_endpoint(&provider.base_url)
-        || !supports_responses;
+    let prefer_chat = provider_prefers_chat_responses(provider);
 
     if prefer_chat {
+        let chat_body = responses_to_chat_body(&responses_body)?;
         match send_to_provider(
             state,
             provider,
@@ -545,13 +572,19 @@ async fn open_responses_as_chat_stream(
                     && (err.status == StatusCode::NOT_FOUND
                         || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
             {
-                send_chat_via_responses(state, provider, request_headers, chat_body, true).await
+                send_responses_stream_as_chat(state, provider, request_headers, responses_body)
+                    .await
             }
             Err(err) => Err(err),
         }
     } else {
-        match send_chat_via_responses(state, provider, request_headers, chat_body.clone(), true)
-            .await
+        match send_responses_stream_as_chat(
+            state,
+            provider,
+            request_headers,
+            responses_body.clone(),
+        )
+        .await
         {
             Ok(result) => Ok(result),
             Err(err)
@@ -559,6 +592,7 @@ async fn open_responses_as_chat_stream(
                     && (err.status == StatusCode::NOT_FOUND
                         || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
             {
+                let chat_body = responses_to_chat_body(&responses_body)?;
                 send_to_provider(
                     state,
                     provider,
@@ -572,6 +606,12 @@ async fn open_responses_as_chat_stream(
             Err(err) => Err(err),
         }
     }
+}
+
+fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool {
+    provider.responses_mode == "chat"
+        || provider.provider_type == "anthropic"
+        || is_google_openai_endpoint(&provider.base_url)
 }
 
 async fn forward_openai(
@@ -1539,6 +1579,12 @@ impl ManagedResponsesStream {
                             continue;
                         };
                         if data.trim() == "[DONE]" {
+                            if !self.has_meaningful_output() {
+                                return Err(
+                                    "上游流已完成，但没有文本或工具调用（疑似事件格式不兼容）"
+                                        .to_string(),
+                                );
+                            }
                             saw_done = true;
                             break;
                         }
@@ -1577,6 +1623,16 @@ impl ManagedResponsesStream {
         }
 
         Err("上游流未发送 [DONE] 就已结束".to_string())
+    }
+
+    fn has_meaningful_output(&self) -> bool {
+        !self.full_text.is_empty()
+            || self.tool_calls.iter().any(|call| {
+                call.added
+                    || !call.call_id.is_empty()
+                    || !call.name.is_empty()
+                    || !call.arguments.is_empty()
+            })
     }
 
     async fn apply_tool_delta(
@@ -2100,8 +2156,85 @@ async fn send_to_anthropic_provider(
     ))
 }
 
-// 客户端 chat/completions -> 上游 /responses 反向翻译发送
-// 用于 forward_openai 的 auto fallback：上游拒绝 chat/completions 时降级到 responses
+// 原样发送 Responses 请求体，只把上游 Responses SSE 翻译成内部统一使用的 Chat SSE。
+// Codex 兼容上游可能严格校验请求体，不能先转 Chat 再重建 Responses。
+async fn send_responses_stream_as_chat(
+    state: &AppState,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    responses_body: Value,
+) -> Result<ProviderResult, ProxyError> {
+    let request_model = responses_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let url = upstream_url(provider, "/responses");
+    let mut attempt = 0;
+    loop {
+        let result = state
+            .client
+            .post(url.clone())
+            .timeout(Duration::from_secs(provider.timeout.max(1)))
+            .headers(upstream_headers(provider, request_headers, true))
+            .json(&responses_body)
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{} body={}", msg, clean_upstream_error(&text)),
+                    ));
+                }
+                let (usage_rx, body_stream) =
+                    crate::responses_api::spawn_responses_stream_translator(
+                        resp,
+                        request_model.clone(),
+                    );
+                let response = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from_stream(body_stream))
+                    .map_err(|err| ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()))?;
+                return Ok(ProviderResult {
+                    response,
+                    upstream_model: request_model,
+                    usage: TokenUsage::default(),
+                    usage_rx: Some(usage_rx),
+                });
+            }
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let retry_after = parse_retry_after(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                if attempt < provider.max_retries && retryable_status(status) {
+                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+            }
+            Err(err) if attempt < provider.max_retries => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                attempt += 1;
+                if err.is_timeout() || err.is_connect() || err.is_request() {
+                    continue;
+                }
+                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()));
+            }
+            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string())),
+        }
+    }
+}
+
+// 客户端 chat/completions -> 上游 /responses 反向翻译发送。
+// 用于 forward_openai 的 auto fallback：上游拒绝 chat/completions 时降级到 responses。
 async fn send_chat_via_responses(
     state: &AppState,
     provider: &ProviderConfig,
@@ -2125,44 +2258,20 @@ async fn send_chat_via_responses(
     if let Some(obj) = responses_body.as_object_mut() {
         obj.insert("stream".into(), Value::Bool(stream));
     }
+    if stream {
+        return send_responses_stream_as_chat(state, provider, request_headers, responses_body)
+            .await;
+    }
     let url = upstream_url(provider, "/responses");
     let mut attempt: usize = 0;
     loop {
         let req = client
             .post(url.clone())
             .timeout(Duration::from_secs(provider.timeout.max(1)))
-            .headers(upstream_headers(provider, request_headers, stream))
+            .headers(upstream_headers(provider, request_headers, false))
             .json(&responses_body);
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-                if stream {
-                    // 拦截假流响应
-                    if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(ProxyError::new(
-                            StatusCode::BAD_GATEWAY,
-                            format!("{} body={}", msg, clean_upstream_error(&text)),
-                        ));
-                    }
-                    let (usage_rx, body_stream) =
-                        crate::responses_api::spawn_responses_stream_translator(
-                            resp,
-                            request_model.clone(),
-                        );
-                    let response = Response::builder()
-                        .status(status)
-                        .header(header::CONTENT_TYPE, "text/event-stream")
-                        .header(header::CACHE_CONTROL, "no-cache")
-                        .body(Body::from_stream(body_stream))
-                        .map_err(|e| ProxyError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
-                    return Ok(ProviderResult {
-                        response,
-                        upstream_model: request_model,
-                        usage: TokenUsage::default(),
-                        usage_rx: Some(usage_rx),
-                    });
-                }
                 let value = resp.json::<Value>().await.map_err(|e| {
                     ProxyError::new(
                         StatusCode::BAD_GATEWAY,
@@ -3626,6 +3735,23 @@ mod tests {
     }
 
     #[test]
+    fn responses_auto_tries_native_endpoint_even_when_capability_is_stale() {
+        let stale_capability = provider(
+            "openai",
+            "auto",
+            json!({"supports_chat": true, "supports_responses": false}),
+        );
+        let forced_chat = provider(
+            "openai",
+            "chat",
+            json!({"supports_chat": true, "supports_responses": false}),
+        );
+
+        assert!(!provider_prefers_chat_responses(&stale_capability));
+        assert!(provider_prefers_chat_responses(&forced_chat));
+    }
+
+    #[test]
     fn anthropic_provider_is_allowed_for_translated_chat_and_responses() {
         let p = provider(
             "anthropic",
@@ -3792,6 +3918,61 @@ mod tests {
         assert_eq!(out["output"][0]["input"], "*** Begin Patch\n*** End Patch");
     }
 
+    #[test]
+    fn responses_first_stream_attempt_preserves_strict_codex_body() {
+        let mut body = json!({
+            "model": "gpt-test",
+            "stream": true,
+            "store": false,
+            "instructions": "You are Codex.",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "fix it"}]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {"type": "text"}
+            }]
+        });
+        let original = body.clone();
+
+        apply_responses_stream_continuation(&mut body, "");
+
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn responses_stream_continuation_keeps_codex_top_level_fields() {
+        let mut body = json!({
+            "model": "gpt-test",
+            "stream": true,
+            "store": false,
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+            "input": "fix it"
+        });
+
+        apply_responses_stream_continuation(&mut body, "partial result");
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(body["input"][0]["content"][0]["text"], "fix it");
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"][0]["text"], "partial result");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(
+            body["input"][2]["content"][0]["text"],
+            STREAM_CONTINUATION_PROMPT
+        );
+    }
+
     #[tokio::test]
     async fn chat_stream_restores_custom_tool_calls() {
         let chunk = json!({
@@ -3935,6 +4116,27 @@ mod tests {
             completed["response"]["output"][1]["arguments"],
             "{\"cmd\":\"ls\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_responses_stream_rejects_empty_done() {
+        let stream =
+            futures_util::stream::iter([Ok::<Bytes, io::Error>(Bytes::from("data: [DONE]\n\n"))]);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+        let mut managed = ManagedResponsesStream::new("gpt-test".to_string(), HashSet::new());
+
+        managed.send_started(&tx).await.unwrap();
+        let err = managed.relay(Box::pin(stream), &tx).await.unwrap_err();
+        drop(tx);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let sse = String::from_utf8(body).unwrap();
+
+        assert!(err.contains("没有文本或工具调用"));
+        assert!(!sse.contains("response.completed"));
     }
 
     #[test]

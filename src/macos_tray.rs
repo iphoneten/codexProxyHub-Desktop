@@ -1,4 +1,6 @@
 use eframe::egui;
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSApplication;
 use std::sync::mpsc::{self, Receiver};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -111,4 +113,18 @@ fn load_icon() -> Result<Icon, String> {
     let (width, height) = image.dimensions();
     Icon::from_rgba(image.into_raw(), width, height)
         .map_err(|err| format!("解析状态栏图标失败: {err}"))
+}
+
+pub fn app_is_active() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    NSApplication::sharedApplication(mtm).isActive()
+}
+
+pub fn activate_app() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    NSApplication::sharedApplication(mtm).activate();
 }

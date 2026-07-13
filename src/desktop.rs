@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
 #[cfg(target_os = "macos")]
-use crate::macos_tray::{MacosTray, TrayAction};
+use crate::macos_tray::{activate_app, app_is_active, MacosTray, TrayAction};
 
 pub struct HubApp {
     config_path: String,
@@ -29,6 +29,10 @@ pub struct HubApp {
     tray: Option<MacosTray>,
     #[cfg(target_os = "macos")]
     quitting: bool,
+    #[cfg(target_os = "macos")]
+    window_hidden: bool,
+    #[cfg(target_os = "macos")]
+    app_was_active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,12 +96,20 @@ impl HubApp {
             tray: None,
             #[cfg(target_os = "macos")]
             quitting: false,
+            #[cfg(target_os = "macos")]
+            window_hidden: false,
+            #[cfg(target_os = "macos")]
+            app_was_active: false,
         };
         app.load_config();
         #[cfg(target_os = "macos")]
         match MacosTray::new(&cc.egui_ctx) {
             Ok(tray) => app.tray = Some(tray),
             Err(err) => app.message = err,
+        }
+        #[cfg(target_os = "macos")]
+        {
+            app.app_was_active = app_is_active();
         }
         app
     }
@@ -245,6 +257,12 @@ impl HubApp {
 
     #[cfg(target_os = "macos")]
     fn handle_tray(&mut self, ctx: &egui::Context) {
+        let app_active = app_is_active();
+        if self.window_hidden && app_active && !self.app_was_active {
+            self.show_main_window(ctx);
+        }
+        self.app_was_active = app_active;
+
         let running = self.server.lock().running;
         if let Some(tray) = self.tray.as_mut() {
             tray.set_running(running);
@@ -252,10 +270,7 @@ impl HubApp {
 
         while let Some(action) = self.tray.as_ref().and_then(MacosTray::next_action) {
             match action {
-                TrayAction::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                TrayAction::ShowWindow => self.show_main_window(ctx),
                 TrayAction::ToggleServer => {
                     if self.server.lock().running {
                         self.stop_server();
@@ -273,6 +288,14 @@ impl HubApp {
             }
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn show_main_window(&mut self, ctx: &egui::Context) {
+        self.window_hidden = false;
+        activate_app();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
 }
 
 impl eframe::App for HubApp {
@@ -284,6 +307,7 @@ impl eframe::App for HubApp {
         if !self.quitting && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_hidden = true;
             self.message = "窗口已隐藏，代理继续在状态栏运行".to_string();
         }
 

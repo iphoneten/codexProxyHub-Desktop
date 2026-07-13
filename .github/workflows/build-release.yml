@@ -13,9 +13,22 @@ env:
   RECODEX_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
+  prepare:
+    name: Prepare build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      build_time: ${{ steps.build_time.outputs.value }}
+    steps:
+      - name: Generate build time
+        id: build_time
+        run: echo "value=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: prepare
     runs-on: macos-14
+    env:
+      RECODEX_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,9 +36,11 @@ jobs:
           - arch: Apple-Silicon
             target: aarch64-apple-darwin
             artifact: recodexProxyHub-macos-arm64
+            asset_pattern: recodexProxyHub-v*-macos-arm64-*.dmg
           - arch: Intel
             target: x86_64-apple-darwin
             artifact: recodexProxyHub-macos-x86_64
+            asset_pattern: recodexProxyHub-v*-macos-x86_64-*.dmg
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust target
@@ -35,12 +50,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.dmg
+          path: dist/${{ matrix.asset_pattern }}
           if-no-files-found: error
 
   windows:
     name: Windows x86_64
+    needs: prepare
     runs-on: windows-latest
+    env:
+      RECODEX_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust target
@@ -51,13 +69,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: recodexProxyHub-windows-x86_64
-          path: dist/recodexProxyHub-windows-x86_64.zip
+          path: dist/recodexProxyHub-v*-windows-x86_64-*.zip
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs:
+      - prepare
       - macos
       - windows
     runs-on: ubuntu-latest
@@ -72,9 +91,9 @@ jobs:
           merge-multiple: true
       - name: Verify release packages
         run: |
-          test -f release-assets/recodexProxyHub-macos-arm64.dmg
-          test -f release-assets/recodexProxyHub-macos-x86_64.dmg
-          test -f release-assets/recodexProxyHub-windows-x86_64.zip
+          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-macos-arm64-*.dmg' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-macos-x86_64-*.dmg' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-windows-x86_64-*.zip' | wc -l)" -eq 1
           ls -lh release-assets
       - name: Create or update release
         env:
@@ -84,6 +103,24 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" release-assets/* \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
+            while IFS= read -r asset; do
+              case "$asset" in
+                "recodexProxyHub-$GITHUB_REF_NAME-macos-arm64-"*.dmg|\
+                "recodexProxyHub-$GITHUB_REF_NAME-macos-x86_64-"*.dmg|\
+                "recodexProxyHub-$GITHUB_REF_NAME-windows-x86_64-"*.zip)
+                  if [[ ! -f "release-assets/$asset" ]]; then
+                    gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+                      --yes \
+                      --repo "$GITHUB_REPOSITORY"
+                  fi
+                  ;;
+              esac
+            done < <(
+              gh release view "$GITHUB_REF_NAME" \
+                --json assets \
+                --jq '.assets[].name' \
+                --repo "$GITHUB_REPOSITORY"
+            )
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
               --verify-tag \

@@ -58,7 +58,7 @@ rustup target add aarch64-apple-darwin
 产物为：
 
 ```text
-dist/recodexProxyHub-macos-arm64.dmg
+dist/recodexProxyHub-v1.2.3-macos-arm64-20260713-123456.dmg
 ```
 
 ### macOS Intel
@@ -73,7 +73,7 @@ rustup target add x86_64-apple-darwin
 产物为：
 
 ```text
-dist/recodexProxyHub-macos-x86_64.dmg
+dist/recodexProxyHub-v1.2.3-macos-x86_64-20260713-123456.dmg
 ```
 
 ### Windows x64
@@ -88,10 +88,10 @@ rustup target add x86_64-pc-windows-msvc
 产物为：
 
 ```text
-dist/recodexProxyHub-windows-x86_64.zip
+dist/recodexProxyHub-v1.2.3-windows-x86_64-20260713-123456.zip
 ```
 
-也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包。手动从普通分支运行时，构建结果位于对应工作流的 Artifacts。
+文件名中的末尾时间为 UTC 构建时间，格式为 `YYYYMMDD-HHMMSS`。也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包；同一次工作流的三个产物共享同一个时间戳。手动从普通分支运行时，构建结果位于对应工作流的 Artifacts。
 
 发布 tag 必须使用 `vX.Y.Z` 格式，例如：
 
@@ -100,9 +100,9 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-推送 tag 后，GitHub Actions 会构建三个平台，全部成功后自动创建 `v1.2.3` Release、生成发布说明并上传两个 DMG 和一个 Windows ZIP。重新运行同一 tag 的工作流会覆盖 Release 中的同名附件。
+推送 tag 后，GitHub Actions 会构建三个平台，全部成功后自动创建 `v1.2.3` Release、生成发布说明并上传两个 DMG 和一个 Windows ZIP。重新运行同一 tag 的工作流会上传带新时间戳的产物，并清理该 tag 中对应平台的旧附件。
 
-打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `RECODEX_VERSION=1.2.3` 显式覆盖。
+打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `RECODEX_VERSION=1.2.3` 显式覆盖。构建时间默认使用当前 UTC 时间，也可以通过 `RECODEX_BUILD_TIME=20260713-123456` 固定。
 
 macOS 脚本会生成 `recodexProxyHub.app` 和带 Applications 快捷方式的 DMG。打包时如果当前目录存在 `config.yaml`，会内置到 App 的 `Resources` 中；首次从 App 启动时会复制到：
 

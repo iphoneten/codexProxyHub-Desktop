@@ -27,6 +27,13 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 export RECODEX_VERSION="$VERSION"
 
+BUILD_TIME="${RECODEX_BUILD_TIME:-$(date -u +%Y%m%d-%H%M%S)}"
+if [[ ! "$BUILD_TIME" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+  echo "error: invalid build time: $BUILD_TIME" >&2
+  echo "expected UTC format: YYYYMMDD-HHMMSS" >&2
+  exit 1
+fi
+
 case "$TARGET" in
   aarch64-apple-darwin)
     ARCH_NAME="arm64"
@@ -47,7 +54,7 @@ DMG_STAGE_DIR="$WORK_DIR/dmg-root"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-DMG_PATH="$DIST_DIR/$APP_NAME-macos-$ARCH_NAME.dmg"
+DMG_PATH="$DIST_DIR/$APP_NAME-v$VERSION-macos-$ARCH_NAME-$BUILD_TIME.dmg"
 APPICONSET_DIR="$ROOT_DIR/icon/AppIcons/Assets.xcassets/AppIcon.appiconset"
 ICON_PNG="$ROOT_DIR/icon/icon_1024.png"
 ICONSET_DIR="$WORK_DIR/$APP_NAME.iconset"
@@ -204,15 +211,17 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# 先签名最终 .app，再复制到 DMG。这样无论使用 .app 还是 DMG 安装，
+# bundle 都包含完整的 _CodeSignature/CodeResources。
+codesign --force --deep --sign - --timestamp=none "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+
 mkdir -p "$DMG_STAGE_DIR"
 cp -R "$APP_DIR" "$DMG_STAGE_DIR/$APP_NAME.app"
 ln -s /Applications "$DMG_STAGE_DIR/Applications"
 
-# 对整个 .app 做 ad-hoc 签名，避免下载后 Gatekeeper 报"已损坏"。
-# 这不是 Apple Developer ID 签名，只是内部一致性签名；用户首次打开仍需右键"打开"
-# 或执行 xattr -dr com.apple.quarantine 移除下载隔离标记。
-codesign --force --deep --sign - --timestamp=none \
-  "$DMG_STAGE_DIR/$APP_NAME.app"
+# 验证复制过程没有破坏签名。这不是 Apple Developer ID 签名，下载后仍可能需要
+# 右键"打开"或执行 xattr -dr com.apple.quarantine 移除隔离标记。
 codesign --verify --deep --strict "$DMG_STAGE_DIR/$APP_NAME.app"
 
 hdiutil create \
@@ -224,3 +233,4 @@ hdiutil create \
 
 echo "DMG created: $DMG_PATH"
 echo "Version: $VERSION"
+echo "Build time (UTC): $BUILD_TIME"

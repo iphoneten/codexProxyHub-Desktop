@@ -5,9 +5,6 @@ $BinName = "recodex-proxy-hub"
 $Target = "x86_64-pc-windows-msvc"
 $RootDir = Split-Path -Parent $PSScriptRoot
 $DistDir = Join-Path $RootDir "dist"
-$PackageName = "$AppName-windows-x86_64"
-$PackageDir = Join-Path $DistDir $PackageName
-$ZipPath = Join-Path $DistDir "$PackageName.zip"
 $ExePath = Join-Path $RootDir "target\$Target\release\$BinName.exe"
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -39,6 +36,18 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 }
 $env:RECODEX_VERSION = $Version
 
+$BuildTime = $env:RECODEX_BUILD_TIME
+if ([string]::IsNullOrWhiteSpace($BuildTime)) {
+    $BuildTime = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+}
+if ($BuildTime -notmatch '^\d{8}-\d{6}$') {
+    throw "Invalid build time '$BuildTime'. Expected UTC format: YYYYMMDD-HHMMSS"
+}
+
+$PackageName = "$AppName-v$Version-windows-x86_64-$BuildTime"
+$PackageDir = Join-Path $DistDir $PackageName
+$ZipPath = Join-Path $DistDir "$PackageName.zip"
+
 $InstalledTargets = rustup target list --installed
 if ($InstalledTargets -notcontains $Target) {
     throw "Rust target is not installed: $Target. Run: rustup target add $Target"
@@ -68,6 +77,7 @@ try {
     Compress-Archive -Path "$PackageDir\*" -DestinationPath $ZipPath -CompressionLevel Optimal
     Write-Host "Windows package created: $ZipPath"
     Write-Host "Version: $Version"
+    Write-Host "Build time (UTC): $BuildTime"
 }
 finally {
     Pop-Location
