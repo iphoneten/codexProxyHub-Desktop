@@ -832,10 +832,16 @@ impl StreamState {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("upstream error");
-                out.push(self.build_chunk(
-                    json!({"content": format!("[stream error: {msg}]")}),
-                    Some("stop"),
-                ));
+                let error_type = payload
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream_error");
+                out.push(json!({
+                    "error": {
+                        "message": msg,
+                        "type": error_type
+                    }
+                }));
                 self.finished = true;
             }
             _ => {}
@@ -1111,5 +1117,26 @@ mod tests {
         }));
         assert!(state.finished);
         assert_eq!(state.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn stream_state_error_emits_error_object_not_text_delta() {
+        let mut state = StreamState::new("gpt-5".into());
+        let out = state.handle_event(&json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "Concurrency limit exceeded for account, please retry later"
+            }
+        }));
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            out[0]["error"]["message"],
+            "Concurrency limit exceeded for account, please retry later"
+        );
+        assert!(out[0]["choices"].is_null());
+        assert!(state.finished);
     }
 }

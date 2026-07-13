@@ -677,7 +677,7 @@ async fn send_anthropic_chat_stream_as_responses(
                     ));
                 }
                 let (anthropic_usage_rx, chat_stream) =
-                    crate::anthropic::spawn_stream_translator(resp, request_model.clone());
+                    prepare_anthropic_stream(resp, request_model.clone()).await?;
                 let mut result =
                     chat_sse_stream_to_responses(chat_stream, request_model, custom_tool_names)?;
                 result.usage_rx = Some(anthropic_usage_rx);
@@ -719,6 +719,111 @@ fn chat_stream_to_responses(
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
     chat_sse_stream_to_responses(stream, request_model, custom_tool_names)
+}
+
+async fn prepare_anthropic_stream(
+    resp: reqwest::Response,
+    request_model: String,
+) -> Result<
+    (
+        oneshot::Receiver<TokenUsage>,
+        ReceiverStream<Result<Bytes, io::Error>>,
+    ),
+    ProxyError,
+> {
+    let mut upstream = Box::pin(
+        resp.bytes_stream()
+            .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
+    );
+    let mut prefix = Vec::new();
+    let mut text_buffer = String::new();
+
+    loop {
+        match upstream.next().await {
+            Some(Ok(bytes)) => {
+                text_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                prefix.extend_from_slice(&bytes);
+                let Some((event, _)) = next_sse_event(&text_buffer) else {
+                    continue;
+                };
+                if let Some(data) = sse_data(&event) {
+                    if let Some(err) = anthropic_sse_error(&data) {
+                        return Err(err);
+                    }
+                    if !anthropic_sse_has_client_output(&data) {
+                        continue;
+                    }
+                }
+                break;
+            }
+            Some(Err(err)) => {
+                return Err(ProxyError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Anthropic 上游流读取失败: {err}"),
+                ));
+            }
+            None => {
+                return Err(ProxyError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "Anthropic 上游流未返回任何 SSE 事件",
+                ));
+            }
+        }
+    }
+
+    let prefix = Bytes::from(prefix);
+    let stream =
+        futures_util::stream::once(async move { Ok::<Bytes, io::Error>(prefix) }).chain(upstream);
+    Ok(crate::anthropic::spawn_stream_translator(
+        stream,
+        request_model,
+    ))
+}
+
+fn anthropic_sse_error(data: &str) -> Option<ProxyError> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("Anthropic upstream error");
+    let error_type = value
+        .pointer("/error/type")
+        .and_then(Value::as_str)
+        .unwrap_or("upstream_error");
+    let lower = format!("{error_type} {message}").to_ascii_lowercase();
+    let status =
+        if lower.contains("rate") || lower.contains("limit") || lower.contains("concurrency") {
+            StatusCode::TOO_MANY_REQUESTS
+        } else if lower.contains("overload") || lower.contains("unavailable") {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+    Some(ProxyError::new(status, truncate(message)))
+}
+
+fn anthropic_sse_has_client_output(data: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return true;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => {
+            value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+        }
+        Some("content_block_delta") => match value.pointer("/delta/type").and_then(Value::as_str) {
+            Some("text_delta") => value
+                .pointer("/delta/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            Some("input_json_delta") => true,
+            _ => false,
+        },
+        Some("message_stop") => true,
+        _ => false,
+    }
 }
 
 fn chat_sse_stream_to_responses<S>(
@@ -835,6 +940,25 @@ where
                         }
                         // 顺便累积 usage（OpenAI include_usage 的 chunk 通常在 [DONE] 之前抵达）
                         accumulate_usage_from_sse_data(&data, &mut usage);
+                        if let Some(message) = chat_stream_error_message(&data) {
+                            let _ = send_response_sse(
+                                &tx,
+                                "response.failed",
+                                json!({
+                                    "type": "response.failed",
+                                    "response": {
+                                        "id": response_id,
+                                        "status": "failed",
+                                        "model": model,
+                                        "error": {"message": message}
+                                    }
+                                }),
+                            )
+                            .await;
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ = u_tx.send(usage);
+                            return;
+                        }
                         if let Some(delta) = chat_stream_delta(&data) {
                             full_text.push_str(&delta);
                             let _ = send_response_sse(
@@ -1155,6 +1279,15 @@ fn chat_stream_tool_call_deltas(data: &str) -> Vec<ChatToolCallDelta> {
         .collect()
 }
 
+fn chat_stream_error_message(data: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    let error = value.get("error")?;
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        return Some(truncate(message));
+    }
+    Some(truncate(&error.to_string()))
+}
+
 async fn send_response_sse(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     event: &str,
@@ -1371,7 +1504,7 @@ async fn send_to_anthropic_provider(
                         ));
                     }
                     let (usage_rx, body_stream) =
-                        crate::anthropic::spawn_stream_translator(resp, request_model.clone());
+                        prepare_anthropic_stream(resp, request_model.clone()).await?;
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -3230,6 +3363,31 @@ mod tests {
         assert!(sse.contains("\"type\":\"custom_tool_call\""));
         assert!(sse.contains("\"name\":\"apply_patch\""));
         assert!(sse.contains("*** Begin Patch\\n*** End Patch"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_error_becomes_response_failed() {
+        let chunk = json!({
+            "error": {
+                "message": "Concurrency limit exceeded for account, please retry later",
+                "type": "rate_limit_error"
+            }
+        });
+        let bytes = Bytes::from(format!("data: {chunk}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let result =
+            chat_sse_stream_to_responses(stream, "claude-test".to_string(), HashSet::new())
+                .unwrap();
+        let body = to_bytes(result.response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let sse = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(sse.contains("event: response.failed"));
+        assert!(sse.contains("Concurrency limit exceeded"));
+        assert!(!sse.contains("event: response.completed"));
+        assert!(!sse.contains("[stream error:"));
     }
 
     #[test]

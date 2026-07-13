@@ -498,19 +498,22 @@ fn extract_anthropic_usage(body: &Value) -> (i64, i64) {
 
 /// 把上游 Anthropic 流式响应转换成 OpenAI chat.completion.chunk 流。
 /// 返回：客户端字节流 + 最终 usage oneshot。
-pub fn spawn_stream_translator(
-    resp: reqwest::Response,
+pub fn spawn_stream_translator<S>(
+    stream: S,
     request_model: String,
 ) -> (
     oneshot::Receiver<TokenUsage>,
     ReceiverStream<Result<Bytes, io::Error>>,
-) {
+)
+where
+    S: futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
-        let mut stream = resp.bytes_stream();
+        let mut stream = Box::pin(stream);
         // 首个 chunk 先发 role=assistant，OpenAI 客户端惯例
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
             let _ = u_tx.send(state.usage);
@@ -532,6 +535,26 @@ pub fn spawn_stream_translator(
                         let Ok(payload) = serde_json::from_str::<Value>(&data) else {
                             continue;
                         };
+                        if payload.get("type").and_then(Value::as_str) == Some("error") {
+                            let message = payload
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Anthropic upstream error");
+                            let error_type = payload
+                                .pointer("/error/type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("upstream_error");
+                            let error = json!({
+                                "error": {
+                                    "message": message,
+                                    "type": error_type
+                                }
+                            });
+                            let _ = send_json_chunk(&tx, &error).await;
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ = u_tx.send(state.usage);
+                            return;
+                        }
                         let outputs = state.handle_event(&payload);
                         for out in outputs {
                             if send_json_chunk(&tx, &out).await.is_err() {
@@ -748,17 +771,6 @@ impl StreamState {
                     out.push(self.build_terminal_chunk());
                 }
             }
-            Some("error") => {
-                let msg = payload
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("upstream error");
-                out.push(self.build_chunk(
-                    json!({"content": format!("[stream error: {msg}]")}),
-                    Some("stop"),
-                ));
-                self.finished = true;
-            }
             _ => {}
         }
         out
@@ -929,5 +941,28 @@ mod tests {
             out[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
             "{\"q\":\""
         );
+    }
+
+    #[tokio::test]
+    async fn stream_translator_emits_error_chunk_without_assistant_text() {
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "Concurrency limit exceeded for account, please retry later"
+            }
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let input = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+        let (_usage_rx, mut stream) = spawn_stream_translator(input, "claude-test".to_string());
+        let mut out = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            out.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+
+        assert!(out.contains("\"error\""));
+        assert!(out.contains("Concurrency limit exceeded"));
+        assert!(!out.contains("[stream error:"));
     }
 }
