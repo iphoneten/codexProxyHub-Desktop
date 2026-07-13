@@ -2,6 +2,8 @@
 
 Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的配置格式重构。
 
+完整配置字段说明见 [docs/doc.md](docs/doc.md)。
+
 ## 目标
 
 - 使用 Rust 实现本机 OpenAI 兼容代理服务。
