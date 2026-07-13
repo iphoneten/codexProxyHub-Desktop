@@ -55,9 +55,7 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
                 }
                 "assistant" => {
                     // 文本部分（若有）
-                    if let Some(text) = msg
-                        .get("content")
-                        .and_then(|c| extract_plain_text(Some(c)))
+                    if let Some(text) = msg.get("content").and_then(|c| extract_plain_text(Some(c)))
                     {
                         if !text.is_empty() {
                             input_items.push(json!({
@@ -143,7 +141,10 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
     out.insert("model".into(), Value::String(model));
     out.insert("input".into(), Value::Array(input_items));
     if !instructions.is_empty() {
-        out.insert("instructions".into(), Value::String(instructions.join("\n\n")));
+        out.insert(
+            "instructions".into(),
+            Value::String(instructions.join("\n\n")),
+        );
     }
 
     // 采样参数
@@ -174,10 +175,7 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
     // response_format=json_object -> text.format
     if let Some(rf) = obj.get("response_format") {
         if rf.get("type").and_then(Value::as_str) == Some("json_object") {
-            out.insert(
-                "text".into(),
-                json!({"format": {"type": "json_object"}}),
-            );
+            out.insert("text".into(), json!({"format": {"type": "json_object"}}));
         } else if rf.get("type").and_then(Value::as_str) == Some("json_schema") {
             // 尽量转 json_schema：Responses 用 text.format
             if let Some(schema) = rf.get("json_schema") {
@@ -277,10 +275,7 @@ fn convert_user_content(content: Option<&Value>) -> Result<Value, String> {
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        let text = part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
+                        let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                         out.push(json!({"type": "input_text", "text": text}));
                     }
                     Some("image_url") => {
@@ -474,7 +469,10 @@ fn extract_usage(body: &Value) -> (i64, i64) {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let output = usage
-        .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
+        .and_then(|u| {
+            u.get("output_tokens")
+                .or_else(|| u.get("completion_tokens"))
+        })
         .and_then(Value::as_i64)
         .unwrap_or(0);
     (input, output)
@@ -535,8 +533,13 @@ pub fn spawn_responses_stream_translator(
             }
         }
         if !state.finished {
-            let terminal = state.build_terminal_chunk();
-            let _ = send_json_chunk(&tx, &terminal).await;
+            let _ = tx
+                .send(Err(io::Error::other(
+                    "Responses 上游流未收到完成事件就已结束",
+                )))
+                .await;
+            let _ = u_tx.send(state.usage);
+            return;
         }
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         let _ = u_tx.send(state.usage);
@@ -600,10 +603,14 @@ impl StreamState {
 
     fn build_terminal_chunk(&mut self) -> Value {
         self.finished = true;
-        let reason = self
-            .finish_reason
-            .clone()
-            .unwrap_or_else(|| if self.tool_slots.is_empty() { "stop" } else { "tool_calls" }.to_string());
+        let reason = self.finish_reason.clone().unwrap_or_else(|| {
+            if self.tool_slots.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+            .to_string()
+        });
         let mut chunk = self.build_chunk(json!({}), Some(reason.as_str()));
         chunk["usage"] = json!({
             "prompt_tokens": self.usage.input,
@@ -639,9 +646,7 @@ impl StreamState {
                 let index = payload.get("output_index").and_then(Value::as_u64);
                 let item = payload.get("item");
                 if let (Some(index), Some(item)) = (index, item) {
-                    if let Some("function_call") =
-                        item.get("type").and_then(Value::as_str)
-                    {
+                    if let Some("function_call") = item.get("type").and_then(Value::as_str) {
                         let slot = self.tool_slots_seq;
                         self.tool_slots_seq += 1;
                         self.tool_slots.insert(index, slot);
@@ -651,10 +656,8 @@ impl StreamState {
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                        let initial_args = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let initial_args =
+                            item.get("arguments").and_then(Value::as_str).unwrap_or("");
                         out.push(self.build_chunk(
                             json!({
                                 "tool_calls": [{
@@ -914,7 +917,10 @@ mod tests {
         }));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
-        assert_eq!(out[0]["choices"][0]["delta"]["tool_calls"][0]["id"], "call_z");
+        assert_eq!(
+            out[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_z"
+        );
         // arguments delta
         let out = state.handle_event(&json!({
             "type": "response.function_call_arguments.delta",

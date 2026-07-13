@@ -12,6 +12,7 @@ Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的
 
 - 桌面端启动/停止本机代理。
 - 桌面端编辑服务监听地址、鉴权开关、代理 API Key、渠道启用状态、优先级、权重、超时、模型列表。
+- 桌面端通过原生文件对话框导入和导出 YAML 配置。
 - `GET /health`
 - `GET /v1/models`
 - `GET /v1/models/{model}`
@@ -22,6 +23,7 @@ Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的
 - Bearer API Key 鉴权。
 - 按模型匹配、优先级、权重和模型 fallback 选择 provider。
 - 上游 429、5xx、网络错误时重试和故障转移。
+- Chat Completions 与 Responses 流式响应中途断开时，在同一客户端 SSE 连接内续接下一个可用渠道。
 - `/v1/responses` 对 `responses_mode: chat` 或上游不支持 Responses API 的情况做基础 Chat Completions 兼容包装。
 - SQLite 用量日志（`usage_log.backend: sqlite`），并保留 JSONL 兼容写入模式。
 

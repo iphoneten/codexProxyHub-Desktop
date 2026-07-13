@@ -8,6 +8,9 @@ use rusqlite::Connection;
 use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
+#[cfg(target_os = "macos")]
+use crate::macos_tray::{MacosTray, TrayAction};
+
 pub struct HubApp {
     config_path: String,
     config: Option<AppConfig>,
@@ -22,6 +25,10 @@ pub struct HubApp {
     log_view: LogViewState,
     // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
     config_handle: Option<ConfigHandle>,
+    #[cfg(target_os = "macos")]
+    tray: Option<MacosTray>,
+    #[cfg(target_os = "macos")]
+    quitting: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,19 +88,24 @@ impl HubApp {
             provider_header_drafts: Vec::new(),
             log_view: LogViewState::default(),
             config_handle: None,
+            #[cfg(target_os = "macos")]
+            tray: None,
+            #[cfg(target_os = "macos")]
+            quitting: false,
         };
         app.load_config();
+        #[cfg(target_os = "macos")]
+        match MacosTray::new(&cc.egui_ctx) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(err) => app.message = err,
+        }
         app
     }
 
     fn load_config(&mut self) {
         match AppConfig::load(PathBuf::from(self.config_path.trim())) {
             Ok(config) => {
-                self.config = Some(config);
-                self.selected_provider = Some(0);
-                self.provider_mapping_drafts.clear();
-                self.provider_header_drafts.clear();
-                self.log_view = LogViewState::default();
+                self.replace_config(config);
                 self.message = "配置已加载".to_string();
             }
             Err(err) => {
@@ -106,6 +118,14 @@ impl HubApp {
         }
     }
 
+    fn replace_config(&mut self, config: AppConfig) {
+        self.config = Some(config);
+        self.selected_provider = Some(0);
+        self.provider_mapping_drafts.clear();
+        self.provider_header_drafts.clear();
+        self.log_view = LogViewState::default();
+    }
+
     fn save_config(&mut self) {
         let Some(config) = self.config.as_ref() else {
             self.message = "没有可保存的配置".to_string();
@@ -114,6 +134,45 @@ impl HubApp {
         match config.save(PathBuf::from(self.config_path.trim())) {
             Ok(()) => self.message = "配置已保存".to_string(),
             Err(err) => self.message = err.to_string(),
+        }
+    }
+
+    fn import_config(&mut self) {
+        let Some(source_path) = config_file_dialog(&self.config_path).pick_file() else {
+            return;
+        };
+        let target_path = PathBuf::from(self.config_path.trim());
+
+        match AppConfig::load(&source_path) {
+            Ok(imported) => match imported.save(&target_path) {
+                Ok(()) => match AppConfig::load(&target_path) {
+                    Ok(config) => {
+                        self.replace_config(config);
+                        self.message = format!("配置已导入: {}", source_path.display());
+                    }
+                    Err(err) => self.message = err.to_string(),
+                },
+                Err(err) => self.message = format!("导入配置写入失败: {err}"),
+            },
+            Err(err) => self.message = format!("导入配置无效: {err}"),
+        }
+    }
+
+    fn export_config(&mut self) {
+        let Some(config) = self.config.as_ref() else {
+            self.message = "没有可导出的配置".to_string();
+            return;
+        };
+        let Some(target_path) = config_file_dialog(&self.config_path)
+            .set_file_name("config.yaml")
+            .save_file()
+        else {
+            return;
+        };
+
+        match config.save(&target_path) {
+            Ok(()) => self.message = format!("配置已导出: {}", target_path.display()),
+            Err(err) => self.message = format!("导出配置失败: {err}"),
         }
     }
 
@@ -183,10 +242,51 @@ impl HubApp {
             *handle.write() = Arc::new(cfg.clone());
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        let running = self.server.lock().running;
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_running(running);
+        }
+
+        while let Some(action) = self.tray.as_ref().and_then(MacosTray::next_action) {
+            match action {
+                TrayAction::ShowWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::ToggleServer => {
+                    if self.server.lock().running {
+                        self.stop_server();
+                    } else {
+                        self.start_server();
+                    }
+                }
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    if self.server.lock().running {
+                        self.stop_server();
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for HubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        self.handle_tray(ctx);
+
+        #[cfg(target_os = "macos")]
+        if !self.quitting && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.message = "窗口已隐藏，代理继续在状态栏运行".to_string();
+        }
+
         // 把 UI 修改推送到运行中的代理，确保 provider.enabled 等改动即时生效
         self.sync_config_to_runtime();
 
@@ -298,9 +398,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                     if soft_button(ui, "重新加载").clicked() {
                         app.load_config();
                     }
+                    if soft_button(ui, "导出配置").clicked() {
+                        app.export_config();
+                    }
+                    if soft_button(ui, "导入配置").clicked() {
+                        app.import_config();
+                    }
                 });
             });
         });
+}
+
+fn config_file_dialog(config_path: &str) -> rfd::FileDialog {
+    let path = PathBuf::from(config_path.trim());
+    let mut dialog = rfd::FileDialog::new().add_filter("YAML 配置", &["yaml", "yml"]);
+    if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
+        dialog = dialog.set_directory(parent);
+    }
+    dialog
 }
 
 fn status_bar(ui: &mut egui::Ui, app: &HubApp) {

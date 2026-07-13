@@ -69,9 +69,7 @@ pub fn openai_to_anthropic_request(body: &Value) -> Result<Value, String> {
                     let mut appended = false;
                     if let Some(last) = messages.last_mut() {
                         if last.get("role").and_then(Value::as_str) == Some("user") {
-                            if let Some(arr) = last
-                                .get_mut("content")
-                                .and_then(Value::as_array_mut)
+                            if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut)
                             {
                                 arr.push(block.clone());
                                 appended = true;
@@ -151,10 +149,7 @@ pub fn openai_to_anthropic_request(body: &Value) -> Result<Value, String> {
     }
     // metadata.user_id
     if let Some(user) = obj.get("user").and_then(Value::as_str) {
-        out.insert(
-            "metadata".into(),
-            json!({ "user_id": user }),
-        );
+        out.insert("metadata".into(), json!({ "user_id": user }));
     }
 
     // tools 翻译
@@ -245,10 +240,7 @@ fn convert_user_content(content: Option<&Value>) -> Result<Value, String> {
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        let text = part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
+                        let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                         out.push(json!({"type": "text", "text": text}));
                     }
                     Some("image_url") => {
@@ -312,10 +304,7 @@ fn convert_image_url(url: &str) -> Value {
 
 fn convert_assistant_content(msg: &Value) -> Result<Value, String> {
     let mut blocks: Vec<Value> = Vec::new();
-    if let Some(text) = msg
-        .get("content")
-        .and_then(|c| extract_plain_text(Some(c)))
-    {
+    if let Some(text) = msg.get("content").and_then(|c| extract_plain_text(Some(c))) {
         if !text.is_empty() {
             blocks.push(json!({"type": "text", "text": text}));
         }
@@ -336,8 +325,7 @@ fn convert_assistant_content(msg: &Value) -> Result<Value, String> {
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let input: Value =
-                serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
+            let input: Value = serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
             blocks.push(json!({
                 "type": "tool_use",
                 "id": id,
@@ -349,12 +337,8 @@ fn convert_assistant_content(msg: &Value) -> Result<Value, String> {
     // 兼容旧字段 function_call
     if let Some(fc) = msg.get("function_call") {
         if let Some(name) = fc.get("name").and_then(Value::as_str) {
-            let args_raw = fc
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let input: Value =
-                serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
+            let args_raw = fc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+            let input: Value = serde_json::from_str(args_raw).unwrap_or_else(|_| json!({}));
             blocks.push(json!({
                 "type": "tool_use",
                 "id": format!("call_{}", Uuid::new_v4().simple()),
@@ -566,10 +550,14 @@ pub fn spawn_stream_translator(
                 }
             }
         }
-        // 上游结束：确保发出终结 chunk 和 [DONE]
         if !state.finished {
-            let terminal = state.build_terminal_chunk();
-            let _ = send_json_chunk(&tx, &terminal).await;
+            let _ = tx
+                .send(Err(io::Error::other(
+                    "Anthropic 上游流未收到 message_stop 就已结束",
+                )))
+                .await;
+            let _ = u_tx.send(state.usage);
+            return;
         }
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         let _ = u_tx.send(state.usage);
@@ -706,9 +694,7 @@ impl StreamState {
                         Some("text_delta") => {
                             if let Some(t) = delta.get("text").and_then(Value::as_str) {
                                 if !t.is_empty() {
-                                    out.push(
-                                        self.build_chunk(json!({"content": t}), None),
-                                    );
+                                    out.push(self.build_chunk(json!({"content": t}), None));
                                 }
                             }
                         }

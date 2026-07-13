@@ -139,7 +139,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>
   <string>$APP_NAME</string>
   <key>CFBundleIconFile</key>
-  <string>$ICON_ICNS_NAME</string>
+  <string>${ICON_ICNS_NAME%.icns}</string>
+  <key>CFBundleIconName</key>
+  <string>${ICON_ICNS_NAME%.icns}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>

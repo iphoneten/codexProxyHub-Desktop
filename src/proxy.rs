@@ -20,6 +20,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -85,6 +86,8 @@ struct ProviderResult {
     // 流式请求会在此提供最终 usage；外层收到 Some 时改为异步落日志
     usage_rx: Option<oneshot::Receiver<TokenUsage>>,
 }
+
+type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
 #[derive(Debug)]
 struct ProxyError {
@@ -257,6 +260,9 @@ async fn responses(
     let model = body_model(&body)?;
     let providers = provider_attempts(&cfg, &state, &model, "responses");
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        return responses_stream_with_failover(state, headers, body, model, providers);
+    }
     let mut last_error = None;
 
     for (provider, request_model) in providers {
@@ -390,6 +396,184 @@ async fn responses(
     ))
 }
 
+fn responses_stream_with_failover(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+    model: String,
+    providers: Vec<(ProviderConfig, String)>,
+) -> Result<Response, ProxyError> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let cfg = state.snapshot();
+        let custom_tool_names = responses_custom_tool_names(body.get("tools"));
+        let mut stream_state = ManagedResponsesStream::new(model.clone(), custom_tool_names);
+        if stream_state.send_started(&tx).await.is_err() {
+            return;
+        }
+
+        let mut last_error = None;
+        let mut attempted = HashSet::new();
+        for (provider, request_model) in providers {
+            if !attempted.insert((provider.name.clone(), request_model.clone())) {
+                continue;
+            }
+            let started = Instant::now();
+            let mut upstream_body = with_model(body.clone(), &request_model);
+            apply_model_mapping(&provider, &mut upstream_body);
+            let mut chat_body = match responses_to_chat_body(&upstream_body) {
+                Ok(value) => value,
+                Err(err) => {
+                    last_error = Some(err.message);
+                    continue;
+                }
+            };
+            apply_stream_continuation(&mut chat_body, &stream_state.full_text);
+
+            match open_responses_as_chat_stream(&state, &provider, &headers, chat_body).await {
+                Ok(result) => {
+                    let upstream_model = result.upstream_model.clone();
+                    let stream = result
+                        .response
+                        .into_body()
+                        .into_data_stream()
+                        .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+                    match stream_state.relay(Box::pin(stream), &tx).await {
+                        Ok(()) => {
+                            stream_state.send_completed(&tx).await;
+                            log_success(
+                                &cfg,
+                                "responses",
+                                &provider.name,
+                                &model,
+                                &upstream_model,
+                                stream_state.usage,
+                                started,
+                                false,
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            let message = format!("上游流中断，准备切换渠道: {err}");
+                            log_error(
+                                &cfg,
+                                "responses",
+                                &provider.name,
+                                &request_model,
+                                started,
+                                &message,
+                            );
+                            last_error = Some(message);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let message = err.message;
+                    log_error(
+                        &cfg,
+                        "responses",
+                        &provider.name,
+                        &request_model,
+                        started,
+                        &message,
+                    );
+                    if should_stop_failover(err.status) {
+                        stream_state.send_failed(&tx, &message).await;
+                        return;
+                    }
+                    last_error = Some(message);
+                }
+            }
+        }
+
+        let message = last_error.unwrap_or_else(|| format!("模型 '{model}' 没有可用渠道"));
+        stream_state.send_failed(&tx, &message).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .map_err(|err| ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()))
+}
+
+fn apply_stream_continuation(body: &mut Value, partial_text: &str) {
+    if partial_text.is_empty() {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    messages.push(json!({
+        "role": "assistant",
+        "content": partial_text
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": "Continue exactly from where the previous response stopped. Output only the continuation and do not repeat text already produced."
+    }));
+}
+
+async fn open_responses_as_chat_stream(
+    state: &AppState,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    chat_body: Value,
+) -> Result<ProviderResult, ProxyError> {
+    let supports_responses =
+        !matches!(provider.capabilities.get("supports_responses"), Some(false));
+    let prefer_chat = provider.provider_type == "anthropic"
+        || provider.responses_mode == "chat"
+        || is_google_openai_endpoint(&provider.base_url)
+        || !supports_responses;
+
+    if prefer_chat {
+        match send_to_provider(
+            state,
+            provider,
+            "/chat/completions",
+            request_headers,
+            chat_body.clone(),
+            true,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(err)
+                if provider.responses_mode == "auto"
+                    && (err.status == StatusCode::NOT_FOUND
+                        || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
+            {
+                send_chat_via_responses(state, provider, request_headers, chat_body, true).await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        match send_chat_via_responses(state, provider, request_headers, chat_body.clone(), true)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(err)
+                if provider.responses_mode == "auto"
+                    && (err.status == StatusCode::NOT_FOUND
+                        || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
+            {
+                send_to_provider(
+                    state,
+                    provider,
+                    "/chat/completions",
+                    request_headers,
+                    chat_body,
+                    true,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
 async fn forward_openai(
     state: AppState,
     headers: HeaderMap,
@@ -401,6 +585,9 @@ async fn forward_openai(
     let model = body_model(&body)?;
     let providers = provider_attempts(&cfg, &state, &model, api);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream && path == "/chat/completions" {
+        return chat_stream_with_failover(state, headers, body, model, providers);
+    }
     let mut last_error = None;
 
     for (provider, request_model) in providers {
@@ -472,6 +659,137 @@ async fn forward_openai(
         StatusCode::BAD_GATEWAY,
         last_error.unwrap_or_else(|| format!("模型 '{}' 没有可用渠道", model)),
     ))
+}
+
+fn chat_stream_with_failover(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+    model: String,
+    providers: Vec<(ProviderConfig, String)>,
+) -> Result<Response, ProxyError> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let cfg = state.snapshot();
+        let mut stream_state = ManagedChatStream::new();
+        let mut last_error = None;
+        let mut attempted = HashSet::new();
+
+        for (provider, request_model) in providers {
+            if !attempted.insert((provider.name.clone(), request_model.clone())) {
+                continue;
+            }
+            let started = Instant::now();
+            let mut upstream_body = with_model(body.clone(), &request_model);
+            apply_model_mapping(&provider, &mut upstream_body);
+            apply_system_prompt_override(&provider, &mut upstream_body);
+            apply_stream_continuation(&mut upstream_body, &stream_state.full_text);
+
+            match open_chat_stream(&state, &provider, &headers, upstream_body).await {
+                Ok(result) => {
+                    let upstream_model = result.upstream_model.clone();
+                    let stream = result
+                        .response
+                        .into_body()
+                        .into_data_stream()
+                        .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+                    match stream_state.relay(Box::pin(stream), &tx).await {
+                        Ok(()) => {
+                            log_success(
+                                &cfg,
+                                "chat",
+                                &provider.name,
+                                &model,
+                                &upstream_model,
+                                stream_state.usage,
+                                started,
+                                false,
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            let message = format!("上游流中断，准备切换渠道: {err}");
+                            log_error(
+                                &cfg,
+                                "chat",
+                                &provider.name,
+                                &request_model,
+                                started,
+                                &message,
+                            );
+                            last_error = Some(message);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let message = err.message;
+                    log_error(
+                        &cfg,
+                        "chat",
+                        &provider.name,
+                        &request_model,
+                        started,
+                        &message,
+                    );
+                    if should_stop_failover(err.status) {
+                        send_chat_stream_failed(&tx, &message).await;
+                        return;
+                    }
+                    last_error = Some(message);
+                }
+            }
+        }
+
+        let message = last_error.unwrap_or_else(|| format!("模型 '{model}' 没有可用渠道"));
+        send_chat_stream_failed(&tx, &message).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .map_err(|err| ProxyError::new(StatusCode::BAD_GATEWAY, err.to_string()))
+}
+
+async fn open_chat_stream(
+    state: &AppState,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    body: Value,
+) -> Result<ProviderResult, ProxyError> {
+    match send_to_provider(
+        state,
+        provider,
+        "/chat/completions",
+        request_headers,
+        body.clone(),
+        true,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(err)
+            if err.status == StatusCode::NOT_FOUND
+                || err.status == StatusCode::METHOD_NOT_ALLOWED =>
+        {
+            send_chat_via_responses(state, provider, request_headers, body, true).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn send_chat_stream_failed(tx: &mpsc::Sender<Result<Bytes, io::Error>>, message: &str) {
+    let payload = json!({
+        "error": {
+            "message": message,
+            "type": "proxy_stream_error"
+        }
+    });
+    let _ = tx
+        .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
+        .await;
+    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
 }
 
 async fn forward_responses_as_chat(
@@ -1103,6 +1421,355 @@ async fn send_response_stream_done(
     )
     .await;
     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+}
+
+struct ManagedResponsesStream {
+    response_id: String,
+    item_id: String,
+    created_at: i64,
+    model: String,
+    full_text: String,
+    tool_calls: Vec<ChatToolCallState>,
+    custom_tool_names: HashSet<String>,
+    usage: TokenUsage,
+}
+
+impl ManagedResponsesStream {
+    fn new(model: String, custom_tool_names: HashSet<String>) -> Self {
+        Self {
+            response_id: format!("resp-{}", Uuid::new_v4().simple()),
+            item_id: format!("msg-{}", Uuid::new_v4().simple()),
+            created_at: chrono::Utc::now().timestamp(),
+            model: if model.is_empty() {
+                "unknown".to_string()
+            } else {
+                model
+            },
+            full_text: String::new(),
+            tool_calls: Vec::new(),
+            custom_tool_names,
+            usage: TokenUsage::default(),
+        }
+    }
+
+    async fn send_started(
+        &self,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+        send_response_sse(
+            tx,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": []
+                }
+            }),
+        )
+        .await?;
+        send_response_sse(
+            tx,
+            "response.in_progress",
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": []
+                }
+            }),
+        )
+        .await?;
+        send_response_sse(
+            tx,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": self.item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+        )
+        .await?;
+        send_response_sse(
+            tx,
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": self.item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+        )
+        .await
+    }
+
+    async fn relay(
+        &mut self,
+        stream: ByteStream,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        let mut stream = stream;
+        let mut buffer = String::new();
+        let mut candidate_text = String::new();
+        let mut candidate_tool_arguments: Vec<String> = Vec::new();
+        let mut saw_done = false;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some((event, consumed)) = next_sse_event(&buffer) {
+                        buffer.drain(..consumed);
+                        let Some(data) = sse_data(&event) else {
+                            continue;
+                        };
+                        if data.trim() == "[DONE]" {
+                            saw_done = true;
+                            break;
+                        }
+                        accumulate_usage_from_sse_data(&data, &mut self.usage);
+                        if let Some(delta) = chat_stream_delta(&data) {
+                            candidate_text.push_str(&delta);
+                            let emit =
+                                non_overlapping_delta(&self.full_text, &candidate_text, &delta);
+                            if !emit.is_empty() {
+                                self.full_text.push_str(&emit);
+                                let _ = send_response_sse(
+                                    tx,
+                                    "response.output_text.delta",
+                                    json!({
+                                        "type": "response.output_text.delta",
+                                        "item_id": self.item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": emit
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                        for delta in chat_stream_tool_call_deltas(&data) {
+                            self.apply_tool_delta(tx, delta, &mut candidate_tool_arguments)
+                                .await;
+                        }
+                    }
+                    if saw_done {
+                        return Ok(());
+                    }
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        Err("上游流未发送 [DONE] 就已结束".to_string())
+    }
+
+    async fn apply_tool_delta(
+        &mut self,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+        delta: ChatToolCallDelta,
+        candidate_arguments: &mut Vec<String>,
+    ) {
+        while self.tool_calls.len() <= delta.index {
+            self.tool_calls.push(ChatToolCallState::default());
+        }
+        while candidate_arguments.len() <= delta.index {
+            candidate_arguments.push(String::new());
+        }
+        let call = &mut self.tool_calls[delta.index];
+        if let Some(id) = delta.id {
+            if call.call_id.is_empty() {
+                call.call_id = id;
+            }
+        }
+        if let Some(name) = delta.name {
+            if call.name.is_empty() {
+                call.is_custom = self.custom_tool_names.contains(&name);
+                call.name = name;
+            }
+        }
+        if !call.added && !call.name.is_empty() {
+            if call.call_id.is_empty() {
+                call.call_id = format!("call_{}", Uuid::new_v4().simple());
+            }
+            call.added = true;
+            let item = if call.is_custom {
+                json!({
+                    "id": call.call_id,
+                    "type": "custom_tool_call",
+                    "status": "in_progress",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "input": ""
+                })
+            } else {
+                json!({
+                    "id": call.call_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": ""
+                })
+            };
+            let _ = send_response_sse(
+                tx,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": delta.index + 1,
+                    "item": item
+                }),
+            )
+            .await;
+        }
+        if let Some(arguments) = delta.arguments {
+            candidate_arguments[delta.index].push_str(&arguments);
+            let emit = non_overlapping_delta(
+                &call.arguments,
+                &candidate_arguments[delta.index],
+                &arguments,
+            );
+            call.arguments.push_str(&emit);
+            if call.added && !call.is_custom && !emit.is_empty() {
+                let _ = send_response_sse(
+                    tx,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": delta.index + 1,
+                        "delta": emit
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn send_completed(&self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        send_response_stream_done(
+            tx,
+            &self.response_id,
+            &self.item_id,
+            &self.model,
+            self.created_at,
+            &self.full_text,
+            &self.tool_calls,
+        )
+        .await;
+    }
+
+    async fn send_failed(&self, tx: &mpsc::Sender<Result<Bytes, io::Error>>, message: &str) {
+        let _ = send_response_sse(
+            tx,
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": self.response_id,
+                    "status": "failed",
+                    "model": self.model,
+                    "error": {"message": message}
+                }
+            }),
+        )
+        .await;
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+    }
+}
+
+fn non_overlapping_delta(current: &str, candidate_full: &str, raw_delta: &str) -> String {
+    if let Some(suffix) = candidate_full.strip_prefix(current) {
+        return suffix.to_string();
+    }
+    if current.ends_with(candidate_full) {
+        return String::new();
+    }
+    raw_delta.to_string()
+}
+
+struct ManagedChatStream {
+    full_text: String,
+    usage: TokenUsage,
+}
+
+impl ManagedChatStream {
+    fn new() -> Self {
+        Self {
+            full_text: String::new(),
+            usage: TokenUsage::default(),
+        }
+    }
+
+    async fn relay(
+        &mut self,
+        stream: ByteStream,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        let mut stream = stream;
+        let mut buffer = String::new();
+        let mut candidate_text = String::new();
+        let mut saw_done = false;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some((event, consumed)) = next_sse_event(&buffer) {
+                        buffer.drain(..consumed);
+                        let Some(data) = sse_data(&event) else {
+                            continue;
+                        };
+                        if data.trim() == "[DONE]" {
+                            saw_done = true;
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            break;
+                        }
+                        accumulate_usage_from_sse_data(&data, &mut self.usage);
+                        let Some(mut value) = serde_json::from_str::<Value>(&data).ok() else {
+                            continue;
+                        };
+                        if let Some(delta) = chat_stream_delta(&data) {
+                            candidate_text.push_str(&delta);
+                            let emit =
+                                non_overlapping_delta(&self.full_text, &candidate_text, &delta);
+                            if emit.is_empty() {
+                                continue;
+                            }
+                            if let Some(content) = value.pointer_mut("/choices/0/delta/content") {
+                                *content = Value::String(emit.clone());
+                            } else if let Some(text) = value.pointer_mut("/choices/0/text") {
+                                *text = Value::String(emit.clone());
+                            }
+                            self.full_text.push_str(&emit);
+                        }
+                        let _ = tx.send(Ok(Bytes::from(format!("data: {value}\n\n")))).await;
+                    }
+                    if saw_done {
+                        return Ok(());
+                    }
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        Err("上游流未发送 [DONE] 就已结束".to_string())
+    }
 }
 
 #[derive(Default)]
@@ -3147,6 +3814,118 @@ mod tests {
         assert!(sse.contains("\"type\":\"custom_tool_call\""));
         assert!(sse.contains("\"name\":\"apply_patch\""));
         assert!(sse.contains("*** Begin Patch\\n*** End Patch"));
+    }
+
+    #[tokio::test]
+    async fn managed_responses_stream_continues_after_midstream_disconnect() {
+        let first = Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"Hello "}}]})
+        ));
+        let second = Bytes::from(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"Hello world"}}]})
+        ));
+        let stream1 = futures_util::stream::iter([Ok::<Bytes, io::Error>(first)]);
+        let stream2 = futures_util::stream::iter([Ok::<Bytes, io::Error>(second)]);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+        let mut managed = ManagedResponsesStream::new("gpt-test".to_string(), HashSet::new());
+
+        managed.send_started(&tx).await.unwrap();
+        assert!(managed.relay(Box::pin(stream1), &tx).await.is_err());
+        managed.relay(Box::pin(stream2), &tx).await.unwrap();
+        managed.send_completed(&tx).await;
+        drop(tx);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let sse = String::from_utf8(body).unwrap();
+
+        assert!(sse.contains("\"delta\":\"Hello \""));
+        assert!(sse.contains("\"delta\":\"world\""));
+        assert!(!sse.contains("\"delta\":\"Hello world\""));
+        assert!(sse.contains("\"output_text\":\"Hello world\""));
+        assert!(sse.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn managed_chat_stream_continues_after_midstream_disconnect() {
+        let first = Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"Hello "}}]})
+        ));
+        let second = Bytes::from(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"Hello world"}}]})
+        ));
+        let stream1 = futures_util::stream::iter([Ok::<Bytes, io::Error>(first)]);
+        let stream2 = futures_util::stream::iter([Ok::<Bytes, io::Error>(second)]);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+        let mut managed = ManagedChatStream::new();
+
+        assert!(managed.relay(Box::pin(stream1), &tx).await.is_err());
+        managed.relay(Box::pin(stream2), &tx).await.unwrap();
+        drop(tx);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let sse = String::from_utf8(body).unwrap();
+
+        assert!(sse.contains("\"content\":\"Hello \""));
+        assert!(sse.contains("\"content\":\"world\""));
+        assert!(!sse.contains("\"content\":\"Hello world\""));
+        assert_eq!(sse.matches("data: [DONE]").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_responses_stream_deduplicates_replayed_tool_arguments() {
+        let first = Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call_1",
+                "function":{"name":"shell","arguments":"{\"cmd\":"}
+            }]}}]})
+        ));
+        let second = Bytes::from(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call_1",
+                "function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}
+            }]}}]})
+        ));
+        let stream1 = futures_util::stream::iter([Ok::<Bytes, io::Error>(first)]);
+        let stream2 = futures_util::stream::iter([Ok::<Bytes, io::Error>(second)]);
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+        let mut managed = ManagedResponsesStream::new("gpt-test".to_string(), HashSet::new());
+
+        managed.send_started(&tx).await.unwrap();
+        assert!(managed.relay(Box::pin(stream1), &tx).await.is_err());
+        managed.relay(Box::pin(stream2), &tx).await.unwrap();
+        managed.send_completed(&tx).await;
+        drop(tx);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        let sse = String::from_utf8(body).unwrap();
+
+        let completed = sse
+            .split("\n\n")
+            .find(|event| event.contains("event: response.completed"))
+            .and_then(sse_data)
+            .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            .unwrap();
+        assert_eq!(
+            completed["response"]["output"][1]["arguments"],
+            "{\"cmd\":\"ls\"}"
+        );
     }
 
     #[test]
