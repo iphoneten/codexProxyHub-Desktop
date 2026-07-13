@@ -233,21 +233,51 @@ pub fn default_config_path() -> PathBuf {
 }
 
 fn app_support_config_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("recodexProxyHub")
-            .join("config.yaml"),
-    )
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("recodexProxyHub")
+                .join("config.yaml"),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = env::var_os("APPDATA")?;
+        Some(
+            PathBuf::from(app_data)
+                .join("recodexProxyHub")
+                .join("config.yaml"),
+        )
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let config_home = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        Some(config_home.join("recodexProxyHub").join("config.yaml"))
+    }
 }
 
 fn bundled_resource_config_path() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
-    let macos_dir = exe.parent()?;
-    let contents_dir = macos_dir.parent()?;
-    Some(contents_dir.join("Resources").join("config.yaml"))
+
+    #[cfg(target_os = "macos")]
+    {
+        let macos_dir = exe.parent()?;
+        let contents_dir = macos_dir.parent()?;
+        Some(contents_dir.join("Resources").join("config.yaml"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(exe.parent()?.join("config.yaml"))
+    }
 }
 
 fn default_host() -> String {
@@ -314,6 +344,15 @@ fn default_max_chunks() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_example_config_is_valid() {
+        let cfg: AppConfig = serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.server.port, 8000);
+        assert!(cfg.providers.is_empty());
+    }
 
     #[test]
     fn relative_usage_log_paths_resolve_from_config_directory() {

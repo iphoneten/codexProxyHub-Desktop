@@ -46,27 +46,77 @@ cargo install cargo-watch
 
 这会监听 `src/` 和 `Cargo.toml`，保存后自动执行 `cargo run`。
 
-## 打包 DMG
+## 多平台打包
 
-在 macOS 上安装 Rust 后执行：
+### macOS Apple Silicon
 
 ```bash
-./scripts/build-dmg.sh
+rustup target add aarch64-apple-darwin
+./scripts/build-dmg.sh aarch64-apple-darwin
 ```
 
-产物位置：
+产物为：
 
 ```text
-dist/recodexProxyHub.dmg
+dist/recodexProxyHub-macos-arm64.dmg
 ```
 
-脚本会先执行 `cargo build --release`，再生成 `recodexProxyHub.app` 和 DMG。打包时如果当前目录存在 `config.yaml`，会内置到 App 的 `Resources` 中；首次从 App 启动时会复制到：
+### macOS Intel
+
+在 macOS 上执行：
+
+```bash
+rustup target add x86_64-apple-darwin
+./scripts/build-dmg.sh x86_64-apple-darwin
+```
+
+产物为：
+
+```text
+dist/recodexProxyHub-macos-x86_64.dmg
+```
+
+### Windows x64
+
+在安装了 Rust 和 Visual Studio C++ Build Tools 的 Windows PowerShell 中执行：
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+.\scripts\build-windows.ps1
+```
+
+产物为：
+
+```text
+dist/recodexProxyHub-windows-x86_64.zip
+```
+
+也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包。推送 `v*` 标签时也会自动构建，构建结果位于对应工作流的 Artifacts。
+
+发布 tag 必须使用 `vX.Y.Z` 格式，例如：
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `RECODEX_VERSION=1.2.3` 显式覆盖。
+
+macOS 脚本会生成 `recodexProxyHub.app` 和带 Applications 快捷方式的 DMG。打包时如果当前目录存在 `config.yaml`，会内置到 App 的 `Resources` 中；首次从 App 启动时会复制到：
 
 ```text
 ~/Library/Application Support/recodexProxyHub/config.yaml
 ```
 
 后续桌面端默认读写这个用户配置文件，避免直接修改 `.app` 或 DMG 内的只读资源。
+
+Windows 首次运行时会将压缩包中的 `config.yaml` 复制到：
+
+```text
+%APPDATA%\recodexProxyHub\config.yaml
+```
+
+仓库中的 `config.yaml` 不会提交，以防泄露渠道密钥。自动构建找不到本地配置时，会将无密钥的 `config.example.yaml` 作为初始配置打包。
 
 客户端 Base URL：
 

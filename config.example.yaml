@@ -1,0 +1,20 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+auth:
+  enabled: false
+  api_keys: []
+
+routing:
+  model_fallbacks: {}
+
+usage_log:
+  backend: sqlite
+  sqlite_path: logs/proxy_usage.sqlite3
+  import_legacy_jsonl: true
+  path: logs/proxy_usage.jsonl
+  max_bytes: 10485760
+  max_chunks: 1000
+
+providers: []

@@ -375,9 +375,12 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                             .color(stat_color()),
                     );
                     ui.label(
-                        egui::RichText::new("Rust desktop proxy console")
-                            .size(12.0)
-                            .color(muteds()),
+                        egui::RichText::new(format!(
+                            "Rust desktop proxy console · v{}",
+                            crate::app_version()
+                        ))
+                        .size(12.0)
+                        .color(muteds()),
                     );
                 });
                 ui.add_space(20.0);

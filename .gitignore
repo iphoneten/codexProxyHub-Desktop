@@ -5,11 +5,14 @@
 
 # ---- 构建产物 ----
 *.dmg
+*.zip
 *.app
 *.exe
 *.o
 *.so
 *.dylib
+/dist/build-*/
+/dist/recodexProxyHub-windows-*/
 
 # ---- 运行时日志与数据 ----
 /logs/

@@ -4,18 +4,53 @@ set -euo pipefail
 APP_NAME="recodexProxyHub"
 BIN_NAME="recodex-proxy-hub"
 BUNDLE_ID="com.recodex.proxyhub"
-VERSION="0.1.0"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/$APP_NAME.app"
-DMG_STAGE_DIR="$DIST_DIR/dmg-root"
+TARGET="${1:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
+
+RAW_VERSION="${RECODEX_VERSION:-}"
+if [[ -z "$RAW_VERSION" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+  RAW_VERSION="${GITHUB_REF_NAME:-}"
+fi
+if [[ -z "$RAW_VERSION" ]]; then
+  RAW_VERSION="$(git -C "$ROOT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+fi
+if [[ -z "$RAW_VERSION" ]]; then
+  RAW_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
+fi
+
+VERSION="${RAW_VERSION#v}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: invalid release version: $RAW_VERSION" >&2
+  echo "expected tag format: v1.2.3" >&2
+  exit 1
+fi
+export RECODEX_VERSION="$VERSION"
+
+case "$TARGET" in
+  aarch64-apple-darwin)
+    ARCH_NAME="arm64"
+    ;;
+  x86_64-apple-darwin)
+    ARCH_NAME="x86_64"
+    ;;
+  *)
+    echo "error: unsupported macOS target: $TARGET" >&2
+    echo "supported: aarch64-apple-darwin, x86_64-apple-darwin" >&2
+    exit 1
+    ;;
+esac
+
+WORK_DIR="$DIST_DIR/build-macos-$ARCH_NAME"
+APP_DIR="$WORK_DIR/$APP_NAME.app"
+DMG_STAGE_DIR="$WORK_DIR/dmg-root"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+DMG_PATH="$DIST_DIR/$APP_NAME-macos-$ARCH_NAME.dmg"
 APPICONSET_DIR="$ROOT_DIR/icon/AppIcons/Assets.xcassets/AppIcon.appiconset"
 ICON_PNG="$ROOT_DIR/icon/icon_1024.png"
-ICONSET_DIR="$DIST_DIR/$APP_NAME.iconset"
+ICONSET_DIR="$WORK_DIR/$APP_NAME.iconset"
 ICON_ICNS_NAME="AppIcon.icns"
 
 command -v cargo >/dev/null 2>&1 || {
@@ -27,6 +62,12 @@ command -v hdiutil >/dev/null 2>&1 || {
   echo "error: hdiutil not found. DMG packaging must run on macOS." >&2
   exit 1
 }
+
+if ! rustup target list --installed | grep -qx "$TARGET"; then
+  echo "error: Rust target is not installed: $TARGET" >&2
+  echo "install: rustup target add $TARGET" >&2
+  exit 1
+fi
 
 if [[ -d "$APPICONSET_DIR" || -f "$ICON_PNG" ]]; then
   command -v iconutil >/dev/null 2>&1 || {
@@ -42,16 +83,18 @@ if [[ -d "$APPICONSET_DIR" || -f "$ICON_PNG" ]]; then
 fi
 
 cd "$ROOT_DIR"
-cargo build --release
+cargo build --release --target "$TARGET"
 
-rm -rf "$APP_DIR" "$DMG_STAGE_DIR" "$DMG_PATH"
+rm -rf "$WORK_DIR" "$DMG_PATH"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-cp "$ROOT_DIR/target/release/$BIN_NAME" "$MACOS_DIR/$APP_NAME"
+cp "$ROOT_DIR/target/$TARGET/release/$BIN_NAME" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
 if [[ -f "$ROOT_DIR/config.yaml" ]]; then
   cp "$ROOT_DIR/config.yaml" "$RESOURCES_DIR/config.yaml"
+elif [[ -f "$ROOT_DIR/config.example.yaml" ]]; then
+  cp "$ROOT_DIR/config.example.yaml" "$RESOURCES_DIR/config.yaml"
 fi
 
 if [[ -d "$APPICONSET_DIR" || -f "$ICON_PNG" ]]; then
@@ -168,3 +211,4 @@ hdiutil create \
   "$DMG_PATH"
 
 echo "DMG created: $DMG_PATH"
+echo "Version: $VERSION"

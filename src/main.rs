@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod anthropic;
 mod config;
 mod desktop;
@@ -8,6 +13,7 @@ mod responses_api;
 
 fn main() -> eframe::Result<()> {
     set_macos_app_icon();
+    let window_title = format!("recodexProxyHub v{}", app_version());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -17,10 +23,14 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "recodexProxyHub",
+        &window_title,
         options,
         Box::new(|cc| Ok(Box::new(desktop::HubApp::new(cc)))),
     )
+}
+
+pub(crate) fn app_version() -> &'static str {
+    option_env!("RECODEX_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(target_os = "macos")]
