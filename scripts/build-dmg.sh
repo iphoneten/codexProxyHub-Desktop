@@ -63,6 +63,11 @@ command -v hdiutil >/dev/null 2>&1 || {
   exit 1
 }
 
+command -v codesign >/dev/null 2>&1 || {
+  echo "error: codesign not found. macOS Command Line Tools are required." >&2
+  exit 1
+}
+
 if ! rustup target list --installed | grep -qx "$TARGET"; then
   echo "error: Rust target is not installed: $TARGET" >&2
   echo "install: rustup target add $TARGET" >&2
@@ -202,6 +207,13 @@ PLIST
 mkdir -p "$DMG_STAGE_DIR"
 cp -R "$APP_DIR" "$DMG_STAGE_DIR/$APP_NAME.app"
 ln -s /Applications "$DMG_STAGE_DIR/Applications"
+
+# 对整个 .app 做 ad-hoc 签名，避免下载后 Gatekeeper 报"已损坏"。
+# 这不是 Apple Developer ID 签名，只是内部一致性签名；用户首次打开仍需右键"打开"
+# 或执行 xattr -dr com.apple.quarantine 移除下载隔离标记。
+codesign --force --deep --sign - --timestamp=none \
+  "$DMG_STAGE_DIR/$APP_NAME.app"
+codesign --verify --deep --strict "$DMG_STAGE_DIR/$APP_NAME.app"
 
 hdiutil create \
   -volname "$APP_NAME" \

@@ -3138,10 +3138,19 @@ fn upstream_headers(
             || lower.starts_with("openai-")
             || lower.starts_with("x-codex-")
             || lower.starts_with("x-openai-")
-            || lower.starts_with("x-stainless-");
+            || lower.starts_with("x-stainless-")
+            || lower.starts_with("chatgpt-");
 
         // 精确名白名单：不带前缀但需要透传的少数几个
-        let exact_match = matches!(lower.as_str(), "user-agent" | "x-request-id" | "originator");
+        // - user-agent / originator：codex CLI 客户端标识
+        // - x-request-id：Stainless SDK 生成的请求 id
+        // - session_id / conversation_id：codex CLI 会话标识
+        //   （裸名字，anyrouter/rawchat 校验 codex 请求时会检查 session_id 是否存在，
+        //   缺失会回 "invalid codex request"）
+        let exact_match = matches!(
+            lower.as_str(),
+            "user-agent" | "x-request-id" | "originator" | "session_id" | "conversation_id"
+        );
 
         if !prefix_match && !exact_match {
             continue;

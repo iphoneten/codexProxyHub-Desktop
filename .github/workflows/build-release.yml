@@ -53,3 +53,41 @@ jobs:
           name: recodexProxyHub-windows-x86_64
           path: dist/recodexProxyHub-windows-x86_64.zip
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs:
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: recodexProxyHub-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release packages
+        run: |
+          test -f release-assets/recodexProxyHub-macos-arm64.dmg
+          test -f release-assets/recodexProxyHub-macos-x86_64.dmg
+          test -f release-assets/recodexProxyHub-windows-x86_64.zip
+          ls -lh release-assets
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "recodexProxyHub $GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

@@ -12,13 +12,17 @@ mod proxy;
 mod responses_api;
 
 fn main() -> eframe::Result<()> {
-    set_macos_app_icon();
     let window_title = format!("recodexProxyHub v{}", app_version());
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1180.0, 760.0])
+        .with_min_inner_size([980.0, 640.0]);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([980.0, 640.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -33,40 +37,26 @@ pub(crate) fn app_version() -> &'static str {
     option_env!("RECODEX_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+// 通过 eframe 的 ViewportBuilder 设置窗口/Dock 图标。
+//
+// 早期版本在 main() 里直接调用 NSApplication::sharedApplication 提前触发 AppKit
+// 初始化，在 macOS 15 上会因为 `_NSInitializeAppContext` 查询菜单栏状态时
+// `abort()` 而闪退（表现为 DMG 安装后双击没反应）。winit 有专门的时序处理，
+// 交给 with_icon 让 winit 在合适时机设置图标。
 #[cfg(target_os = "macos")]
-fn set_macos_app_icon() {
-    use objc2::rc::Retained;
-    use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::{MainThreadMarker, NSString};
-
-    let Some(icon_path) = bundled_icon_path() else {
-        return;
-    };
-    let Some(icon_path) = icon_path.to_str() else {
-        return;
-    };
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-
-    let path = NSString::from_str(icon_path);
-    let Some(image): Option<Retained<NSImage>> =
-        (unsafe { NSImage::initWithContentsOfFile(mtm.alloc(), &path) })
-    else {
-        return;
-    };
-
-    let app = NSApplication::sharedApplication(mtm);
-    unsafe {
-        app.setApplicationIconImage(Some(&image));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn bundled_icon_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let macos_dir = exe.parent()?;
-    let contents_dir = macos_dir.parent()?;
-    Some(contents_dir.join("Resources").join("AppIcon.icns"))
+fn load_window_icon() -> Option<egui::IconData> {
+    let bytes: &[u8] =
+        include_bytes!("../icon/AppIcons/Assets.xcassets/AppIcon.appiconset/256.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_macos_app_icon() {}
+fn load_window_icon() -> Option<egui::IconData> {
+    None
+}

@@ -91,7 +91,7 @@ rustup target add x86_64-pc-windows-msvc
 dist/recodexProxyHub-windows-x86_64.zip
 ```
 
-也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包。推送 `v*` 标签时也会自动构建，构建结果位于对应工作流的 Artifacts。
+也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包。手动从普通分支运行时，构建结果位于对应工作流的 Artifacts。
 
 发布 tag 必须使用 `vX.Y.Z` 格式，例如：
 
@@ -99,6 +99,8 @@ dist/recodexProxyHub-windows-x86_64.zip
 git tag v1.2.3
 git push origin v1.2.3
 ```
+
+推送 tag 后，GitHub Actions 会构建三个平台，全部成功后自动创建 `v1.2.3` Release、生成发布说明并上传两个 DMG 和一个 Windows ZIP。重新运行同一 tag 的工作流会覆盖 Release 中的同名附件。
 
 打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `RECODEX_VERSION=1.2.3` 显式覆盖。
 
@@ -109,6 +111,24 @@ macOS 脚本会生成 `recodexProxyHub.app` 和带 Applications 快捷方式的 
 ```
 
 后续桌面端默认读写这个用户配置文件，避免直接修改 `.app` 或 DMG 内的只读资源。
+
+### macOS 首次打开提示"已损坏"
+
+因为当前版本没有 Apple Developer ID 签名和公证，从浏览器下载 DMG 后 macOS 会给 `.app` 打上 `com.apple.quarantine` 隔离标记，双击可能出现：
+
+> "recodexProxyHub" 已损坏，无法打开。你应该将它移到废纸篓。
+
+这不是安装包损坏，而是 Gatekeeper 拒绝运行未签名程序。任选一种方式解除：
+
+方式一（推荐，一次性）：把 `.app` 拖入"应用程序"后，在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/recodexProxyHub.app
+```
+
+方式二：在"访达"里对 `.app` 右键选择"打开"，在弹窗中再次点击"打开"。
+
+打包脚本已经对 `.app` 做了 ad-hoc 签名，从源码本地打包后直接双击运行不会出现该提示。
 
 Windows 首次运行时会将压缩包中的 `config.yaml` 复制到：
 
