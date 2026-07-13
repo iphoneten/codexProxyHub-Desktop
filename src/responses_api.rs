@@ -9,7 +9,7 @@
 use crate::proxy::{next_sse_event, sse_data, TokenUsage};
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -495,6 +495,7 @@ fn extract_usage(body: &Value) -> (i64, i64) {
 // ============================== 流式 SSE 翻译 ==============================
 
 /// 把上游 Responses 流式响应转换成 OpenAI chat.completion.chunk 流。
+#[allow(dead_code)]
 pub fn spawn_responses_stream_translator(
     resp: reqwest::Response,
     request_model: String,
@@ -502,12 +503,28 @@ pub fn spawn_responses_stream_translator(
     oneshot::Receiver<TokenUsage>,
     ReceiverStream<Result<Bytes, io::Error>>,
 ) {
+    let stream = resp
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+    spawn_responses_stream_translator_from_stream(stream, request_model)
+}
+
+pub fn spawn_responses_stream_translator_from_stream<S>(
+    stream: S,
+    request_model: String,
+) -> (
+    oneshot::Receiver<TokenUsage>,
+    ReceiverStream<Result<Bytes, io::Error>>,
+)
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
-        let mut stream = resp.bytes_stream();
+        let mut stream = Box::pin(stream);
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
             let _ = u_tx.send(state.usage);
             return;

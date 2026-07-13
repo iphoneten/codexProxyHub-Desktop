@@ -187,7 +187,7 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `connect_timeout` | number | `10` | 连接超时秒数，限制 DNS/TCP/TLS/连接建立阶段。代理会按该值缓存 reqwest Client。 |
-| `request_timeout` | number | `60` | 请求超时秒数。非流式请求限制整个请求；流式请求只限制等待响应头/开始流，不限制 SSE 流总时长。 |
+| `request_timeout` | number | `60` | 请求超时秒数。非流式请求限制整个请求；流式请求分别限制等待响应头和等待首个有效输出，SSE 已开始正常输出后不限制总时长。 |
 | `timeout` | number | 无 | 旧字段。仍可读取，会映射到 `request_timeout`；保存新配置时建议使用 `request_timeout`。 |
 
 建议值：
@@ -226,11 +226,12 @@ max_retries: 0
 
 1. 根据请求模型生成候选模型列表：原模型优先，然后追加 `routing.model_fallbacks`。
 2. 对每个候选模型过滤 provider：必须 `enabled: true`，且 `models` 或 `model_mapping` 能匹配模型。
-3. 按 `priority` ��小到大尝试。
+3. 按 `priority` 从小到大尝试。
 4. 同一 `priority` 内按 `weight` 做轮询排序。
 5. 单个 provider 失败后，先按 `max_retries` 在该 provider 内重试。
 6. 重试耗尽后继续尝试下一个 provider。
-7. 一旦某个 provider 成功，立即返回，不再尝试后续 provider。
+7. 流式请求只有拿到首个有效文本或工具调用事件后才判定 provider 成功；在此之前超时、报错或断流会继续故障转移。
+8. 一旦某个 provider 成功，立即返回，不再尝试后续 provider。
 
 同优先级同权重示例：
 

@@ -20,6 +20,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -34,6 +35,7 @@ use uuid::Uuid;
 // 配置句柄：Arc<RwLock<Arc<AppConfig>>>
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
+type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -116,6 +118,10 @@ impl ProxyError {
             status,
             message: message.into(),
         }
+    }
+
+    fn retryable(&self) -> bool {
+        retryable_status(self.status)
     }
 }
 
@@ -719,8 +725,20 @@ async fn send_anthropic_chat_stream_as_responses(
                         format!("{} body={}", msg, clean_upstream_error(&text)),
                     ));
                 }
-                let (anthropic_usage_rx, chat_stream) =
-                    prepare_anthropic_stream(resp, request_model.clone()).await?;
+                let (anthropic_usage_rx, chat_stream) = match prepare_anthropic_stream(
+                    resp,
+                    request_model.clone(),
+                    provider.request_timeout,
+                )
+                .await
+                {
+                    Ok(streams) => streams,
+                    Err(err) if attempt < provider.max_retries && err.retryable() => {
+                        tokio::time::sleep(retry_delay(attempt)).await;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 let mut result =
                     chat_sse_stream_to_responses(chat_stream, request_model, custom_tool_names)?;
                 result.usage_rx = Some(anthropic_usage_rx);
@@ -767,6 +785,7 @@ fn chat_stream_to_responses(
 async fn prepare_anthropic_stream(
     resp: reqwest::Response,
     request_model: String,
+    request_timeout: u64,
 ) -> Result<
     (
         oneshot::Receiver<TokenUsage>,
@@ -774,53 +793,207 @@ async fn prepare_anthropic_stream(
     ),
     ProxyError,
 > {
-    let mut upstream = Box::pin(
+    let upstream = Box::pin(
         resp.bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
     );
-    let mut prefix = Vec::new();
-    let mut text_buffer = String::new();
-
-    loop {
-        match upstream.next().await {
-            Some(Ok(bytes)) => {
-                text_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                prefix.extend_from_slice(&bytes);
-                let Some((event, _)) = next_sse_event(&text_buffer) else {
-                    continue;
-                };
-                if let Some(data) = sse_data(&event) {
-                    if let Some(err) = anthropic_sse_error(&data) {
-                        return Err(err);
-                    }
-                    if !anthropic_sse_has_client_output(&data) {
-                        continue;
-                    }
-                }
-                break;
-            }
-            Some(Err(err)) => {
-                return Err(ProxyError::new(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Anthropic 上游流读取失败: {err}"),
-                ));
-            }
-            None => {
-                return Err(ProxyError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "Anthropic 上游流未返回任何 SSE 事件",
-                ));
-            }
-        }
-    }
-
-    let prefix = Bytes::from(prefix);
-    let stream =
-        futures_util::stream::once(async move { Ok::<Bytes, io::Error>(prefix) }).chain(upstream);
+    let stream = prepare_sse_stream(upstream, request_timeout, SseProbeKind::Anthropic).await?;
     Ok(crate::anthropic::spawn_stream_translator(
         stream,
         request_model,
     ))
+}
+
+async fn prepare_openai_stream(
+    resp: reqwest::Response,
+    request_timeout: u64,
+    kind: SseProbeKind,
+) -> Result<ProxyByteStream, ProxyError> {
+    let upstream = Box::pin(
+        resp.bytes_stream()
+            .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
+    );
+    prepare_sse_stream(upstream, request_timeout, kind).await
+}
+
+#[derive(Clone, Copy)]
+enum SseProbeKind {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
+enum SseProbeDecision {
+    Continue,
+    Ready,
+    Error(ProxyError),
+}
+
+async fn prepare_sse_stream(
+    mut upstream: ProxyByteStream,
+    timeout_secs: u64,
+    kind: SseProbeKind,
+) -> Result<ProxyByteStream, ProxyError> {
+    let timeout_secs = timeout_secs.max(1);
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
+        let mut prefix = Vec::new();
+        let mut text_buffer = String::new();
+
+        loop {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    text_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    prefix.extend_from_slice(&bytes);
+                    while let Some((event, consumed)) = next_sse_event(&text_buffer) {
+                        text_buffer.drain(..consumed);
+                        let Some(data) = sse_data(&event) else {
+                            continue;
+                        };
+                        match inspect_sse_probe_event(kind, &data) {
+                            SseProbeDecision::Continue => {}
+                            SseProbeDecision::Ready => {
+                                let prefix = Bytes::from(prefix);
+                                let stream = futures_util::stream::once(async move {
+                                    Ok::<Bytes, io::Error>(prefix)
+                                })
+                                .chain(upstream);
+                                return Ok(Box::pin(stream) as ProxyByteStream);
+                            }
+                            SseProbeDecision::Error(err) => return Err(err),
+                        }
+                    }
+                }
+                Some(Err(err)) => {
+                    return Err(ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("上游流读取失败: {err}"),
+                    ));
+                }
+                None => {
+                    return Err(ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "上游流在首个有效输出前断开",
+                    ));
+                }
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(ProxyError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("上游流首个有效输出超时: {timeout_secs}s"),
+        )),
+    }
+}
+
+fn inspect_sse_probe_event(kind: SseProbeKind, data: &str) -> SseProbeDecision {
+    match kind {
+        SseProbeKind::Chat => inspect_chat_sse_probe_event(data),
+        SseProbeKind::Responses => inspect_responses_sse_probe_event(data),
+        SseProbeKind::Anthropic => {
+            if let Some(err) = anthropic_sse_error(data) {
+                return SseProbeDecision::Error(err);
+            }
+            if anthropic_sse_has_client_output(data) {
+                SseProbeDecision::Ready
+            } else {
+                SseProbeDecision::Continue
+            }
+        }
+    }
+}
+
+fn inspect_chat_sse_probe_event(data: &str) -> SseProbeDecision {
+    if data.trim() == "[DONE]" {
+        return SseProbeDecision::Error(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "上游流未返回有效输出",
+        ));
+    }
+    if let Some(message) = chat_stream_error_message(data) {
+        return SseProbeDecision::Error(ProxyError::new(stream_error_status(&message), message));
+    }
+    if chat_stream_delta(data).is_some() || !chat_stream_tool_call_deltas(data).is_empty() {
+        return SseProbeDecision::Ready;
+    }
+    SseProbeDecision::Continue
+}
+
+fn inspect_responses_sse_probe_event(data: &str) -> SseProbeDecision {
+    if data.trim() == "[DONE]" {
+        return SseProbeDecision::Error(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "Responses 上游流未返回有效输出",
+        ));
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return SseProbeDecision::Continue;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("error") | Some("response.failed") => {
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/response/error/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Responses upstream error");
+            SseProbeDecision::Error(ProxyError::new(
+                stream_error_status(message),
+                truncate(message),
+            ))
+        }
+        Some("response.output_text.delta") => {
+            if value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                SseProbeDecision::Ready
+            } else {
+                SseProbeDecision::Continue
+            }
+        }
+        Some("response.output_item.added") => {
+            let item_type = value.pointer("/item/type").and_then(Value::as_str);
+            if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
+                SseProbeDecision::Ready
+            } else {
+                SseProbeDecision::Continue
+            }
+        }
+        Some("response.function_call_arguments.delta")
+        | Some("response.custom_tool_call_input.delta") => {
+            if value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                SseProbeDecision::Ready
+            } else {
+                SseProbeDecision::Continue
+            }
+        }
+        Some("response.completed") => SseProbeDecision::Error(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            "Responses 上游流完成但未返回有效输出",
+        )),
+        _ => SseProbeDecision::Continue,
+    }
+}
+
+fn stream_error_status(message: &str) -> StatusCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("rate") || lower.contains("limit") || lower.contains("concurrency") {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if lower.contains("timeout") {
+        StatusCode::GATEWAY_TIMEOUT
+    } else if lower.contains("overload") || lower.contains("unavailable") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 fn anthropic_sse_error(data: &str) -> Option<ProxyError> {
@@ -1434,7 +1607,24 @@ async fn send_to_provider(
                             format!("{} body={}", msg, clean_upstream_error(&text)),
                         ));
                     }
-                    let (usage_rx, body_stream) = stream_with_usage_probe(resp);
+                    let probe_kind = if path == "/responses" {
+                        SseProbeKind::Responses
+                    } else {
+                        SseProbeKind::Chat
+                    };
+                    let stream =
+                        match prepare_openai_stream(resp, provider.request_timeout, probe_kind)
+                            .await
+                        {
+                            Ok(stream) => stream,
+                            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                                tokio::time::sleep(retry_delay(attempt)).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        };
+                    let (usage_rx, body_stream) = stream_with_usage_probe(stream);
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1554,8 +1744,20 @@ async fn send_to_anthropic_provider(
                             format!("{} body={}", msg, clean_upstream_error(&text)),
                         ));
                     }
-                    let (usage_rx, body_stream) =
-                        prepare_anthropic_stream(resp, request_model.clone()).await?;
+                    let (usage_rx, body_stream) = match prepare_anthropic_stream(
+                        resp,
+                        request_model.clone(),
+                        provider.request_timeout,
+                    )
+                    .await
+                    {
+                        Ok(streams) => streams,
+                        Err(err) if attempt < provider.max_retries && err.retryable() => {
+                            tokio::time::sleep(retry_delay(attempt)).await;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1653,9 +1855,24 @@ async fn send_responses_stream_as_chat(
                         format!("{} body={}", msg, clean_upstream_error(&text)),
                     ));
                 }
+                let stream = match prepare_openai_stream(
+                    resp,
+                    provider.request_timeout,
+                    SseProbeKind::Responses,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(err) if attempt < provider.max_retries && err.retryable() => {
+                        tokio::time::sleep(retry_delay(attempt)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 let (usage_rx, body_stream) =
-                    crate::responses_api::spawn_responses_stream_translator(
-                        resp,
+                    crate::responses_api::spawn_responses_stream_translator_from_stream(
+                        stream,
                         request_model.clone(),
                     );
                 let response = Response::builder()
@@ -2532,18 +2749,21 @@ fn accumulate_usage_from_sse_data(data: &str, target: &mut TokenUsage) {
 
 // 将上游流式响应拆成：客户端可读的字节流 + 最终 usage 的 oneshot 通道
 // 边转发边解析 SSE，不改写 payload；客户端断连时立即结束以避免资源浪费
-fn stream_with_usage_probe(
-    resp: reqwest::Response,
+fn stream_with_usage_probe<S>(
+    stream: S,
 ) -> (
     oneshot::Receiver<TokenUsage>,
     ReceiverStream<Result<Bytes, io::Error>>,
-) {
+)
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
     tokio::spawn(async move {
         let mut usage = TokenUsage::default();
         let mut buffer = String::new();
-        let mut stream = resp.bytes_stream();
+        let mut stream = Box::pin(stream);
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -3488,6 +3708,66 @@ mod tests {
         assert!(sse.contains("Concurrency limit exceeded"));
         assert!(!sse.contains("event: response.completed"));
         assert!(!sse.contains("[stream error:"));
+    }
+
+    #[tokio::test]
+    async fn sse_probe_preserves_chat_prefix_after_first_delta() {
+        let first = json!({"choices":[{"delta":{"role":"assistant"}}]});
+        let second = json!({"choices":[{"delta":{"content":"hi"}}]});
+        let bytes = Bytes::from(format!("data: {first}\n\ndata: {second}\n\n"));
+        let stream: ProxyByteStream =
+            Box::pin(futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]));
+
+        let mut prepared = prepare_sse_stream(stream, 1, SseProbeKind::Chat)
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(chunk) = prepared.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("\"role\":\"assistant\""));
+        assert!(text.contains("\"content\":\"hi\""));
+    }
+
+    #[tokio::test]
+    async fn sse_probe_rejects_chat_done_before_output() {
+        let stream: ProxyByteStream =
+            Box::pin(futures_util::stream::iter([Ok::<Bytes, io::Error>(
+                Bytes::from("data: [DONE]\n\n"),
+            )]));
+
+        let err = match prepare_sse_stream(stream, 1, SseProbeKind::Chat).await {
+            Ok(_) => panic!("expected probe error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert!(err.message.contains("未返回有效输出"));
+    }
+
+    #[tokio::test]
+    async fn sse_probe_maps_responses_error_before_output_to_retryable_error() {
+        let chunk = json!({
+            "type": "error",
+            "error": {
+                "message": "Concurrency limit exceeded for account",
+                "type": "rate_limit_error"
+            }
+        });
+        let stream: ProxyByteStream =
+            Box::pin(futures_util::stream::iter([Ok::<Bytes, io::Error>(
+                Bytes::from(format!("data: {chunk}\n\n")),
+            )]));
+
+        let err = match prepare_sse_stream(stream, 1, SseProbeKind::Responses).await {
+            Ok(_) => panic!("expected probe error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(err.retryable());
     }
 
     #[test]
