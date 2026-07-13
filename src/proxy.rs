@@ -38,7 +38,7 @@ pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 #[derive(Clone)]
 struct AppState {
     config: ConfigHandle,
-    client: Client,
+    clients: Arc<Mutex<HashMap<u64, Client>>>,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
@@ -50,6 +50,15 @@ impl AppState {
     // 拿一份当前配置快照。整个请求生命周期内用这份，避免请求中途配置换了导致的不一致
     fn snapshot(&self) -> Arc<AppConfig> {
         self.config.read().clone()
+    }
+
+    fn client_for_provider(&self, provider: &ProviderConfig) -> Client {
+        let connect_timeout = provider.connect_timeout.max(1);
+        let mut clients = self.clients.lock();
+        clients
+            .entry(connect_timeout)
+            .or_insert_with(|| build_http_client(connect_timeout))
+            .clone()
     }
 
     // 判断该 provider 是否需要注入 stream_options.include_usage
@@ -70,6 +79,15 @@ impl AppState {
             .lock()
             .insert(provider.name.clone(), false);
     }
+}
+
+fn build_http_client(connect_timeout: u64) -> Client {
+    Client::builder()
+        .pool_max_idle_per_host(20)
+        .connect_timeout(Duration::from_secs(connect_timeout.max(1)))
+        .danger_accept_invalid_certs(false)
+        .build()
+        .expect("failed to build reqwest client")
 }
 
 #[derive(Clone, Copy, Default)]
@@ -161,10 +179,7 @@ pub async fn run_server(config: ConfigHandle, shutdown: oneshot::Receiver<()>) -
     let addr: SocketAddr = format!("{}:{}", bind_host, initial.server.port).parse()?;
     let state = AppState {
         config,
-        client: Client::builder()
-            .pool_max_idle_per_host(20)
-            .danger_accept_invalid_certs(false)
-            .build()?,
+        clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -549,14 +564,10 @@ async fn forward_responses_as_chat(
         .await?;
         response_json(result.response).await?
     } else {
-        let value = send_json_to_provider(
-            &state.client,
-            provider,
-            "/chat/completions",
-            headers,
-            chat_body,
-        )
-        .await?;
+        let client = state.client_for_provider(provider);
+        let value =
+            send_json_to_provider(&client, provider, "/chat/completions", headers, chat_body)
+                .await?;
         // send_json_to_provider 只做 HTTP 层错误处理，这里作为 chat 语义调用者要自己校验结构
         // 因为该函数被复用在多种 path，不能在里面按 path 分支校验
         if let Err(msg) = validate_upstream_chat_json(&value) {
@@ -610,8 +621,9 @@ async fn send_chat_stream_as_responses(
     custom_tool_names: HashSet<String>,
 ) -> Result<ProviderResult, ProxyError> {
     if provider.provider_type == "anthropic" {
+        let client = state.client_for_provider(provider);
         return send_anthropic_chat_stream_as_responses(
-            &state.client,
+            &client,
             provider,
             request_headers,
             body,
@@ -620,7 +632,7 @@ async fn send_chat_stream_as_responses(
         )
         .await;
     }
-    let client = &state.client;
+    let client = state.client_for_provider(provider);
     let url = upstream_url(provider, "/chat/completions");
     // /responses 转 chat 走的是 OpenAI 兼容协议，按探测结果决定是否注入 include_usage
     let mut probing = state.should_inject_usage(provider);
@@ -634,7 +646,7 @@ async fn send_chat_stream_as_responses(
             .post(url.clone())
             .headers(upstream_headers(provider, request_headers, true))
             .json(&send_body);
-        match send_stream_request(req, provider.timeout).await {
+        match send_stream_request(req, provider.request_timeout).await {
             Ok(resp) if resp.status().is_success() => {
                 // 拦截假 SSE 响应（Content-Type 非 event-stream）
                 if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
@@ -698,7 +710,7 @@ async fn send_anthropic_chat_stream_as_responses(
         .json(&anthropic_body);
 
     for attempt in 0..=provider.max_retries {
-        match send_stream_request(req.try_clone().unwrap(), provider.timeout).await {
+        match send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await {
             Ok(resp) if resp.status().is_success() => {
                 if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
                     let text = resp.text().await.unwrap_or_default();
@@ -1384,10 +1396,10 @@ async fn send_to_provider(
     body: Value,
     stream: bool,
 ) -> Result<ProviderResult, ProxyError> {
-    let client = &state.client;
+    let client = state.client_for_provider(provider);
     // Anthropic 渠道：对 chat/completions 走独立协议翻译到 /messages
     if provider.provider_type == "anthropic" && path == "/chat/completions" {
-        return send_to_anthropic_provider(client, provider, request_headers, body, stream).await;
+        return send_to_anthropic_provider(&client, provider, request_headers, body, stream).await;
     }
     if stream {
         let upstream_model = body
@@ -1409,7 +1421,7 @@ async fn send_to_provider(
                 .post(url.clone())
                 .headers(upstream_headers(provider, request_headers, true))
                 .json(&send_body);
-            match send_stream_request(req, provider.timeout).await {
+            match send_stream_request(req, provider.request_timeout).await {
                 Ok(resp) if resp.status().is_success() => {
                     let status =
                         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -1473,7 +1485,7 @@ async fn send_to_provider(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let value = send_json_to_provider(client, provider, path, request_headers, body).await?;
+    let value = send_json_to_provider(&client, provider, path, request_headers, body).await?;
     // 上游可能返回 HTTP 200 + 假 JSON（rawchat 一类跑路中转站的典型症状）
     // 结构不合规就当作该 provider 失败，抛 502 让上层 failover 到下个渠道
     let validation = match path {
@@ -1521,11 +1533,11 @@ async fn send_to_anthropic_provider(
 
     for attempt in 0..=provider.max_retries {
         let send_result = if stream {
-            send_stream_request(req.try_clone().unwrap(), provider.timeout).await
+            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
         } else {
             req.try_clone()
                 .unwrap()
-                .timeout(Duration::from_secs(provider.timeout.max(1)))
+                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
                 .send()
                 .await
                 .map_err(UpstreamSendError::Request)
@@ -1625,12 +1637,12 @@ async fn send_responses_stream_as_chat(
     let url = upstream_url(provider, "/responses");
     let mut attempt = 0;
     loop {
-        let result = state
-            .client
+        let client = state.client_for_provider(provider);
+        let result = client
             .post(url.clone())
             .headers(upstream_headers(provider, request_headers, true))
             .json(&responses_body);
-        let result = send_stream_request(result, provider.timeout).await;
+        let result = send_stream_request(result, provider.request_timeout).await;
         match result {
             Ok(resp) if resp.status().is_success() => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -1693,7 +1705,7 @@ async fn send_chat_via_responses(
     body: Value,
     stream: bool,
 ) -> Result<ProviderResult, ProxyError> {
-    let client = &state.client;
+    let client = state.client_for_provider(provider);
     let request_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -1718,7 +1730,7 @@ async fn send_chat_via_responses(
     loop {
         let req = client
             .post(url.clone())
-            .timeout(Duration::from_secs(provider.timeout.max(1)))
+            .timeout(Duration::from_secs(provider.request_timeout.max(1)))
             .headers(upstream_headers(provider, request_headers, false))
             .json(&responses_body);
         match req.send().await {
@@ -1784,7 +1796,7 @@ async fn send_json_to_provider(
     for attempt in 0..=provider.max_retries {
         let result = client
             .post(url.clone())
-            .timeout(Duration::from_secs(provider.timeout.max(1)))
+            .timeout(Duration::from_secs(provider.request_timeout.max(1)))
             .headers(upstream_headers(provider, request_headers, false))
             .json(&body)
             .send()
@@ -3175,7 +3187,7 @@ mod tests {
             config: Arc::new(RwLock::new(Arc::new(
                 AppConfig::load("config.example.yaml").unwrap(),
             ))),
-            client: Client::new(),
+            clients: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }

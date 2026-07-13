@@ -125,8 +125,10 @@ pub struct ProviderConfig {
     pub responses_mode: String,
     #[serde(default = "default_client_mode")]
     pub client_mode: String,
-    #[serde(default = "default_timeout")]
-    pub timeout: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+    #[serde(default = "default_request_timeout", alias = "timeout")]
+    pub request_timeout: u64,
     #[serde(default)]
     pub max_retries: usize,
     #[serde(default = "default_weight")]
@@ -307,8 +309,11 @@ fn default_responses_mode() -> String {
 fn default_client_mode() -> String {
     "normal".to_string()
 }
-fn default_timeout() -> u64 {
-    120
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    60
 }
 fn default_weight() -> u32 {
     1
@@ -352,6 +357,24 @@ mod tests {
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 8000);
         assert!(cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn legacy_timeout_maps_to_request_timeout() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+providers:
+  - name: legacy
+    base_url: https://example.test/v1
+    api_key: sk-test
+    timeout: 120
+"#,
+        )
+        .unwrap();
+
+        let provider = &cfg.providers[0];
+        assert_eq!(provider.connect_timeout, 10);
+        assert_eq!(provider.request_timeout, 120);
     }
 
     #[test]

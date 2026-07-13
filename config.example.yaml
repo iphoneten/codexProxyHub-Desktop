@@ -17,4 +17,5 @@ usage_log:
   max_bytes: 10485760
   max_chunks: 1000
 
+# provider 默认超时字段：connect_timeout: 10, request_timeout: 60
 providers: []

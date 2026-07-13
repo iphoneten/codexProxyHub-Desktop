@@ -1699,10 +1699,16 @@ fn provider_detail_panel(
                     ui.add(egui::DragValue::new(&mut provider.weight).range(1..=100));
                     ui.end_row();
 
-                    form_label(ui, "Timeout");
-                    ui.add(egui::DragValue::new(&mut provider.timeout).range(1..=600));
+                    form_label(ui, "Connect");
+                    ui.add(egui::DragValue::new(&mut provider.connect_timeout).range(1..=120));
+                    form_label(ui, "Request");
+                    ui.add(egui::DragValue::new(&mut provider.request_timeout).range(1..=600));
+                    ui.end_row();
+
                     form_label(ui, "Retries");
                     ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
+                    ui.label("");
+                    ui.label("");
                     ui.end_row();
 
                     form_label(ui, "Responses");
@@ -1885,7 +1891,12 @@ fn form_label(ui: &mut egui::Ui, text: &str) {
 fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(provider.timeout.max(1)))
+        .connect_timeout(std::time::Duration::from_secs(
+            provider.connect_timeout.max(1),
+        ))
+        .timeout(std::time::Duration::from_secs(
+            provider.request_timeout.max(1),
+        ))
         .build()
         .map_err(|err| err.to_string())?;
 
@@ -2020,7 +2031,8 @@ fn default_provider() -> ProviderConfig {
         model_sync_filter: "all".to_string(),
         responses_mode: "auto".to_string(),
         client_mode: "normal".to_string(),
-        timeout: 120,
+        connect_timeout: 10,
+        request_timeout: 60,
         max_retries: 3,
         weight: 1,
         priority: 1,
