@@ -75,14 +75,6 @@ pub struct UsageLogConfig {
     pub backend: String,
     #[serde(default = "default_sqlite_path")]
     pub sqlite_path: String,
-    #[serde(default = "default_true")]
-    pub import_legacy_jsonl: bool,
-    #[serde(default = "default_usage_path")]
-    pub path: String,
-    #[serde(default = "default_max_bytes")]
-    pub max_bytes: u64,
-    #[serde(default = "default_max_chunks")]
-    pub max_chunks: usize,
 }
 
 impl Default for UsageLogConfig {
@@ -90,10 +82,6 @@ impl Default for UsageLogConfig {
         Self {
             backend: default_usage_backend(),
             sqlite_path: default_sqlite_path(),
-            import_legacy_jsonl: true,
-            path: default_usage_path(),
-            max_bytes: default_max_bytes(),
-            max_chunks: default_max_chunks(),
         }
     }
 }
@@ -129,6 +117,10 @@ pub struct ProviderConfig {
     pub connect_timeout: u64,
     #[serde(default = "default_request_timeout", alias = "timeout")]
     pub request_timeout: u64,
+    #[serde(default)]
+    pub stream_idle_timeout: u64,
+    #[serde(default)]
+    pub stream_max_duration: u64,
     #[serde(default)]
     pub max_retries: usize,
     #[serde(default = "default_weight")]
@@ -183,10 +175,6 @@ impl AppConfig {
 
     pub fn usage_log_sqlite_path(&self) -> PathBuf {
         self.resolve_runtime_path(&self.usage_log.sqlite_path)
-    }
-
-    pub fn usage_log_jsonl_path(&self) -> PathBuf {
-        self.resolve_runtime_path(&self.usage_log.path)
     }
 
     fn resolve_runtime_path(&self, path: &str) -> PathBuf {
@@ -332,15 +320,6 @@ fn default_usage_backend() -> String {
 fn default_sqlite_path() -> String {
     "logs/proxy_usage.sqlite3".to_string()
 }
-fn default_usage_path() -> String {
-    "logs/proxy_usage.jsonl".to_string()
-}
-fn default_max_bytes() -> u64 {
-    5 * 1024 * 1024
-}
-fn default_max_chunks() -> usize {
-    20
-}
 
 #[cfg(test)]
 mod tests {
@@ -380,7 +359,6 @@ providers:
 usage_log:
   backend: sqlite
   sqlite_path: logs/proxy_usage.sqlite3
-  path: logs/proxy_usage.jsonl
 "#,
         )
         .unwrap();
@@ -389,10 +367,6 @@ usage_log:
         assert_eq!(
             cfg.usage_log_sqlite_path(),
             PathBuf::from("/tmp/RouteHub/logs/proxy_usage.sqlite3")
-        );
-        assert_eq!(
-            cfg.usage_log_jsonl_path(),
-            PathBuf::from("/tmp/RouteHub/logs/proxy_usage.jsonl")
         );
     }
 
@@ -403,7 +377,6 @@ usage_log:
 usage_log:
   backend: sqlite
   sqlite_path: /var/tmp/proxy_usage.sqlite3
-  path: /var/tmp/proxy_usage.jsonl
 "#,
         )
         .unwrap();
@@ -412,10 +385,6 @@ usage_log:
         assert_eq!(
             cfg.usage_log_sqlite_path(),
             PathBuf::from("/var/tmp/proxy_usage.sqlite3")
-        );
-        assert_eq!(
-            cfg.usage_log_jsonl_path(),
-            PathBuf::from("/var/tmp/proxy_usage.jsonl")
         );
     }
 }

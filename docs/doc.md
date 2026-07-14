@@ -19,10 +19,6 @@ routing:
 usage_log:
   backend: sqlite
   sqlite_path: logs/proxy_usage.sqlite3
-  import_legacy_jsonl: true
-  path: logs/proxy_usage.jsonl
-  max_bytes: 5242880
-  max_chunks: 20
 
 providers:
   - name: openai-main
@@ -102,12 +98,8 @@ routing:
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `backend` | string | `sqlite` | 日志后端。`sqlite` 写入 SQLite；其它值走 JSONL 兼容路径。 |
+| `backend` | string | `sqlite` | 日志后端。目前使用 SQLite。 |
 | `sqlite_path` | string | `logs/proxy_usage.sqlite3` | SQLite 日志文件路径。相对路径按配置文件所在目录解析。 |
-| `import_legacy_jsonl` | bool | `true` | 保留兼容字段，用于旧 JSONL 日志迁移。 |
-| `path` | string | `logs/proxy_usage.jsonl` | JSONL 日志路径。相对路径按配置文件所在目录解析。 |
-| `max_bytes` | number | `5242880` | JSONL 日志最大字节数，当前主要用于兼容旧配置。 |
-| `max_chunks` | number | `20` | JSONL 轮转分片数量，当前主要用于兼容旧配置。 |
 
 日志字段里，`first_token_ms` 是流式请求从代理开始请求该渠道到首个有效文本或工具调用输出的耗时；`latency_ms` 是完整流结束后的代理端到端耗时。长输出、工具调用等待、客户端读取和 SSE 连接持续时间都会让 `latency_ms` 大于上游平台显示的模型实际耗时。
 
@@ -190,6 +182,8 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | --- | --- | --- | --- |
 | `connect_timeout` | number | `10` | 连接超时秒数，限制 DNS/TCP/TLS/连接建立阶段。代理会按该值缓存 reqwest Client。 |
 | `request_timeout` | number | `60` | 请求超时秒数。非流式请求限制整个请求；流式请求分别限制等待响应头和等待首个有效输出，SSE 已开始正常输出后不限制总时长。 |
+| `stream_idle_timeout` | number | `0` | 流式响应开始后，连续多少秒没有收到上游新数据就主动中断。`0` 表示关闭。适合不稳定渠道，例如 `60`。 |
+| `stream_max_duration` | number | `0` | 流式响应开始后允许持续的最大秒数。`0` 表示关闭。设置过短会误杀长输出或工具任务。 |
 | `timeout` | number | 无 | 旧字段。仍可读取，会映射到 `request_timeout`；保存新配置时建议使用 `request_timeout`。 |
 
 建议值：
@@ -197,10 +191,13 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 ```yaml
 connect_timeout: 10
 request_timeout: 60
+stream_idle_timeout: 60
+stream_max_duration: 300
 max_retries: 0
 ```
 
 如果希望坏渠道尽快切换，可以降低 `request_timeout`，但不要设得太小，否则首包慢的上游会被误判失败。
+如果希望避免上游进入流式后长时间拖住任务，可以给不稳定渠道设置 `stream_idle_timeout` 或 `stream_max_duration`。流已经开始后无法无缝切换渠道，这类保护会主动中断并在日志中记为 `error`。
 
 ### 协议和兼容字段
 

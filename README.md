@@ -27,7 +27,7 @@ Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的
 - 上游 429、5xx、网络错误时重试和故障转移。
 - Chat Completions 与 Responses 流式响应中途断开时，在同一客户端 SSE 连接内续接下一个可用渠道。
 - `/v1/responses` 对 `responses_mode: chat` 或上游不支持 Responses API 的情况做基础 Chat Completions 兼容包装。
-- SQLite 用量日志（`usage_log.backend: sqlite`），并保留 JSONL 兼容写入模式。
+- SQLite 用量日志（`usage_log.backend: sqlite`）。
 
 ## 启动
 
@@ -156,7 +156,7 @@ usage_log:
   sqlite_path: logs/proxy_usage.sqlite3
 ```
 
-桌面端“日志”页会按当前 backend 读取最近 200 条请求记录。若将 `backend` 改为其他值，则使用 `usage_log.path` 写入/读取 JSONL。
+桌面端“日志”页会读取 SQLite 请求记录。
 流式请求里，`首字(秒)` 表示代理从开始请求该渠道到收到首个有效文本或工具调用输出的时间；`总耗时(秒)`/`latency_ms` 表示代理侧完整流连接结束后的端到端耗时，可能明显大于上游平台显示的模型处理耗时。
 相对日志路径会按当前加载的配置文件所在目录解析；DMG 首次启动后默认写入：
 

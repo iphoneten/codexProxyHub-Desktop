@@ -5,7 +5,7 @@ use crate::{
 use eframe::egui;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
-use std::{fs, path::PathBuf, sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
 #[cfg(target_os = "macos")]
@@ -460,12 +460,17 @@ fn status_bar(ui: &mut egui::Ui, app: &HubApp) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("状态")
+                    egui::RichText::new("操作动态")
                         .strong()
                         .color(egui::Color32::from_rgb(70, 75, 84)),
                 );
                 ui.separator();
-                ui.label(egui::RichText::new(&app.message).color(muteds()));
+                let message = if app.message.trim().is_empty() {
+                    "暂无操作"
+                } else {
+                    app.message.as_str()
+                };
+                ui.label(egui::RichText::new(message).color(muteds()));
                 if let Some(err) = app.server.lock().last_error.clone() {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(176, 54, 64), err);
@@ -909,11 +914,11 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
     section(ui, "鉴权", |ui| {
         ui.horizontal(|ui| {
             switch(ui, &mut config.auth.enabled);
-            ui.label("启用 Bearer API Key 鉴权");
+            ui.label("启用 API 秘钥鉴权");
         });
         ui.horizontal(|ui| {
-            ui.label("新 Key 名称");
-            ui.text_edit_singleline(new_key_name);
+            ui.label("新秘钥名称");
+            ui.add(egui::TextEdit::singleline(new_key_name).desired_width(220.0));
             if ui.button("添加").clicked() && !new_key_name.trim().is_empty() {
                 let name = new_key_name.trim().to_string();
                 let final_name = if name.is_empty() {
@@ -931,34 +936,60 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
             }
         });
 
-        egui::Grid::new("keys").striped(true).show(ui, |ui| {
-            ui.label("启用");
-            ui.label("名称");
-            ui.label("Key");
-            ui.label("操作");
-            ui.end_row();
-            let mut remove = None;
-            for (idx, key) in config.auth.api_keys.iter_mut().enumerate() {
-                switch(ui, &mut key.enabled);
-                ui.text_edit_singleline(&mut key.name);
-                ui.monospace(&key.key);
-                ui.horizontal(|ui| {
-                    if ui.button("复制").clicked() {
-                        ui.output_mut(|output| {
-                            output.copied_text = key.key.clone();
-                        });
-                    }
-                    if ui.button("删除").clicked() {
-                        remove = Some(idx);
-                    }
-                });
+        egui::Grid::new("keys")
+            .striped(true)
+            .spacing(egui::vec2(14.0, 8.0))
+            .show(ui, |ui| {
+                ui.label("启用");
+                ui.label("名称");
+                ui.label("API 秘钥");
+                ui.label("创建时间");
+                ui.label("操作");
                 ui.end_row();
-            }
-            if let Some(idx) = remove {
-                config.auth.api_keys.remove(idx);
-            }
-        });
+                let mut remove = None;
+                for (idx, key) in config.auth.api_keys.iter_mut().enumerate() {
+                    switch(ui, &mut key.enabled);
+                    ui.add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut key.name));
+                    ui.monospace(mask_api_key(&key.key));
+                    ui.label(if key.created_at.trim().is_empty() {
+                        "-"
+                    } else {
+                        key.created_at.as_str()
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("复制").clicked() {
+                            ui.output_mut(|output| {
+                                output.copied_text = key.key.clone();
+                            });
+                        }
+                        if ui.button("删除").clicked() {
+                            remove = Some(idx);
+                        }
+                    });
+                    ui.end_row();
+                }
+                if let Some(idx) = remove {
+                    config.auth.api_keys.remove(idx);
+                }
+            });
     });
+}
+
+fn mask_api_key(key: &str) -> String {
+    let len = key.chars().count();
+    if len <= 12 {
+        return "*".repeat(len.max(6));
+    }
+    let prefix: String = key.chars().take(8).collect();
+    let suffix: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}****{suffix}")
 }
 
 fn routing_section(ui: &mut egui::Ui, config: &mut AppConfig) {
@@ -1016,13 +1047,8 @@ fn logs_section(
     message: &mut String,
 ) {
     const LOG_PAGE_SIZE: usize = 20;
-    let backend = config.usage_log.backend.to_ascii_lowercase();
-    let path = if backend == "sqlite" {
-        config.usage_log_sqlite_path()
-    } else {
-        config.usage_log_jsonl_path()
-    };
-    let source_key = format!("{backend}:{}", path.display());
+    let path = config.usage_log_sqlite_path();
+    let source_key = format!("sqlite:{}", path.display());
     if log_view.loaded_path != source_key {
         log_view.page = 0;
         refresh_logs(config, log_view, Some(message));
@@ -1151,13 +1177,8 @@ fn logs_section(
 
 fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut String>) {
     const LOG_PAGE_SIZE: usize = 20;
-    let backend = config.usage_log.backend.to_ascii_lowercase();
-    let path = if backend == "sqlite" {
-        config.usage_log_sqlite_path()
-    } else {
-        config.usage_log_jsonl_path()
-    };
-    log_view.loaded_path = format!("{backend}:{}", path.display());
+    let path = config.usage_log_sqlite_path();
+    log_view.loaded_path = format!("sqlite:{}", path.display());
     log_view.last_refresh = Some(Instant::now());
     let (final_rows, final_total, note) = match read_log_page(config, log_view.page, LOG_PAGE_SIZE)
     {
@@ -1193,11 +1214,7 @@ fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option
 }
 
 fn read_log_totals(config: &AppConfig) -> Result<LogTotals, String> {
-    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        read_sqlite_log_totals(config.usage_log_sqlite_path())
-    } else {
-        read_jsonl_log_totals(config.usage_log_jsonl_path())
-    }
+    read_sqlite_log_totals(config.usage_log_sqlite_path())
 }
 
 fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
@@ -1220,32 +1237,6 @@ fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
     })
 }
 
-fn read_jsonl_log_totals(path: PathBuf) -> Result<LogTotals, String> {
-    if !path.exists() {
-        return Ok(LogTotals::default());
-    }
-    let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
-    let mut totals = LogTotals::default();
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        totals.input_tokens = totals.input_tokens.saturating_add(
-            value
-                .get("input_tokens")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0),
-        );
-        totals.output_tokens = totals.output_tokens.saturating_add(
-            value
-                .get("output_tokens")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0),
-        );
-    }
-    Ok(totals)
-}
-
 // Token 紧凑显示：< 1K 原样；≥ 1K 用 K；≥ 1M 用 M，均保留 2 位小数
 // 采用整数除法向下截断，避免浮点四舍五入导致边界值跨单位（如 999999 变 1000.00K）
 fn format_compact_tokens(n: i64) -> String {
@@ -1264,18 +1255,7 @@ fn format_compact_tokens(n: i64) -> String {
 }
 
 fn clear_logs(config: &AppConfig) -> Result<(), String> {
-    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        clear_sqlite_logs(config.usage_log_sqlite_path())
-    } else {
-        clear_jsonl_logs(config.usage_log_jsonl_path())
-    }
-}
-
-fn clear_jsonl_logs(path_buf: PathBuf) -> Result<(), String> {
-    if !path_buf.exists() {
-        return Ok(());
-    }
-    fs::write(&path_buf, "").map_err(|err| format!("清空日志失败: {err}"))
+    clear_sqlite_logs(config.usage_log_sqlite_path())
 }
 
 fn clear_sqlite_logs(path_buf: PathBuf) -> Result<(), String> {
@@ -1295,37 +1275,7 @@ fn read_log_page(
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
-    if config.usage_log.backend.eq_ignore_ascii_case("sqlite") {
-        read_sqlite_log_page(config.usage_log_sqlite_path(), page, page_size)
-    } else {
-        read_jsonl_log_page(config.usage_log_jsonl_path(), page, page_size)
-    }
-}
-
-fn read_jsonl_log_page(
-    path: PathBuf,
-    page: usize,
-    page_size: usize,
-) -> Result<(Vec<LogRow>, usize), String> {
-    if !path.exists() {
-        return Ok((Vec::new(), 0));
-    }
-    let content = fs::read_to_string(path).map_err(|err| format!("读取日志失败: {err}"))?;
-    let all_lines: Vec<_> = content.lines().collect();
-    let total = all_lines.len();
-    let offset = page.saturating_mul(page_size);
-    // 时间倒序：最新的一条排在最上面
-    let lines: Vec<String> = all_lines
-        .into_iter()
-        .rev()
-        .skip(offset)
-        .take(page_size)
-        .map(ToOwned::to_owned)
-        .collect();
-    Ok((
-        lines.iter().map(|line| parse_log_line(line)).collect(),
-        total,
-    ))
+    read_sqlite_log_page(config.usage_log_sqlite_path(), page, page_size)
 }
 
 fn read_sqlite_log_page(
@@ -1403,51 +1353,6 @@ struct LogRow {
     error: String,
 }
 
-fn parse_log_line(line: &str) -> LogRow {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return LogRow {
-            ts: "-".to_string(),
-            status: "raw".to_string(),
-            api: "-".to_string(),
-            channel: "-".to_string(),
-            model: "-".to_string(),
-            upstream_model: "-".to_string(),
-            first_token: "-".to_string(),
-            latency: "-".to_string(),
-            input_tokens: 0,
-            output_tokens: 0,
-            error: line.to_string(),
-        };
-    };
-    LogRow {
-        ts: json_string(&value, "ts"),
-        status: json_string(&value, "status"),
-        api: json_string(&value, "api"),
-        channel: json_string(&value, "channel"),
-        model: json_string(&value, "request_model"),
-        upstream_model: json_string(&value, "upstream_model"),
-        first_token: value
-            .get("first_token_ms")
-            .and_then(serde_json::Value::as_i64)
-            .map(|value| format!("{:.2}", value as f64 / 1000.0))
-            .unwrap_or_else(|| "-".to_string()),
-        latency: value
-            .get("latency_ms")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| format!("{:.2}", value as f64 / 1000.0))
-            .unwrap_or_else(|| "-".to_string()),
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or_default(),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or_default(),
-        error: json_string(&value, "error"),
-    }
-}
-
 fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
     ui.vertical(|ui| {
         ui.label(&row.model);
@@ -1478,15 +1383,6 @@ fn forward_arrow(ui: &mut egui::Ui) {
         .line_segment([egui::pos2(tip.x - 3.0, tip.y - 3.0), tip], stroke);
     ui.painter()
         .line_segment([tip, egui::pos2(tip.x - 3.0, tip.y + 3.0)], stroke);
-}
-
-fn json_string(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("-")
-        .to_string()
 }
 
 fn status_text(status: &str) -> egui::RichText {
@@ -1728,7 +1624,15 @@ fn provider_detail_panel(
 
                     form_label(ui, "Retries");
                     ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
-                    ui.label("");
+                    form_label(ui, "Stream Idle");
+                    ui.add(egui::DragValue::new(&mut provider.stream_idle_timeout).range(0..=3600));
+                    ui.end_row();
+
+                    form_label(ui, "Stream Max");
+                    ui.add(
+                        egui::DragValue::new(&mut provider.stream_max_duration).range(0..=86400),
+                    );
+                    ui.label(egui::RichText::new("0 表示关闭").color(muteds()));
                     ui.label("");
                     ui.end_row();
 
@@ -2125,6 +2029,8 @@ fn default_provider() -> ProviderConfig {
         client_mode: "normal".to_string(),
         connect_timeout: 10,
         request_timeout: 60,
+        stream_idle_timeout: 0,
+        stream_max_duration: 0,
         max_retries: 3,
         weight: 1,
         priority: 1,

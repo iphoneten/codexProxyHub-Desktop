@@ -12,10 +12,7 @@ routing:
 usage_log:
   backend: sqlite
   sqlite_path: logs/proxy_usage.sqlite3
-  import_legacy_jsonl: true
-  path: logs/proxy_usage.jsonl
-  max_bytes: 10485760
-  max_chunks: 1000
 
 # provider 默认超时字段：connect_timeout: 10, request_timeout: 60
+# 流式保护默认关闭：stream_idle_timeout: 0, stream_max_duration: 0
 providers: []

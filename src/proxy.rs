@@ -16,8 +16,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
@@ -804,6 +803,8 @@ async fn send_anthropic_chat_stream_as_responses(
                     resp,
                     request_model.clone(),
                     provider.request_timeout,
+                    provider.stream_idle_timeout,
+                    provider.stream_max_duration,
                     started,
                 )
                 .await
@@ -867,6 +868,8 @@ async fn prepare_anthropic_stream(
     resp: reqwest::Response,
     request_model: String,
     request_timeout: u64,
+    stream_idle_timeout: u64,
+    stream_max_duration: u64,
     started: Instant,
 ) -> Result<
     (
@@ -880,6 +883,12 @@ async fn prepare_anthropic_stream(
             .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
     );
     let stream = prepare_sse_stream(upstream, request_timeout, SseProbeKind::Anthropic).await?;
+    let stream = apply_stream_watchdog(
+        stream,
+        stream_idle_timeout,
+        stream_max_duration,
+        "Anthropic 上游流",
+    );
     Ok(crate::anthropic::spawn_stream_translator(
         stream,
         request_model,
@@ -890,13 +899,89 @@ async fn prepare_anthropic_stream(
 async fn prepare_openai_stream(
     resp: reqwest::Response,
     request_timeout: u64,
+    stream_idle_timeout: u64,
+    stream_max_duration: u64,
     kind: SseProbeKind,
 ) -> Result<ProxyByteStream, ProxyError> {
     let upstream = Box::pin(
         resp.bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
     );
-    prepare_sse_stream(upstream, request_timeout, kind).await
+    let stream = prepare_sse_stream(upstream, request_timeout, kind).await?;
+    Ok(apply_stream_watchdog(
+        stream,
+        stream_idle_timeout,
+        stream_max_duration,
+        "上游流",
+    ))
+}
+
+fn apply_stream_watchdog(
+    stream: ProxyByteStream,
+    idle_timeout_secs: u64,
+    max_duration_secs: u64,
+    label: &'static str,
+) -> ProxyByteStream {
+    if idle_timeout_secs == 0 && max_duration_secs == 0 {
+        return stream;
+    }
+
+    let idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
+    let max_duration = (max_duration_secs > 0).then(|| Duration::from_secs(max_duration_secs));
+    let started = Instant::now();
+    Box::pin(futures_util::stream::unfold(
+        (stream, started, idle_timeout, max_duration, false),
+        move |(mut stream, started, idle_timeout, max_duration, done)| async move {
+            if done {
+                return None;
+            }
+            let next = async { stream.next().await };
+            let result = match (idle_timeout, max_duration) {
+                (Some(idle), Some(max)) => {
+                    let remaining = max.checked_sub(started.elapsed()).unwrap_or_default();
+                    if remaining.is_zero() {
+                        Err(format!("{label}超过最大持续时间: {max_duration_secs}s"))
+                    } else {
+                        let wait = idle.min(remaining);
+                        match tokio::time::timeout(wait, next).await {
+                            Ok(value) => Ok(value),
+                            Err(_) if started.elapsed() >= max => {
+                                Err(format!("{label}超过最大持续时间: {max_duration_secs}s"))
+                            }
+                            Err(_) => Err(format!("{label}空闲超时: {idle_timeout_secs}s")),
+                        }
+                    }
+                }
+                (Some(idle), None) => match tokio::time::timeout(idle, next).await {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(format!("{label}空闲超时: {idle_timeout_secs}s")),
+                },
+                (None, Some(max)) => {
+                    let remaining = max.checked_sub(started.elapsed()).unwrap_or_default();
+                    if remaining.is_zero() {
+                        Err(format!("{label}超过最大持续时间: {max_duration_secs}s"))
+                    } else {
+                        match tokio::time::timeout(remaining, next).await {
+                            Ok(value) => Ok(value),
+                            Err(_) => Err(format!("{label}超过最大持续时间: {max_duration_secs}s")),
+                        }
+                    }
+                }
+                (None, None) => Ok(next.await),
+            };
+
+            match result {
+                Ok(Some(item)) => {
+                    Some((item, (stream, started, idle_timeout, max_duration, false)))
+                }
+                Ok(None) => None,
+                Err(message) => Some((
+                    Err(io::Error::new(io::ErrorKind::TimedOut, message)),
+                    (stream, started, idle_timeout, max_duration, true),
+                )),
+            }
+        },
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1712,18 +1797,23 @@ async fn send_to_provider(
                     } else {
                         SseProbeKind::Chat
                     };
-                    let stream =
-                        match prepare_openai_stream(resp, provider.request_timeout, probe_kind)
-                            .await
-                        {
-                            Ok(stream) => stream,
-                            Err(err) if attempt < provider.max_retries && err.retryable() => {
-                                tokio::time::sleep(retry_delay(attempt)).await;
-                                attempt += 1;
-                                continue;
-                            }
-                            Err(err) => return Err(err),
-                        };
+                    let stream = match prepare_openai_stream(
+                        resp,
+                        provider.request_timeout,
+                        provider.stream_idle_timeout,
+                        provider.stream_max_duration,
+                        probe_kind,
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(err) if attempt < provider.max_retries && err.retryable() => {
+                            tokio::time::sleep(retry_delay(attempt)).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
                     let (usage_rx, body_stream) =
                         stream_with_usage_probe(stream, probe_kind, started);
                     let response = Response::builder()
@@ -1850,6 +1940,8 @@ async fn send_to_anthropic_provider(
                         resp,
                         request_model.clone(),
                         provider.request_timeout,
+                        provider.stream_idle_timeout,
+                        provider.stream_max_duration,
                         started,
                     )
                     .await
@@ -1962,6 +2054,8 @@ async fn send_responses_stream_as_chat(
                 let stream = match prepare_openai_stream(
                     resp,
                     provider.request_timeout,
+                    provider.stream_idle_timeout,
+                    provider.stream_max_duration,
                     SseProbeKind::Responses,
                 )
                 .await
@@ -3452,48 +3546,21 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
     let error = event.error.unwrap_or("");
     let token_source = event.token_source.unwrap_or("upstream_or_unknown");
 
-    if config.usage_log.backend.eq_ignore_ascii_case("sqlite")
-        && log_usage_sqlite(
-            config.usage_log_sqlite_path(),
-            &ts,
-            event.api,
-            event.status,
-            event.provider,
-            event.model,
-            event.upstream_model,
-            latency_ms,
-            event.first_token_ms,
-            error,
-            event.usage.input,
-            event.usage.output,
-            token_source,
-        )
-        .is_ok()
-    {
-        return;
-    }
-
-    let record = json!({
-        "ts": ts,
-        "api": event.api,
-        "status": event.status,
-        "channel": event.provider,
-        "request_model": event.model,
-        "upstream_model": event.upstream_model,
-        "latency_ms": latency_ms,
-        "first_token_ms": event.first_token_ms,
-        "input_tokens": event.usage.input,
-        "output_tokens": event.usage.output,
-        "error": error,
-        "token_source": token_source,
-    });
-    let path = config.usage_log_jsonl_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{}", record);
-    }
+    let _ = log_usage_sqlite(
+        config.usage_log_sqlite_path(),
+        &ts,
+        event.api,
+        event.status,
+        event.provider,
+        event.model,
+        event.upstream_model,
+        latency_ms,
+        event.first_token_ms,
+        error,
+        event.usage.input,
+        event.usage.output,
+        token_source,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4059,6 +4126,35 @@ mod tests {
         assert!(outcome.error.is_none());
         assert_eq!(outcome.usage.input, 11);
         assert_eq!(outcome.usage.output, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_watchdog_reports_max_duration_after_first_output() {
+        let first = json!({"choices":[{"delta":{"content":"hi"}}]});
+        let delayed = futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<Bytes, io::Error>(Bytes::from("data: [DONE]\n\n"))
+        });
+        let stream: ProxyByteStream = Box::pin(
+            futures_util::stream::once(async move {
+                Ok::<Bytes, io::Error>(Bytes::from(format!("data: {first}\n\n")))
+            })
+            .chain(delayed),
+        );
+        let stream = apply_stream_watchdog(stream, 0, 1, "test");
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+        while let Some(chunk) = body_stream.next().await {
+            let _ = chunk;
+        }
+        let outcome = rx.await.unwrap();
+
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("超过最大持续时间"));
     }
 
     #[test]
