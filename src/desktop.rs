@@ -42,6 +42,7 @@ enum AppView {
     Auth,
     Routing,
     Logs,
+    About,
 }
 
 #[derive(Default)]
@@ -334,21 +335,26 @@ impl eframe::App for HubApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(config) = self.config.as_mut() else {
-                empty_state(
-                    ui,
-                    "未加载配置",
-                    "请确认 config.yaml 路径，然后点击重新加载。",
-                );
-                return;
-            };
-
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(18.0, 16.0))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            if self.view == AppView::About {
+                                about_section(ui, &self.config_path, &self.server.lock());
+                                return;
+                            }
+
+                            let Some(config) = self.config.as_mut() else {
+                                empty_state(
+                                    ui,
+                                    "未加载配置",
+                                    "请确认 config.yaml 路径，然后点击重新加载。",
+                                );
+                                return;
+                            };
+
                             overview_header(ui, config, &self.server.lock());
                             ui.add_space(14.0);
                             match self.view {
@@ -375,6 +381,7 @@ impl eframe::App for HubApp {
                                 AppView::Logs => {
                                     logs_section(ui, config, &mut self.log_view, &mut self.message)
                                 }
+                                AppView::About => {}
                             }
                         });
                 });
@@ -480,6 +487,7 @@ fn side_navigation(ui: &mut egui::Ui, app: &mut HubApp) {
             nav_item(ui, &mut next_view, AppView::Auth, "鉴权");
             nav_item(ui, &mut next_view, AppView::Routing, "路由");
             nav_item(ui, &mut next_view, AppView::Logs, "日志");
+            nav_item(ui, &mut next_view, AppView::About, "关于");
             ui.add_space(18.0);
             ui.separator();
             ui.add_space(10.0);
@@ -1962,6 +1970,77 @@ fn push_unique(models: &mut Vec<String>, id: &str) {
     if !id.is_empty() && !models.iter().any(|item| item == id) {
         models.push(id.to_string());
     }
+}
+
+fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
+    section(ui, "关于 recodexProxyHub", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("recodexProxyHub")
+                    .size(24.0)
+                    .strong()
+                    .color(stat_color()),
+            );
+            badge(
+                ui,
+                &format!("v{}", crate::app_version()),
+                egui::Color32::from_rgb(239, 246, 255),
+                accent(),
+            );
+        });
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "本地 OpenAI-compatible 代理桌面工具，用于管理多渠道转发、智能路由、故障转移和请求日志。",
+            )
+            .color(muteds()),
+        );
+    });
+
+    ui.add_space(12.0);
+
+    section(ui, "运行信息", |ui| {
+        about_info_row(ui, "版本", crate::app_version());
+        about_info_row(ui, "配置文件", config_path);
+        about_info_row(
+            ui,
+            "代理状态",
+            if server.running {
+                "运行中"
+            } else {
+                "未运行"
+            },
+        );
+        if server.running {
+            about_info_row(ui, "本地接口", &server.endpoint);
+        }
+    });
+
+    ui.add_space(12.0);
+
+    section(ui, "项目", |ui| {
+        let repository = "https://github.com/iphoneten/codexProxyHub-Desktop";
+        about_info_row(ui, "仓库", repository);
+        ui.horizontal(|ui| {
+            if soft_button(ui, "复制仓库地址").clicked() {
+                ui.output_mut(|output| output.copied_text = repository.to_string());
+            }
+            if soft_button(ui, "复制配置路径").clicked() {
+                ui.output_mut(|output| output.copied_text = config_path.to_string());
+            }
+        });
+    });
+}
+
+fn about_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.set_min_height(24.0);
+        ui.add_sized(
+            egui::vec2(92.0, 20.0),
+            egui::Label::new(egui::RichText::new(label).size(12.0).color(muteds())),
+        );
+        ui.label(egui::RichText::new(value).color(text_color()));
+    });
 }
 
 fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
