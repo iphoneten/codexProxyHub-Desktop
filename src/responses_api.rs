@@ -6,7 +6,7 @@
 //   - responses_to_chat_response: Responses 响应 -> Chat 响应（非流式）
 //   - spawn_responses_stream_translator: Responses SSE -> Chat SSE（状态机）
 
-use crate::proxy::{next_sse_event, sse_data, TokenUsage};
+use crate::proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::{HashMap, HashSet},
     io,
+    time::Instant,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -499,34 +500,37 @@ fn extract_usage(body: &Value) -> (i64, i64) {
 pub fn spawn_responses_stream_translator(
     resp: reqwest::Response,
     request_model: String,
+    started: Instant,
 ) -> (
-    oneshot::Receiver<TokenUsage>,
+    oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
 ) {
     let stream = resp
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
-    spawn_responses_stream_translator_from_stream(stream, request_model)
+    spawn_responses_stream_translator_from_stream(stream, request_model, started)
 }
 
 pub fn spawn_responses_stream_translator_from_stream<S>(
     stream: S,
     request_model: String,
+    started: Instant,
 ) -> (
-    oneshot::Receiver<TokenUsage>,
+    oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
 )
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
-    let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
+    let (u_tx, u_rx) = oneshot::channel::<StreamOutcome>();
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
         let mut stream = Box::pin(stream);
+        let mut first_token_ms = None;
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
-            let _ = u_tx.send(state.usage);
+            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
             return;
         }
 
@@ -547,35 +551,70 @@ where
                         };
                         let outputs = state.handle_event(&payload);
                         for out in outputs {
+                            if stream_chunk_has_client_output(&out) {
+                                first_token_ms
+                                    .get_or_insert_with(|| started.elapsed().as_millis() as i64);
+                            }
                             if send_json_chunk(&tx, &out).await.is_err() {
-                                let _ = u_tx.send(state.usage);
+                                let _ =
+                                    u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
                                 return;
                             }
+                        }
+                        if let Some(error) = responses_stream_error_message(&payload) {
+                            let _ = u_tx.send(StreamOutcome::failed(
+                                state.usage,
+                                first_token_ms,
+                                error,
+                            ));
+                            return;
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = tx
-                        .send(Err(io::Error::other(format!("上游流错误: {err}"))))
-                        .await;
-                    let _ = u_tx.send(state.usage);
+                    let message = format!("上游流错误: {err}");
+                    let _ = tx.send(Err(io::Error::other(message.clone()))).await;
+                    let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
                     return;
                 }
             }
         }
         if !state.finished {
-            let _ = tx
-                .send(Err(io::Error::other(
-                    "Responses 上游流未收到完成事件就已结束",
-                )))
-                .await;
-            let _ = u_tx.send(state.usage);
+            let message = "Responses 上游流未收到完成事件就已结束";
+            let _ = tx.send(Err(io::Error::other(message))).await;
+            let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
             return;
         }
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-        let _ = u_tx.send(state.usage);
+        let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
     });
     (u_rx, ReceiverStream::new(rx))
+}
+
+fn stream_chunk_has_client_output(value: &Value) -> bool {
+    value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+        || value.pointer("/choices/0/delta/tool_calls").is_some()
+}
+
+fn responses_stream_error_message(payload: &Value) -> Option<String> {
+    let event_type = payload.get("type").and_then(Value::as_str)?;
+    if !matches!(
+        event_type,
+        "error" | "response.failed" | "response.incomplete"
+    ) {
+        return None;
+    }
+    Some(
+        payload
+            .pointer("/error/message")
+            .or_else(|| payload.pointer("/response/error/message"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("Responses 上游返回 {event_type}")),
+    )
 }
 
 async fn send_json_chunk(
@@ -915,6 +954,7 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn request_extracts_system_to_instructions() {
@@ -1155,5 +1195,35 @@ mod tests {
         );
         assert!(out[0]["choices"].is_null());
         assert!(state.finished);
+    }
+
+    #[tokio::test]
+    async fn stream_translator_reports_failed_event_as_error_outcome() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "message": "Concurrency limit exceeded for account"
+                }
+            }
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let (rx, body_stream) = spawn_responses_stream_translator_from_stream(
+            stream,
+            "gpt-test".to_string(),
+            Instant::now(),
+        );
+        let body = axum::body::Body::from_stream(body_stream);
+        let _ = to_bytes(body, 1024 * 1024).await.unwrap();
+        let outcome = rx.await.unwrap();
+
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Concurrency limit exceeded"));
     }
 }

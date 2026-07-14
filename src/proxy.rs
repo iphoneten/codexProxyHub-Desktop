@@ -98,12 +98,40 @@ pub(crate) struct TokenUsage {
     pub output: i64,
 }
 
+pub(crate) struct StreamOutcome {
+    pub(crate) usage: TokenUsage,
+    pub(crate) first_token_ms: Option<i64>,
+    pub(crate) error: Option<String>,
+}
+
+impl StreamOutcome {
+    pub(crate) fn success(usage: TokenUsage, first_token_ms: Option<i64>) -> Self {
+        Self {
+            usage,
+            first_token_ms,
+            error: None,
+        }
+    }
+
+    pub(crate) fn failed(
+        usage: TokenUsage,
+        first_token_ms: Option<i64>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            usage,
+            first_token_ms,
+            error: Some(error.into()),
+        }
+    }
+}
+
 struct ProviderResult {
     response: Response,
     upstream_model: String,
     usage: TokenUsage,
-    // 流式请求会在此提供最终 usage；外层收到 Some 时改为异步落日志
-    usage_rx: Option<oneshot::Receiver<TokenUsage>>,
+    // 流式请求会在此提供最终 usage 和流错误；外层收到 Some 时改为异步落日志
+    usage_rx: Option<oneshot::Receiver<StreamOutcome>>,
 }
 
 #[derive(Debug)]
@@ -331,8 +359,15 @@ async fn responses(
         // 其它一律先尝试 native /responses；失败时下面的 auto-fallback 分支会自动降级 chat。
         let force_chat = provider_prefers_chat_responses(&provider);
         if force_chat {
-            match forward_responses_as_chat(&state, &provider, &headers, upstream_body, stream)
-                .await
+            match forward_responses_as_chat(
+                &state,
+                &provider,
+                &headers,
+                upstream_body,
+                stream,
+                started,
+            )
+            .await
             {
                 Ok(result) => {
                     return Ok(commit_result(
@@ -353,6 +388,7 @@ async fn responses(
                         &provider.name,
                         &request_model,
                         started,
+                        None,
                         &message,
                     );
                     last_error = Some(message);
@@ -368,6 +404,7 @@ async fn responses(
             &headers,
             upstream_body,
             stream,
+            started,
         )
         .await
         {
@@ -388,8 +425,10 @@ async fn responses(
                         || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
             {
                 let chat_body = with_model(body.clone(), &request_model);
-                match forward_responses_as_chat(&state, &provider, &headers, chat_body, stream)
-                    .await
+                match forward_responses_as_chat(
+                    &state, &provider, &headers, chat_body, stream, started,
+                )
+                .await
                 {
                     Ok(result) => {
                         return Ok(commit_result(
@@ -410,6 +449,7 @@ async fn responses(
                             &provider.name,
                             &request_model,
                             started,
+                            None,
                             &message,
                         );
                         last_error = Some(message);
@@ -425,6 +465,7 @@ async fn responses(
                     &provider.name,
                     &request_model,
                     started,
+                    None,
                     &message,
                 );
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
@@ -474,7 +515,17 @@ async fn forward_openai(
         } else {
             None
         };
-        match send_to_provider(&state, &provider, path, &headers, upstream_body, stream).await {
+        match send_to_provider(
+            &state,
+            &provider,
+            path,
+            &headers,
+            upstream_body,
+            stream,
+            started,
+        )
+        .await
+        {
             Ok(result) => {
                 return Ok(commit_result(
                     state.snapshot(),
@@ -493,7 +544,9 @@ async fn forward_openai(
                     err.status == StatusCode::NOT_FOUND
                         || err.status == StatusCode::METHOD_NOT_ALLOWED,
                 ) {
-                    match send_chat_via_responses(&state, &provider, &headers, fb, stream).await {
+                    match send_chat_via_responses(&state, &provider, &headers, fb, stream, started)
+                        .await
+                    {
                         Ok(result) => {
                             return Ok(commit_result(
                                 state.snapshot(),
@@ -507,7 +560,15 @@ async fn forward_openai(
                         }
                         Err(fb_err) => {
                             let msg = fb_err.message;
-                            log_error(&cfg, api, &provider.name, &request_model, started, &msg);
+                            log_error(
+                                &cfg,
+                                api,
+                                &provider.name,
+                                &request_model,
+                                started,
+                                None,
+                                &msg,
+                            );
                             last_error = Some(msg);
                             continue;
                         }
@@ -515,7 +576,15 @@ async fn forward_openai(
                 }
                 let status = err.status;
                 let message = err.message;
-                log_error(&cfg, api, &provider.name, &request_model, started, &message);
+                log_error(
+                    &cfg,
+                    api,
+                    &provider.name,
+                    &request_model,
+                    started,
+                    None,
+                    &message,
+                );
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
                 if should_stop_failover(status) {
@@ -538,6 +607,7 @@ async fn forward_responses_as_chat(
     headers: &HeaderMap,
     body: Value,
     stream: bool,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let chat_body = responses_to_chat_body(&body)?;
     let custom_tool_names = responses_custom_tool_names(body.get("tools"));
@@ -554,6 +624,7 @@ async fn forward_responses_as_chat(
             chat_body,
             request_model,
             custom_tool_names,
+            started,
         )
         .await;
     }
@@ -566,6 +637,7 @@ async fn forward_responses_as_chat(
             headers,
             chat_body,
             false,
+            started,
         )
         .await?;
         response_json(result.response).await?
@@ -625,6 +697,7 @@ async fn send_chat_stream_as_responses(
     body: Value,
     request_model: String,
     custom_tool_names: HashSet<String>,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     if provider.provider_type == "anthropic" {
         let client = state.client_for_provider(provider);
@@ -635,6 +708,7 @@ async fn send_chat_stream_as_responses(
             body,
             request_model,
             custom_tool_names,
+            started,
         )
         .await;
     }
@@ -662,7 +736,7 @@ async fn send_chat_stream_as_responses(
                         format!("{} body={}", msg, clean_upstream_error(&text)),
                     ));
                 }
-                return chat_stream_to_responses(resp, request_model, custom_tool_names);
+                return chat_stream_to_responses(resp, request_model, custom_tool_names, started);
             }
             Ok(resp) => {
                 let status =
@@ -703,6 +777,7 @@ async fn send_anthropic_chat_stream_as_responses(
     body: Value,
     request_model: String,
     custom_tool_names: HashSet<String>,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let mut anthropic_body = crate::anthropic::openai_to_anthropic_request(&body)
         .map_err(|err| ProxyError::new(StatusCode::BAD_REQUEST, format!("协议翻译失败: {err}")))?;
@@ -729,6 +804,7 @@ async fn send_anthropic_chat_stream_as_responses(
                     resp,
                     request_model.clone(),
                     provider.request_timeout,
+                    started,
                 )
                 .await
                 {
@@ -739,8 +815,12 @@ async fn send_anthropic_chat_stream_as_responses(
                     }
                     Err(err) => return Err(err),
                 };
-                let mut result =
-                    chat_sse_stream_to_responses(chat_stream, request_model, custom_tool_names)?;
+                let mut result = chat_sse_stream_to_responses(
+                    chat_stream,
+                    request_model,
+                    custom_tool_names,
+                    started,
+                )?;
                 result.usage_rx = Some(anthropic_usage_rx);
                 return Ok(result);
             }
@@ -775,20 +855,22 @@ fn chat_stream_to_responses(
     resp: reqwest::Response,
     request_model: String,
     custom_tool_names: HashSet<String>,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let stream = resp
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
-    chat_sse_stream_to_responses(stream, request_model, custom_tool_names)
+    chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started)
 }
 
 async fn prepare_anthropic_stream(
     resp: reqwest::Response,
     request_model: String,
     request_timeout: u64,
+    started: Instant,
 ) -> Result<
     (
-        oneshot::Receiver<TokenUsage>,
+        oneshot::Receiver<StreamOutcome>,
         ReceiverStream<Result<Bytes, io::Error>>,
     ),
     ProxyError,
@@ -801,6 +883,7 @@ async fn prepare_anthropic_stream(
     Ok(crate::anthropic::spawn_stream_translator(
         stream,
         request_model,
+        started,
     ))
 }
 
@@ -1046,6 +1129,7 @@ fn chat_sse_stream_to_responses<S>(
     stream: S,
     request_model: String,
     custom_tool_names: HashSet<String>,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -1058,7 +1142,7 @@ where
     let result_model = model.clone();
     let stream_model = model.clone();
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
-    let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
+    let (u_tx, u_rx) = oneshot::channel::<StreamOutcome>();
     tokio::spawn(async move {
         let mut usage = TokenUsage::default();
         let u_tx = u_tx;
@@ -1131,6 +1215,7 @@ where
         let mut buffer = String::new();
         let mut full_text = String::new();
         let mut tool_calls: Vec<ChatToolCallState> = Vec::new();
+        let mut first_token_ms = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -1151,7 +1236,7 @@ where
                                 &tool_calls,
                             )
                             .await;
-                            let _ = u_tx.send(usage);
+                            let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
                             return;
                         }
                         // 顺便累积 usage（OpenAI include_usage 的 chunk 通常在 [DONE] 之前抵达）
@@ -1172,10 +1257,13 @@ where
                             )
                             .await;
                             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                            let _ = u_tx.send(usage);
+                            let _ =
+                                u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
                             return;
                         }
                         if let Some(delta) = chat_stream_delta(&data) {
+                            first_token_ms
+                                .get_or_insert_with(|| started.elapsed().as_millis() as i64);
                             full_text.push_str(&delta);
                             let _ = send_response_sse(
                                 &tx,
@@ -1191,6 +1279,8 @@ where
                             .await;
                         }
                         for delta in chat_stream_tool_call_deltas(&data) {
+                            first_token_ms
+                                .get_or_insert_with(|| started.elapsed().as_millis() as i64);
                             while tool_calls.len() <= delta.index {
                                 tool_calls.push(ChatToolCallState::default());
                             }
@@ -1260,6 +1350,7 @@ where
                     }
                 }
                 Err(err) => {
+                    let message = err.to_string();
                     let _ = send_response_sse(
                         &tx,
                         "response.failed",
@@ -1269,12 +1360,12 @@ where
                                 "id": response_id,
                                 "status": "failed",
                                 "model": model,
-                                "error": {"message": err.to_string()}
+                                "error": {"message": message}
                             }
                         }),
                     )
                     .await;
-                    let _ = u_tx.send(usage);
+                    let _ = u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
                     return;
                 }
             }
@@ -1290,7 +1381,7 @@ where
             &tool_calls,
         )
         .await;
-        let _ = u_tx.send(usage);
+        let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
     });
 
     let response = Response::builder()
@@ -1568,11 +1659,20 @@ async fn send_to_provider(
     request_headers: &HeaderMap,
     body: Value,
     stream: bool,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let client = state.client_for_provider(provider);
     // Anthropic 渠道：对 chat/completions 走独立协议翻译到 /messages
     if provider.provider_type == "anthropic" && path == "/chat/completions" {
-        return send_to_anthropic_provider(&client, provider, request_headers, body, stream).await;
+        return send_to_anthropic_provider(
+            &client,
+            provider,
+            request_headers,
+            body,
+            stream,
+            started,
+        )
+        .await;
     }
     if stream {
         let upstream_model = body
@@ -1624,7 +1724,8 @@ async fn send_to_provider(
                             }
                             Err(err) => return Err(err),
                         };
-                    let (usage_rx, body_stream) = stream_with_usage_probe(stream);
+                    let (usage_rx, body_stream) =
+                        stream_with_usage_probe(stream, probe_kind, started);
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1704,6 +1805,7 @@ async fn send_to_anthropic_provider(
     request_headers: &HeaderMap,
     body: Value,
     stream: bool,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = body
         .get("model")
@@ -1748,6 +1850,7 @@ async fn send_to_anthropic_provider(
                         resp,
                         request_model.clone(),
                         provider.request_timeout,
+                        started,
                     )
                     .await
                     {
@@ -1830,6 +1933,7 @@ async fn send_responses_stream_as_chat(
     provider: &ProviderConfig,
     request_headers: &HeaderMap,
     responses_body: Value,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = responses_body
         .get("model")
@@ -1874,6 +1978,7 @@ async fn send_responses_stream_as_chat(
                     crate::responses_api::spawn_responses_stream_translator_from_stream(
                         stream,
                         request_model.clone(),
+                        started,
                     );
                 let response = Response::builder()
                     .status(status)
@@ -1921,6 +2026,7 @@ async fn send_chat_via_responses(
     request_headers: &HeaderMap,
     body: Value,
     stream: bool,
+    started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
     let client = state.client_for_provider(provider);
     let request_model = body
@@ -1939,8 +2045,14 @@ async fn send_chat_via_responses(
         obj.insert("stream".into(), Value::Bool(stream));
     }
     if stream {
-        return send_responses_stream_as_chat(state, provider, request_headers, responses_body)
-            .await;
+        return send_responses_stream_as_chat(
+            state,
+            provider,
+            request_headers,
+            responses_body,
+            started,
+        )
+        .await;
     }
     let url = upstream_url(provider, "/responses");
     let mut attempt: usize = 0;
@@ -2751,46 +2863,115 @@ fn accumulate_usage_from_sse_data(data: &str, target: &mut TokenUsage) {
 // 边转发边解析 SSE，不改写 payload；客户端断连时立即结束以避免资源浪费
 fn stream_with_usage_probe<S>(
     stream: S,
+    kind: SseProbeKind,
+    started: Instant,
 ) -> (
-    oneshot::Receiver<TokenUsage>,
+    oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
 )
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
-    let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
+    let (u_tx, u_rx) = oneshot::channel::<StreamOutcome>();
     tokio::spawn(async move {
         let mut usage = TokenUsage::default();
         let mut buffer = String::new();
         let mut stream = Box::pin(stream);
+        let mut completed = false;
+        let mut stream_error = None;
+        let mut client_disconnected = false;
+        let mut first_token_ms = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     // 先原样转发给客户端
                     if tx.send(Ok(bytes.clone())).await.is_err() {
                         // 客户端已断开，停止解析节省上游流量
+                        client_disconnected = true;
                         break;
                     }
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         if let Some(data) = sse_data(&event) {
-                            if data.trim() != "[DONE]" {
-                                accumulate_usage_from_sse_data(&data, &mut usage);
+                            accumulate_usage_from_sse_data(&data, &mut usage);
+                            if sse_stream_completed(kind, &data) {
+                                completed = true;
+                            }
+                            if first_token_ms.is_none()
+                                && matches!(
+                                    inspect_sse_probe_event(kind, &data),
+                                    SseProbeDecision::Ready
+                                )
+                            {
+                                first_token_ms = Some(started.elapsed().as_millis() as i64);
+                            }
+                            if stream_error.is_none() {
+                                stream_error = sse_stream_error(kind, &data);
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(io::Error::other(err.to_string()))).await;
+                    let message = err.to_string();
+                    stream_error = Some(message.clone());
+                    let _ = tx.send(Err(io::Error::other(message))).await;
                     break;
                 }
             }
         }
-        let _ = u_tx.send(usage);
+        let outcome = if let Some(error) = stream_error {
+            StreamOutcome::failed(usage, first_token_ms, error)
+        } else if !completed && !client_disconnected {
+            StreamOutcome::failed(usage, first_token_ms, "上游流在完成事件前断开")
+        } else {
+            StreamOutcome::success(usage, first_token_ms)
+        };
+        let _ = u_tx.send(outcome);
     });
     (u_rx, ReceiverStream::new(rx))
+}
+
+fn sse_stream_completed(kind: SseProbeKind, data: &str) -> bool {
+    if data.trim() == "[DONE]" {
+        return true;
+    }
+    if !matches!(kind, SseProbeKind::Responses) {
+        return false;
+    }
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .as_deref()
+        == Some("response.completed")
+}
+
+fn sse_stream_error(kind: SseProbeKind, data: &str) -> Option<String> {
+    if matches!(kind, SseProbeKind::Chat) {
+        return chat_stream_error_message(data);
+    }
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    let event_type = value.get("type").and_then(Value::as_str)?;
+    if !matches!(
+        event_type,
+        "error" | "response.failed" | "response.incomplete"
+    ) {
+        return None;
+    }
+    Some(
+        value
+            .pointer("/error/message")
+            .or_else(|| value.pointer("/response/error/message"))
+            .and_then(Value::as_str)
+            .map(truncate)
+            .unwrap_or_else(|| format!("Responses 上游返回 {event_type}")),
+    )
 }
 
 // 若结果自带 usage 通道，则延迟到流结束再写日志；否则按同步 usage 立即落库
@@ -2809,17 +2990,51 @@ fn commit_result(
         let model = model.to_string();
         let upstream_model = result.upstream_model.clone();
         tokio::spawn(async move {
-            let usage = rx.await.unwrap_or_default();
-            log_success(
-                &cfg,
-                &api,
-                &provider,
-                &model,
-                &upstream_model,
-                usage,
-                started,
-                false,
-            );
+            match rx.await {
+                Ok(StreamOutcome {
+                    usage: _,
+                    first_token_ms,
+                    error: Some(error),
+                }) => {
+                    log_error(
+                        &cfg,
+                        &api,
+                        &provider,
+                        &model,
+                        started,
+                        first_token_ms,
+                        &error,
+                    );
+                }
+                Ok(StreamOutcome {
+                    usage,
+                    first_token_ms,
+                    error: None,
+                }) => {
+                    log_success(
+                        &cfg,
+                        &api,
+                        &provider,
+                        &model,
+                        &upstream_model,
+                        usage,
+                        started,
+                        first_token_ms,
+                        false,
+                    );
+                }
+                Err(_) => {
+                    log_error(
+                        &cfg,
+                        &api,
+                        &provider,
+                        &model,
+                        started,
+                        None,
+                        "流式结果状态通道异常关闭",
+                    );
+                }
+            }
         });
     } else {
         log_success(
@@ -2830,6 +3045,7 @@ fn commit_result(
             &result.upstream_model,
             result.usage,
             started,
+            None,
             stream,
         );
     }
@@ -3171,6 +3387,7 @@ struct UsageLogEvent<'a> {
     status: &'a str,
     error: Option<&'a str>,
     usage: TokenUsage,
+    first_token_ms: Option<i64>,
     token_source: Option<&'a str>,
 }
 
@@ -3183,6 +3400,7 @@ fn log_success(
     upstream_model: &str,
     usage: TokenUsage,
     started: Instant,
+    first_token_ms: Option<i64>,
     stream: bool,
 ) {
     log_usage(
@@ -3196,6 +3414,7 @@ fn log_success(
             status: if stream { "stream_started" } else { "ok" },
             error: None,
             usage,
+            first_token_ms,
             token_source: None,
         },
     );
@@ -3207,6 +3426,7 @@ fn log_error(
     provider: &str,
     model: &str,
     started: Instant,
+    first_token_ms: Option<i64>,
     error: &str,
 ) {
     log_usage(
@@ -3220,6 +3440,7 @@ fn log_error(
             status: "error",
             error: Some(error),
             usage: TokenUsage::default(),
+            first_token_ms,
             token_source: None,
         },
     );
@@ -3241,6 +3462,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
             event.model,
             event.upstream_model,
             latency_ms,
+            event.first_token_ms,
             error,
             event.usage.input,
             event.usage.output,
@@ -3259,6 +3481,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
         "request_model": event.model,
         "upstream_model": event.upstream_model,
         "latency_ms": latency_ms,
+        "first_token_ms": event.first_token_ms,
         "input_tokens": event.usage.input,
         "output_tokens": event.usage.output,
         "error": error,
@@ -3283,6 +3506,7 @@ fn log_usage_sqlite(
     model: &str,
     upstream_model: &str,
     latency_ms: i64,
+    first_token_ms: Option<i64>,
     error: &str,
     input_tokens: i64,
     output_tokens: i64,
@@ -3298,10 +3522,10 @@ fn log_usage_sqlite(
         INSERT INTO usage_logs
             (
                 ts, api, status, channel, request_model, upstream_model,
-                latency_ms, input_tokens, output_tokens, error, token_source
+                latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         "#,
         params![
             ts,
@@ -3311,6 +3535,7 @@ fn log_usage_sqlite(
             model,
             upstream_model,
             latency_ms,
+            first_token_ms,
             input_tokens,
             output_tokens,
             error,
@@ -3332,6 +3557,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
             request_model TEXT NOT NULL,
             upstream_model TEXT NOT NULL DEFAULT '',
             latency_ms INTEGER NOT NULL,
+            first_token_ms INTEGER,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             error TEXT NOT NULL DEFAULT '',
@@ -3343,6 +3569,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     ensure_column(conn, "upstream_model", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "first_token_ms", "INTEGER")?;
     ensure_column(conn, "input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
@@ -3673,8 +3900,13 @@ mod tests {
         let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
         let custom_tools = HashSet::from(["apply_patch".to_string()]);
 
-        let result =
-            chat_sse_stream_to_responses(stream, "claude-test".to_string(), custom_tools).unwrap();
+        let result = chat_sse_stream_to_responses(
+            stream,
+            "claude-test".to_string(),
+            custom_tools,
+            Instant::now(),
+        )
+        .unwrap();
         let body = to_bytes(result.response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -3696,9 +3928,13 @@ mod tests {
         let bytes = Bytes::from(format!("data: {chunk}\n\n"));
         let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
-        let result =
-            chat_sse_stream_to_responses(stream, "claude-test".to_string(), HashSet::new())
-                .unwrap();
+        let result = chat_sse_stream_to_responses(
+            stream,
+            "claude-test".to_string(),
+            HashSet::new(),
+            Instant::now(),
+        )
+        .unwrap();
         let body = to_bytes(result.response.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -3708,6 +3944,37 @@ mod tests {
         assert!(sse.contains("Concurrency limit exceeded"));
         assert!(!sse.contains("event: response.completed"));
         assert!(!sse.contains("[stream error:"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_to_responses_reports_error_outcome() {
+        let chunk = json!({
+            "error": {
+                "message": "Concurrency limit exceeded for account, please retry later",
+                "type": "rate_limit_error"
+            }
+        });
+        let bytes = Bytes::from(format!("data: {chunk}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let result = chat_sse_stream_to_responses(
+            stream,
+            "claude-test".to_string(),
+            HashSet::new(),
+            Instant::now(),
+        )
+        .unwrap();
+        let rx = result.usage_rx.unwrap();
+        let _ = to_bytes(result.response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let outcome = rx.await.unwrap();
+
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Concurrency limit exceeded"));
     }
 
     #[tokio::test]
@@ -3729,6 +3996,113 @@ mod tests {
 
         assert!(text.contains("\"role\":\"assistant\""));
         assert!(text.contains("\"content\":\"hi\""));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_probe_reports_unfinished_stream_as_error() {
+        let chunk = json!({"choices":[{"delta":{"content":"hi"}}]});
+        let bytes = Bytes::from(format!("data: {chunk}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+        while let Some(chunk) = body_stream.next().await {
+            chunk.unwrap();
+        }
+        let outcome = rx.await.unwrap();
+
+        assert_eq!(outcome.error.as_deref(), Some("上游流在完成事件前断开"));
+        assert!(outcome.first_token_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn stream_usage_probe_records_first_token_and_total_usage() {
+        let first = json!({"choices":[{"delta":{"content":"hi"}}]});
+        let second = json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}});
+        let bytes = Bytes::from(format!(
+            "data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n"
+        ));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+        while let Some(chunk) = body_stream.next().await {
+            chunk.unwrap();
+        }
+        let outcome = rx.await.unwrap();
+
+        assert!(outcome.error.is_none());
+        assert!(outcome.first_token_ms.is_some());
+        assert_eq!(outcome.usage.input, 2);
+        assert_eq!(outcome.usage.output, 3);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_usage_probe_counts_completed_event_usage() {
+        let first = json!({"type":"response.output_text.delta","delta":"hi"});
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {"input_tokens": 11, "output_tokens": 7}
+            }
+        });
+        let bytes = Bytes::from(format!("data: {first}\n\ndata: {completed}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now());
+        while let Some(chunk) = body_stream.next().await {
+            chunk.unwrap();
+        }
+        let outcome = rx.await.unwrap();
+
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.usage.input, 11);
+        assert_eq!(outcome.usage.output, 7);
+    }
+
+    #[test]
+    fn sqlite_usage_log_persists_first_token_ms() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-usage-log-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+
+        log_usage_sqlite(
+            path.clone(),
+            "2026-07-14 12:00:00",
+            "responses",
+            "ok",
+            "test-provider",
+            "gpt-test",
+            "gpt-upstream",
+            197_320,
+            Some(1_234),
+            "",
+            142_286,
+            793,
+            "upstream_or_unknown",
+        )
+        .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT first_token_ms, latency_ms, input_tokens, output_tokens FROM usage_logs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row, (Some(1_234), 197_320, 142_286, 793));
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]

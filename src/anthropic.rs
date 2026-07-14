@@ -6,12 +6,12 @@
 //
 // 硬编码：Anthropic max_tokens 默认 4096；anthropic-version 由 proxy 侧统一填 2023-06-01
 
-use crate::proxy::{next_sse_event, sse_data, TokenUsage};
+use crate::proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -501,22 +501,24 @@ fn extract_anthropic_usage(body: &Value) -> (i64, i64) {
 pub fn spawn_stream_translator<S>(
     stream: S,
     request_model: String,
+    started: Instant,
 ) -> (
-    oneshot::Receiver<TokenUsage>,
+    oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
 )
 where
     S: futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
-    let (u_tx, u_rx) = oneshot::channel::<TokenUsage>();
+    let (u_tx, u_rx) = oneshot::channel::<StreamOutcome>();
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
         let mut stream = Box::pin(stream);
+        let mut first_token_ms = None;
         // 首个 chunk 先发 role=assistant，OpenAI 客户端惯例
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
-            let _ = u_tx.send(state.usage);
+            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
             return;
         }
 
@@ -552,40 +554,53 @@ where
                             });
                             let _ = send_json_chunk(&tx, &error).await;
                             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                            let _ = u_tx.send(state.usage);
+                            let _ = u_tx.send(StreamOutcome::failed(
+                                state.usage,
+                                first_token_ms,
+                                message.to_string(),
+                            ));
                             return;
                         }
                         let outputs = state.handle_event(&payload);
                         for out in outputs {
+                            if stream_chunk_has_client_output(&out) {
+                                first_token_ms
+                                    .get_or_insert_with(|| started.elapsed().as_millis() as i64);
+                            }
                             if send_json_chunk(&tx, &out).await.is_err() {
-                                let _ = u_tx.send(state.usage);
+                                let _ =
+                                    u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
                                 return;
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = tx
-                        .send(Err(io::Error::other(format!("上游流错误: {err}"))))
-                        .await;
-                    let _ = u_tx.send(state.usage);
+                    let message = format!("上游流错误: {err}");
+                    let _ = tx.send(Err(io::Error::other(message.clone()))).await;
+                    let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
                     return;
                 }
             }
         }
         if !state.finished {
-            let _ = tx
-                .send(Err(io::Error::other(
-                    "Anthropic 上游流未收到 message_stop 就已结束",
-                )))
-                .await;
-            let _ = u_tx.send(state.usage);
+            let message = "Anthropic 上游流未收到 message_stop 就已结束";
+            let _ = tx.send(Err(io::Error::other(message))).await;
+            let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
             return;
         }
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-        let _ = u_tx.send(state.usage);
+        let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
     });
     (u_rx, ReceiverStream::new(rx))
+}
+
+fn stream_chunk_has_client_output(value: &Value) -> bool {
+    value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+        || value.pointer("/choices/0/delta/tool_calls").is_some()
 }
 
 async fn send_json_chunk(
@@ -954,7 +969,8 @@ mod tests {
         });
         let bytes = Bytes::from(format!("data: {event}\n\n"));
         let input = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
-        let (_usage_rx, mut stream) = spawn_stream_translator(input, "claude-test".to_string());
+        let (_usage_rx, mut stream) =
+            spawn_stream_translator(input, "claude-test".to_string(), Instant::now());
         let mut out = String::new();
 
         while let Some(chunk) = stream.next().await {

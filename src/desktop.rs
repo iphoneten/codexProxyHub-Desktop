@@ -1126,7 +1126,8 @@ fn logs_section(
                                 table_header(ui, "渠道");
                                 table_header(ui, "模型");
                                 table_header(ui, "Token");
-                                table_header(ui, "耗时(秒)");
+                                table_header(ui, "首字(秒)");
+                                table_header(ui, "总耗时(秒)");
                                 table_header(ui, "错误");
                                 ui.end_row();
 
@@ -1137,6 +1138,7 @@ fn logs_section(
                                     ui.label(&row.channel);
                                     model_cell(ui, row);
                                     ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
+                                    ui.label(&row.first_token);
                                     ui.label(&row.latency);
                                     ui.label(egui::RichText::new(&row.error).color(muteds()));
                                     ui.end_row();
@@ -1347,7 +1349,7 @@ fn read_sqlite_log_page(
             r#"
             SELECT
                 ts, status, api, channel, request_model, upstream_model,
-                latency_ms, input_tokens, output_tokens, error
+                latency_ms, first_token_ms, input_tokens, output_tokens, error
             FROM usage_logs
             ORDER BY id DESC
             LIMIT ?1
@@ -1360,6 +1362,7 @@ fn read_sqlite_log_page(
             [page_size as i64, page.saturating_mul(page_size) as i64],
             |row| {
                 let latency_ms: i64 = row.get(6)?;
+                let first_token_ms: Option<i64> = row.get(7)?;
                 Ok(LogRow {
                     ts: row.get(0)?,
                     status: row.get(1)?,
@@ -1367,10 +1370,13 @@ fn read_sqlite_log_page(
                     channel: row.get(3)?,
                     model: row.get(4)?,
                     upstream_model: row.get(5)?,
+                    first_token: first_token_ms
+                        .map(|value| format!("{:.2}", value as f64 / 1000.0))
+                        .unwrap_or_else(|| "-".to_string()),
                     latency: format!("{:.2}", latency_ms as f64 / 1000.0),
-                    input_tokens: row.get(7)?,
-                    output_tokens: row.get(8)?,
-                    error: row.get(9)?,
+                    input_tokens: row.get(8)?,
+                    output_tokens: row.get(9)?,
+                    error: row.get(10)?,
                 })
             },
         )
@@ -1390,6 +1396,7 @@ struct LogRow {
     channel: String,
     model: String,
     upstream_model: String,
+    first_token: String,
     latency: String,
     input_tokens: i64,
     output_tokens: i64,
@@ -1405,6 +1412,7 @@ fn parse_log_line(line: &str) -> LogRow {
             channel: "-".to_string(),
             model: "-".to_string(),
             upstream_model: "-".to_string(),
+            first_token: "-".to_string(),
             latency: "-".to_string(),
             input_tokens: 0,
             output_tokens: 0,
@@ -1418,6 +1426,11 @@ fn parse_log_line(line: &str) -> LogRow {
         channel: json_string(&value, "channel"),
         model: json_string(&value, "request_model"),
         upstream_model: json_string(&value, "upstream_model"),
+        first_token: value
+            .get("first_token_ms")
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| format!("{:.2}", value as f64 / 1000.0))
+            .unwrap_or_else(|| "-".to_string()),
         latency: value
             .get("latency_ms")
             .and_then(serde_json::Value::as_u64)

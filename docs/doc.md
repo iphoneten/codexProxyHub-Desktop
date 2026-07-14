@@ -109,6 +109,8 @@ routing:
 | `max_bytes` | number | `5242880` | JSONL 日志最大字节数，当前主要用于兼容旧配置。 |
 | `max_chunks` | number | `20` | JSONL 轮转分片数量，当前主要用于兼容旧配置。 |
 
+日志字段里，`first_token_ms` 是流式请求从代理开始请求该渠道到首个有效文本或工具调用输出的耗时；`latency_ms` 是完整流结束后的代理端到端耗时。长输出、工具调用等待、客户端读取和 SSE 连接持续时间都会让 `latency_ms` 大于上游平台显示的模型实际耗时。
+
 ## providers[]
 
 `providers` 是上游渠道数组。代理会先按模型和 API 能力过滤渠道，再按 `priority`、`weight` 和轮询顺序尝试。
