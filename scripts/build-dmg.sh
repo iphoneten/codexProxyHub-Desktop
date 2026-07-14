@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="recodexProxyHub"
-BIN_NAME="recodex-proxy-hub"
-BUNDLE_ID="com.recodex.proxyhub"
+APP_NAME="RouteHub"
+BIN_NAME="route-hub"
+BUNDLE_ID="com.routehub.app"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 TARGET="${1:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
 
-RAW_VERSION="${RECODEX_VERSION:-}"
+RAW_VERSION="${ROUTEHUB_VERSION:-}"
 if [[ -z "$RAW_VERSION" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
   RAW_VERSION="${GITHUB_REF_NAME:-}"
 fi
@@ -25,9 +25,9 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "expected tag format: v1.2.3" >&2
   exit 1
 fi
-export RECODEX_VERSION="$VERSION"
+export ROUTEHUB_VERSION="$VERSION"
 
-BUILD_TIME="${RECODEX_BUILD_TIME:-$(date -u +%Y%m%d-%H%M%S)}"
+BUILD_TIME="${ROUTEHUB_BUILD_TIME:-$(date -u +%Y%m%d-%H%M%S)}"
 if [[ ! "$BUILD_TIME" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
   echo "error: invalid build time: $BUILD_TIME" >&2
   echo "expected UTC format: YYYYMMDD-HHMMSS" >&2

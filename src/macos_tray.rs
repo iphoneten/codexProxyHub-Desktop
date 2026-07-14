@@ -29,7 +29,7 @@ impl MacosTray {
         let show_item = MenuItem::new("显示主窗口", true, None);
         let status_item = MenuItem::new("代理状态：已停止", false, None);
         let toggle_item = MenuItem::new("启动代理", true, None);
-        let quit_item = MenuItem::new("退出 recodexProxyHub", true, None);
+        let quit_item = MenuItem::new("退出 RouteHub", true, None);
         let separator = PredefinedMenuItem::separator();
         let menu = Menu::new();
         menu.append_items(&[
@@ -45,7 +45,7 @@ impl MacosTray {
         let icon = load_icon()?;
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("recodexProxyHub - 代理已停止")
+            .with_tooltip("RouteHub - 代理已停止")
             .with_icon(icon)
             .build()
             .map_err(|err| format!("创建状态栏图标失败: {err}"))?;
@@ -91,15 +91,11 @@ impl MacosTray {
         if running {
             self.status_item.set_text("代理状态：运行中");
             self.toggle_item.set_text("停止代理");
-            let _ = self
-                ._tray_icon
-                .set_tooltip(Some("recodexProxyHub - 代理运行中"));
+            let _ = self._tray_icon.set_tooltip(Some("RouteHub - 代理运行中"));
         } else {
             self.status_item.set_text("代理状态：已停止");
             self.toggle_item.set_text("启动代理");
-            let _ = self
-                ._tray_icon
-                .set_tooltip(Some("recodexProxyHub - 代理已停止"));
+            let _ = self._tray_icon.set_tooltip(Some("RouteHub - 代理已停止"));
         }
     }
 }

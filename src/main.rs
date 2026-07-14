@@ -12,7 +12,7 @@ mod proxy;
 mod responses_api;
 
 fn main() -> eframe::Result<()> {
-    let window_title = format!("recodexProxyHub v{}", app_version());
+    let window_title = format!("RouteHub v{}", app_version());
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 760.0])
@@ -34,7 +34,7 @@ fn main() -> eframe::Result<()> {
 }
 
 pub(crate) fn app_version() -> &'static str {
-    option_env!("RECODEX_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    option_env!("ROUTEHUB_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 // 通过 eframe 的 ViewportBuilder 设置窗口/Dock 图标。

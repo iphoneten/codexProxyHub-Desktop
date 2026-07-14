@@ -400,7 +400,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("recodexProxyHub")
+                        egui::RichText::new("RouteHub")
                             .size(24.0)
                             .strong()
                             .color(stat_color()),
@@ -1973,10 +1973,10 @@ fn push_unique(models: &mut Vec<String>, id: &str) {
 }
 
 fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
-    section(ui, "关于 recodexProxyHub", |ui| {
+    section(ui, "关于 RouteHub", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                egui::RichText::new("recodexProxyHub")
+                egui::RichText::new("RouteHub")
                     .size(24.0)
                     .strong()
                     .color(stat_color()),

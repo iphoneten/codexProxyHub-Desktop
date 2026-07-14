@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  RECODEX_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  ROUTEHUB_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
   prepare:
@@ -28,19 +28,19 @@ jobs:
     needs: prepare
     runs-on: macos-14
     env:
-      RECODEX_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+      ROUTEHUB_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: Apple-Silicon
             target: aarch64-apple-darwin
-            artifact: recodexProxyHub-macos-arm64
-            asset_pattern: recodexProxyHub-v*-macos-arm64-*.dmg
+            artifact: RouteHub-macos-arm64
+            asset_pattern: RouteHub-v*-macos-arm64-*.dmg
           - arch: Intel
             target: x86_64-apple-darwin
-            artifact: recodexProxyHub-macos-x86_64
-            asset_pattern: recodexProxyHub-v*-macos-x86_64-*.dmg
+            artifact: RouteHub-macos-x86_64
+            asset_pattern: RouteHub-v*-macos-x86_64-*.dmg
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust target
@@ -58,7 +58,7 @@ jobs:
     needs: prepare
     runs-on: windows-latest
     env:
-      RECODEX_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+      ROUTEHUB_BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust target
@@ -68,8 +68,8 @@ jobs:
         run: ./scripts/build-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: recodexProxyHub-windows-x86_64
-          path: dist/recodexProxyHub-v*-windows-x86_64-*.zip
+          name: RouteHub-windows-x86_64
+          path: dist/RouteHub-v*-windows-x86_64-*.zip
           if-no-files-found: error
 
   release:
@@ -86,14 +86,14 @@ jobs:
       - name: Download release packages
         uses: actions/download-artifact@v4
         with:
-          pattern: recodexProxyHub-*
+          pattern: RouteHub-*
           path: release-assets
           merge-multiple: true
       - name: Verify release packages
         run: |
-          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-macos-arm64-*.dmg' | wc -l)" -eq 1
-          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-macos-x86_64-*.dmg' | wc -l)" -eq 1
-          test "$(find release-assets -maxdepth 1 -name 'recodexProxyHub-v*-windows-x86_64-*.zip' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name 'RouteHub-v*-macos-arm64-*.dmg' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name 'RouteHub-v*-macos-x86_64-*.dmg' | wc -l)" -eq 1
+          test "$(find release-assets -maxdepth 1 -name 'RouteHub-v*-windows-x86_64-*.zip' | wc -l)" -eq 1
           ls -lh release-assets
       - name: Create or update release
         env:
@@ -105,9 +105,9 @@ jobs:
               --repo "$GITHUB_REPOSITORY"
             while IFS= read -r asset; do
               case "$asset" in
-                "recodexProxyHub-$GITHUB_REF_NAME-macos-arm64-"*.dmg|\
-                "recodexProxyHub-$GITHUB_REF_NAME-macos-x86_64-"*.dmg|\
-                "recodexProxyHub-$GITHUB_REF_NAME-windows-x86_64-"*.zip)
+                "RouteHub-$GITHUB_REF_NAME-macos-arm64-"*.dmg|\
+                "RouteHub-$GITHUB_REF_NAME-macos-x86_64-"*.dmg|\
+                "RouteHub-$GITHUB_REF_NAME-windows-x86_64-"*.zip)
                   if [[ ! -f "release-assets/$asset" ]]; then
                     gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
                       --yes \
@@ -125,6 +125,6 @@ jobs:
             gh release create "$GITHUB_REF_NAME" release-assets/* \
               --verify-tag \
               --generate-notes \
-              --title "recodexProxyHub $GITHUB_REF_NAME" \
+              --title "RouteHub $GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY"
           fi

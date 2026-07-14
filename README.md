@@ -1,4 +1,4 @@
-# recodexProxyHub
+# RouteHub
 
 Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的配置格式重构。
 
@@ -60,7 +60,7 @@ rustup target add aarch64-apple-darwin
 产物为：
 
 ```text
-dist/recodexProxyHub-v1.2.3-macos-arm64-20260713-123456.dmg
+dist/RouteHub-v1.2.3-macos-arm64-20260713-123456.dmg
 ```
 
 ### macOS Intel
@@ -75,7 +75,7 @@ rustup target add x86_64-apple-darwin
 产物为：
 
 ```text
-dist/recodexProxyHub-v1.2.3-macos-x86_64-20260713-123456.dmg
+dist/RouteHub-v1.2.3-macos-x86_64-20260713-123456.dmg
 ```
 
 ### Windows x64
@@ -90,7 +90,7 @@ rustup target add x86_64-pc-windows-msvc
 产物为：
 
 ```text
-dist/recodexProxyHub-v1.2.3-windows-x86_64-20260713-123456.zip
+dist/RouteHub-v1.2.3-windows-x86_64-20260713-123456.zip
 ```
 
 文件名中的末尾时间为 UTC 构建时间，格式为 `YYYYMMDD-HHMMSS`。也可以在 GitHub 仓库的 Actions 页面手动运行 `Build release packages`，一次生成上述三种包；同一次工作流的三个产物共享同一个时间戳。手动从普通分支运行时，构建结果位于对应工作流的 Artifacts。
@@ -104,12 +104,12 @@ git push origin v1.2.3
 
 推送 tag 后，GitHub Actions 会构建三个平台，全部成功后自动创建 `v1.2.3` Release、生成发布说明并上传两个 DMG 和一个 Windows ZIP。重新运行同一 tag 的工作流会上传带新时间戳的产物，并清理该 tag 中对应平台的旧附件。
 
-打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `RECODEX_VERSION=1.2.3` 显式覆盖。构建时间默认使用当前 UTC 时间，也可以通过 `RECODEX_BUILD_TIME=20260713-123456` 固定。
+打包脚本会自动将 tag 解析为软件版本 `1.2.3`，并写入应用标题、macOS Bundle 版本和 Windows 包内的 `VERSION.txt`。非 tag 构建会回退到 `Cargo.toml` 的 package version，也可以通过 `ROUTEHUB_VERSION=1.2.3` 显式覆盖。构建时间默认使用当前 UTC 时间，也可以通过 `ROUTEHUB_BUILD_TIME=20260713-123456` 固定。
 
-macOS 脚本会生成 `recodexProxyHub.app` 和带 Applications 快捷方式的 DMG。打包时如果当前目录存在 `config.yaml`，会内置到 App 的 `Resources` 中；首次从 App 启动时会复制到：
+macOS 脚本会生成 `RouteHub.app` 和带 Applications 快捷方式的 DMG。打包时如果当前目录存在 `config.yaml`，会内置到 App 的 `Resources` 中；首次从 App 启动时会复制到：
 
 ```text
-~/Library/Application Support/recodexProxyHub/config.yaml
+~/Library/Application Support/RouteHub/config.yaml
 ```
 
 后续桌面端默认读写这个用户配置文件，避免直接修改 `.app` 或 DMG 内的只读资源。
@@ -118,14 +118,14 @@ macOS 脚本会生成 `recodexProxyHub.app` 和带 Applications 快捷方式的 
 
 因为当前版本没有 Apple Developer ID 签名和公证，从浏览器下载 DMG 后 macOS 会给 `.app` 打上 `com.apple.quarantine` 隔离标记，双击可能出现：
 
-> "recodexProxyHub" 已损坏，无法打开。你应该将它移到废纸篓。
+> "RouteHub" 已损坏，无法打开。你应该将它移到废纸篓。
 
 这不是安装包损坏，而是 Gatekeeper 拒绝运行未签名程序。任选一种方式解除：
 
 方式一（推荐，一次性）：把 `.app` 拖入"应用程序"后，在终端执行：
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/recodexProxyHub.app
+xattr -dr com.apple.quarantine /Applications/RouteHub.app
 ```
 
 方式二：在"访达"里对 `.app` 右键选择"打开"，在弹窗中再次点击"打开"。
@@ -135,7 +135,7 @@ xattr -dr com.apple.quarantine /Applications/recodexProxyHub.app
 Windows 首次运行时会将压缩包中的 `config.yaml` 复制到：
 
 ```text
-%APPDATA%\recodexProxyHub\config.yaml
+%APPDATA%\RouteHub\config.yaml
 ```
 
 仓库中的 `config.yaml` 不会提交，以防泄露渠道密钥。自动构建找不到本地配置时，会将无密钥的 `config.example.yaml` 作为初始配置打包。
@@ -160,18 +160,18 @@ usage_log:
 相对日志路径会按当前加载的配置文件所在目录解析；DMG 首次启动后默认写入：
 
 ```text
-~/Library/Application Support/recodexProxyHub/logs/
+~/Library/Application Support/RouteHub/logs/
 ```
 
 Codex 示例：
 
 ```toml
-model_provider = "recodexProxyHub"
+model_provider = "RouteHub"
 model = "gpt-5.5"
 review_model = "gpt-5.5"
 
-[model_providers.recodexProxyHub]
-name = "recodexProxyHub"
+[model_providers.RouteHub]
+name = "RouteHub"
 base_url = "http://127.0.0.1:8000/v1"
 wire_api = "responses"
 requires_openai_auth = true

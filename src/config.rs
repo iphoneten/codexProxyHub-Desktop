@@ -242,7 +242,7 @@ fn app_support_config_path() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join("recodexProxyHub")
+                .join("RouteHub")
                 .join("config.yaml"),
         )
     }
@@ -250,11 +250,7 @@ fn app_support_config_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let app_data = env::var_os("APPDATA")?;
-        Some(
-            PathBuf::from(app_data)
-                .join("recodexProxyHub")
-                .join("config.yaml"),
-        )
+        Some(PathBuf::from(app_data).join("RouteHub").join("config.yaml"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -262,7 +258,7 @@ fn app_support_config_path() -> Option<PathBuf> {
         let config_home = env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-        Some(config_home.join("recodexProxyHub").join("config.yaml"))
+        Some(config_home.join("RouteHub").join("config.yaml"))
     }
 }
 
@@ -388,15 +384,15 @@ usage_log:
 "#,
         )
         .unwrap();
-        cfg.config_dir = Some(PathBuf::from("/tmp/recodexProxyHub"));
+        cfg.config_dir = Some(PathBuf::from("/tmp/RouteHub"));
 
         assert_eq!(
             cfg.usage_log_sqlite_path(),
-            PathBuf::from("/tmp/recodexProxyHub/logs/proxy_usage.sqlite3")
+            PathBuf::from("/tmp/RouteHub/logs/proxy_usage.sqlite3")
         );
         assert_eq!(
             cfg.usage_log_jsonl_path(),
-            PathBuf::from("/tmp/recodexProxyHub/logs/proxy_usage.jsonl")
+            PathBuf::from("/tmp/RouteHub/logs/proxy_usage.jsonl")
         );
     }
 
@@ -411,7 +407,7 @@ usage_log:
 "#,
         )
         .unwrap();
-        cfg.config_dir = Some(PathBuf::from("/tmp/recodexProxyHub"));
+        cfg.config_dir = Some(PathBuf::from("/tmp/RouteHub"));
 
         assert_eq!(
             cfg.usage_log_sqlite_path(),

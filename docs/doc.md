@@ -1,6 +1,6 @@
 # config.yaml 配置说明
 
-本文档说明 `recodexProxyHub` 当前支持的 `config.yaml` 字段。配置使用 YAML 格式，未知字段会被保留，用于兼容旧版配置或后续扩展。
+本文档说明 `RouteHub` 当前支持的 `config.yaml` 字段。配置使用 YAML 格式，未知字段会被保留，用于兼容旧版配置或后续扩展。
 
 ## 最小配置示例
 

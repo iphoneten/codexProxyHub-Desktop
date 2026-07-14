@@ -222,7 +222,7 @@ pub async fn run_server(config: ConfigHandle, shutdown: oneshot::Receiver<()>) -
 async fn index(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = state.snapshot();
     Json(json!({
-        "name": "recodexProxyHub",
+        "name": "RouteHub",
         "ok": true,
         "base_url": format!("http://{}:{}/v1", display_host(&cfg.server.host), cfg.server.port),
         "endpoints": [
@@ -253,7 +253,7 @@ async fn list_models(
     authorize(&cfg, &headers)?;
     let data: Vec<Value> = collect_models(&cfg)
         .into_iter()
-        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "recodex-proxy-hub"}))
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "route-hub"}))
         .collect();
     Ok(Json(json!({"object": "list", "data": data})))
 }
@@ -267,7 +267,7 @@ async fn get_model(
     authorize(&cfg, &headers)?;
     if collect_models(&cfg).contains(&model) {
         Ok(Json(
-            json!({"id": model, "object": "model", "created": 0, "owned_by": "recodex-proxy-hub"}),
+            json!({"id": model, "object": "model", "created": 0, "owned_by": "route-hub"}),
         ))
     } else {
         Err(ProxyError::new(StatusCode::NOT_FOUND, "模型不存在"))

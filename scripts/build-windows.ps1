@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$AppName = "recodexProxyHub"
-$BinName = "recodex-proxy-hub"
+$AppName = "RouteHub"
+$BinName = "route-hub"
 $Target = "x86_64-pc-windows-msvc"
 $RootDir = Split-Path -Parent $PSScriptRoot
 $DistDir = Join-Path $RootDir "dist"
@@ -11,7 +11,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo not found. Install Rust first: https://rustup.rs/"
 }
 
-$RawVersion = $env:RECODEX_VERSION
+$RawVersion = $env:ROUTEHUB_VERSION
 if ([string]::IsNullOrWhiteSpace($RawVersion) -and $env:GITHUB_REF_TYPE -eq "tag") {
     $RawVersion = $env:GITHUB_REF_NAME
 }
@@ -34,9 +34,9 @@ $Version = $RawVersion -replace '^v', ''
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "Invalid release version '$RawVersion'. Expected tag format: v1.2.3"
 }
-$env:RECODEX_VERSION = $Version
+$env:ROUTEHUB_VERSION = $Version
 
-$BuildTime = $env:RECODEX_BUILD_TIME
+$BuildTime = $env:ROUTEHUB_BUILD_TIME
 if ([string]::IsNullOrWhiteSpace($BuildTime)) {
     $BuildTime = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
 }
