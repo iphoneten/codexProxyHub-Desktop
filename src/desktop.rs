@@ -330,6 +330,13 @@ impl eframe::App for HubApp {
             self.message = "窗口已隐藏，代理继续在状态栏运行".to_string();
         }
 
+        #[cfg(target_os = "windows")]
+        if ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.message = "窗口已最小化，代理继续运行".to_string();
+        }
+
         // 把 UI 修改推送到运行中的代理，确保 provider.enabled 等改动即时生效
         self.sync_config_to_runtime();
 
@@ -1498,6 +1505,9 @@ fn provider_section(
                 provider_list_panel(ui, config, &mut idx);
             },
         );
+        resize_drafts(mapping_drafts, config.providers.len());
+        resize_drafts(header_drafts, config.providers.len());
+        idx = idx.min(config.providers.len().saturating_sub(1));
         ui.add_space(gap);
         ui.allocate_ui_with_layout(
             egui::vec2(detail_width, ui.available_height()),
@@ -1974,7 +1984,7 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         .build()
         .map_err(|err| err.to_string())?;
 
-    let mut request = client.get(url);
+    let mut request = client.get(&url);
     if provider.provider_type == "anthropic" {
         request = request
             .header("x-api-key", &provider.api_key)
@@ -1993,7 +2003,9 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         request = request.header(name, value);
     }
 
-    let response = request.send().map_err(|err| err.to_string())?;
+    let response = request
+        .send()
+        .map_err(|err| format_model_sync_request_error(&url, &err))?;
     let status = response.status();
     let payload: serde_json::Value = response.json().map_err(|err| err.to_string())?;
     if !status.is_success() {
@@ -2029,6 +2041,25 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         models.sort();
         Ok(models)
     }
+}
+
+fn format_model_sync_request_error(url: &str, err: &reqwest::Error) -> String {
+    let mut parts = vec![format!("请求失败: {url}")];
+    if err.is_timeout() {
+        parts.push("连接或响应超时".to_string());
+    } else if err.is_connect() {
+        parts.push("连接上游失败".to_string());
+    } else if err.is_request() {
+        parts.push("请求构造失败".to_string());
+    }
+    parts.push(err.to_string());
+    if let Some(source) = std::error::Error::source(err) {
+        parts.push(format!("source: {source}"));
+    }
+    if url.contains("api.openai.com") {
+        parts.push("如果当前网络无法直连 OpenAI，请为桌面应用进程配置 HTTP_PROXY/HTTPS_PROXY，或使用可直连的中转 base_url。".to_string());
+    }
+    parts.join("；")
 }
 
 fn push_unique(models: &mut Vec<String>, id: &str) {
