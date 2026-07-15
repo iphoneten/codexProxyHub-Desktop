@@ -950,6 +950,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                     name: final_name,
                     enabled: true,
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    max_concurrency: Some(5),
                 });
                 new_key_name.clear();
             }
@@ -961,6 +962,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
             .show(ui, |ui| {
                 ui.label("启用");
                 ui.label("名称");
+                ui.label("并发");
                 ui.label("API 秘钥");
                 ui.label("创建时间");
                 ui.label("操作");
@@ -969,6 +971,12 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                 for (idx, key) in config.auth.api_keys.iter_mut().enumerate() {
                     switch(ui, &mut key.enabled);
                     ui.add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut key.name));
+                    let max_concurrency = key.max_concurrency.get_or_insert(5);
+                    ui.add(
+                        egui::DragValue::new(max_concurrency)
+                            .range(1..=500)
+                            .speed(1),
+                    );
                     ui.monospace(mask_api_key(&key.key));
                     ui.label(if key.created_at.trim().is_empty() {
                         "-"
@@ -1173,6 +1181,7 @@ fn logs_section(
                             .show(ui, |ui| {
                                 table_header(ui, "时间");
                                 table_header(ui, "状态");
+                                table_header(ui, "API Key");
                                 table_header(ui, "接口");
                                 table_header(ui, "渠道");
                                 table_header(ui, "模型");
@@ -1184,6 +1193,7 @@ fn logs_section(
                                 for row in &log_view.rows {
                                     ui.monospace(&row.ts);
                                     ui.label(status_text(&row.status));
+                                    ui.label(row.api_key_label());
                                     ui.label(&row.api);
                                     ui.label(&row.channel);
                                     model_cell(ui, row);
@@ -1328,7 +1338,7 @@ fn read_sqlite_log_page(
         .prepare(
             r#"
             SELECT
-                ts, status, api, channel, request_model, upstream_model,
+                ts, status, api_key_name, api, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error
             FROM usage_logs
             ORDER BY id DESC
@@ -1341,22 +1351,23 @@ fn read_sqlite_log_page(
         .query_map(
             [page_size as i64, page.saturating_mul(page_size) as i64],
             |row| {
-                let latency_ms: i64 = row.get(6)?;
-                let first_token_ms: Option<i64> = row.get(7)?;
+                let latency_ms: i64 = row.get(7)?;
+                let first_token_ms: Option<i64> = row.get(8)?;
                 Ok(LogRow {
                     ts: row.get(0)?,
                     status: row.get(1)?,
-                    api: row.get(2)?,
-                    channel: row.get(3)?,
-                    model: row.get(4)?,
-                    upstream_model: row.get(5)?,
+                    api_key_name: row.get(2)?,
+                    api: row.get(3)?,
+                    channel: row.get(4)?,
+                    model: row.get(5)?,
+                    upstream_model: row.get(6)?,
                     first_token: first_token_ms
                         .map(|value| format!("{:.2}", value as f64 / 1000.0))
                         .unwrap_or_else(|| "-".to_string()),
                     latency: format!("{:.2}", latency_ms as f64 / 1000.0),
-                    input_tokens: row.get(8)?,
-                    output_tokens: row.get(9)?,
-                    error: row.get(10)?,
+                    input_tokens: row.get(9)?,
+                    output_tokens: row.get(10)?,
+                    error: row.get(11)?,
                 })
             },
         )
@@ -1372,6 +1383,7 @@ fn read_sqlite_log_page(
 struct LogRow {
     ts: String,
     status: String,
+    api_key_name: String,
     api: String,
     channel: String,
     model: String,
@@ -1384,6 +1396,14 @@ struct LogRow {
 }
 
 impl LogRow {
+    fn api_key_label(&self) -> &str {
+        if self.api_key_name.trim().is_empty() {
+            "-"
+        } else {
+            self.api_key_name.as_str()
+        }
+    }
+
     fn display_latency(&self) -> String {
         if self.status != "running" {
             return self.latency.clone();

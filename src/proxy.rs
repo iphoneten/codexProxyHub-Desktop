@@ -26,7 +26,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
@@ -45,11 +45,24 @@ pub struct KeepaliveStatus {
 pub type KeepaliveStatusHandle = Arc<RwLock<HashMap<String, KeepaliveStatus>>>;
 
 #[derive(Clone)]
+struct ApiKeyLimiter {
+    limit: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+struct AuthAccess {
+    permit: OwnedSemaphorePermit,
+    key_name: String,
+}
+
+#[derive(Clone)]
 struct AppState {
     config: ConfigHandle,
     clients: Arc<Mutex<HashMap<u64, Client>>>,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     keepalive_headers: Arc<Mutex<HashMap<String, HeaderMap>>>,
+    api_key_limiters: Arc<Mutex<HashMap<String, ApiKeyLimiter>>>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
@@ -119,6 +132,36 @@ impl AppState {
                 .display()
                 .to_string(),
             max_events: provider.debug_sse_max_events.max(10),
+        })
+    }
+
+    fn acquire_api_key_permit(
+        &self,
+        token: &str,
+        limit: usize,
+    ) -> Result<OwnedSemaphorePermit, ProxyError> {
+        let limit = limit.max(1);
+        let limiter = {
+            let mut limiters = self.api_key_limiters.lock();
+            let entry = limiters
+                .entry(token.to_string())
+                .or_insert_with(|| ApiKeyLimiter {
+                    limit,
+                    semaphore: Arc::new(Semaphore::new(limit)),
+                });
+            if entry.limit != limit {
+                *entry = ApiKeyLimiter {
+                    limit,
+                    semaphore: Arc::new(Semaphore::new(limit)),
+                };
+            }
+            entry.clone()
+        };
+        limiter.semaphore.try_acquire_owned().map_err(|_| {
+            ProxyError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("API Key 并发数已达上限({limit})"),
+            )
         })
     }
 }
@@ -287,6 +330,7 @@ pub async fn run_server(
         clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
         keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
+        api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
     };
     let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
@@ -548,7 +592,7 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
-    authorize(&cfg, &headers)?;
+    let _auth = authorize_and_acquire(&state, &cfg, &headers)?;
     let data: Vec<Value> = collect_models(&cfg)
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "route-hub"}))
@@ -562,7 +606,7 @@ async fn get_model(
     Path(model): Path<String>,
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
-    authorize(&cfg, &headers)?;
+    let _auth = authorize_and_acquire(&state, &cfg, &headers)?;
     if collect_models(&cfg).contains(&model) {
         Ok(Json(
             json!({"id": model, "object": "model", "created": 0, "owned_by": "route-hub"}),
@@ -577,8 +621,18 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
-    authorize(&state.snapshot(), &headers)?;
-    forward_openai(state, headers, body, "/chat/completions", "chat").await
+    let cfg = state.snapshot();
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    forward_openai(
+        state,
+        headers,
+        body,
+        "/chat/completions",
+        "chat",
+        Some(auth.permit),
+        auth.key_name,
+    )
+    .await
 }
 
 async fn completions(
@@ -586,8 +640,18 @@ async fn completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
-    authorize(&state.snapshot(), &headers)?;
-    forward_openai(state, headers, body, "/completions", "completion").await
+    let cfg = state.snapshot();
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    forward_openai(
+        state,
+        headers,
+        body,
+        "/completions",
+        "completion",
+        Some(auth.permit),
+        auth.key_name,
+    )
+    .await
 }
 
 async fn embeddings(
@@ -595,8 +659,18 @@ async fn embeddings(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
-    authorize(&state.snapshot(), &headers)?;
-    forward_openai(state, headers, body, "/embeddings", "embedding").await
+    let cfg = state.snapshot();
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    forward_openai(
+        state,
+        headers,
+        body,
+        "/embeddings",
+        "embedding",
+        Some(auth.permit),
+        auth.key_name,
+    )
+    .await
 }
 
 async fn responses(
@@ -605,7 +679,9 @@ async fn responses(
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
-    authorize(&cfg, &headers)?;
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_name = auth.key_name;
+    let mut permit = Some(auth.permit);
     let model = body_model(&body)?;
     let providers = provider_attempts(&cfg, &state, &model, "responses");
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -648,6 +724,8 @@ async fn responses(
                         result,
                         started,
                         stream,
+                        permit.take(),
+                        &api_key_name,
                     ));
                 }
                 Err(err) => {
@@ -677,6 +755,8 @@ async fn responses(
                     result,
                     started,
                     stream,
+                    permit.take(),
+                    &api_key_name,
                 ));
             }
             Err(err)
@@ -699,6 +779,8 @@ async fn responses(
                             result,
                             started,
                             stream,
+                            permit.take(),
+                            &api_key_name,
                         ));
                     }
                     Err(chat_err) => {
@@ -723,6 +805,7 @@ async fn responses(
                         failure.started,
                         None,
                         &failure.message,
+                        &api_key_name,
                     );
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
@@ -740,6 +823,7 @@ async fn responses(
             failure.started,
             None,
             &failure.message,
+            &api_key_name,
         );
         return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
     }
@@ -762,6 +846,8 @@ async fn forward_openai(
     body: Value,
     path: &'static str,
     api: &'static str,
+    mut permit: Option<OwnedSemaphorePermit>,
+    api_key_name: String,
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let model = body_model(&body)?;
@@ -802,6 +888,8 @@ async fn forward_openai(
                     result,
                     started,
                     stream,
+                    permit.take(),
+                    &api_key_name,
                 ));
             }
             Err(err) => {
@@ -823,6 +911,8 @@ async fn forward_openai(
                                 result,
                                 started,
                                 stream,
+                                permit.take(),
+                                &api_key_name,
                             ));
                         }
                         Err(fb_err) => {
@@ -848,6 +938,7 @@ async fn forward_openai(
                         failure.started,
                         None,
                         &failure.message,
+                        &api_key_name,
                     );
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
@@ -865,6 +956,7 @@ async fn forward_openai(
             failure.started,
             None,
             &failure.message,
+            &api_key_name,
         );
         return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
     }
@@ -2565,9 +2657,16 @@ async fn send_json_to_provider(
     Err(ProxyError::new(StatusCode::BAD_GATEWAY, "上游请求失败"))
 }
 
-fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ProxyError> {
+fn authorize_and_acquire(
+    state: &AppState,
+    config: &AppConfig,
+    headers: &HeaderMap,
+) -> Result<AuthAccess, ProxyError> {
     if !config.auth.enabled {
-        return Ok(());
+        return Ok(AuthAccess {
+            permit: state.acquire_api_key_permit("__auth_disabled__", 1_000_000)?,
+            key_name: String::new(),
+        });
     }
     let token = headers
         .get(header::AUTHORIZATION)
@@ -2576,13 +2675,20 @@ fn authorize(config: &AppConfig, headers: &HeaderMap) -> Result<(), ProxyError> 
         .map(str::trim)
         .unwrap_or_default();
 
-    if config
+    if let Some(key) = config
         .auth
         .api_keys
         .iter()
-        .any(|k| k.enabled && k.key == token)
+        .find(|k| k.enabled && k.key == token)
     {
-        Ok(())
+        let limit = key
+            .max_concurrency
+            .or(config.auth.max_concurrency_per_key)
+            .unwrap_or(5);
+        Ok(AuthAccess {
+            permit: state.acquire_api_key_permit(token, limit)?,
+            key_name: key.name.clone(),
+        })
     } else {
         Err(ProxyError::new(
             StatusCode::UNAUTHORIZED,
@@ -3509,11 +3615,21 @@ fn commit_result(
     mut result: ProviderResult,
     started: Instant,
     stream: bool,
+    permit: Option<OwnedSemaphorePermit>,
+    api_key_name: &str,
 ) -> Response {
     if let Some(rx) = result.usage_rx.take() {
-        let log_id =
-            log_stream_started(&cfg, api, provider, model, &result.upstream_model, started);
+        let log_id = log_stream_started(
+            &cfg,
+            api,
+            provider,
+            model,
+            &result.upstream_model,
+            started,
+            api_key_name,
+        );
         let api = api.to_string();
+        let api_key_name = api_key_name.to_string();
         let provider = provider.to_string();
         let model = model.to_string();
         let upstream_model = result.upstream_model.clone();
@@ -3530,6 +3646,7 @@ fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
                             upstream_model: &upstream_model,
@@ -3553,6 +3670,7 @@ fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
                             upstream_model: &upstream_model,
@@ -3572,6 +3690,7 @@ fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
                             upstream_model: &upstream_model,
@@ -3597,9 +3716,25 @@ fn commit_result(
             started,
             None,
             stream,
+            api_key_name,
         );
     }
+    if stream {
+        if let Some(permit) = permit {
+            return hold_permit_until_body_done(result.response, permit);
+        }
+    }
     result.response
+}
+
+fn hold_permit_until_body_done(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    let (parts, body) = response.into_parts();
+    let guard = Some(permit);
+    let stream = body.into_data_stream().map(move |item| {
+        let _guard = &guard;
+        item
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 fn upstream_url(provider: &ProviderConfig, path: &str) -> String {
@@ -3976,6 +4111,7 @@ fn display_host(host: &str) -> &str {
 
 struct UsageLogEvent<'a> {
     api: &'a str,
+    api_key_name: &'a str,
     provider: &'a str,
     model: &'a str,
     upstream_model: &'a str,
@@ -3997,12 +4133,14 @@ fn log_success(
     started: Instant,
     first_token_ms: Option<i64>,
     stream: bool,
+    api_key_name: &str,
 ) {
     log_usage(
         config,
         started,
         UsageLogEvent {
             api,
+            api_key_name,
             provider,
             model,
             upstream_model,
@@ -4023,12 +4161,14 @@ fn log_error(
     started: Instant,
     first_token_ms: Option<i64>,
     error: &str,
+    api_key_name: &str,
 ) {
     log_usage(
         config,
         started,
         UsageLogEvent {
             api,
+            api_key_name,
             provider,
             model,
             upstream_model: "",
@@ -4048,12 +4188,14 @@ fn log_stream_started(
     model: &str,
     upstream_model: &str,
     started: Instant,
+    api_key_name: &str,
 ) -> Option<i64> {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     log_usage_sqlite(
         config.usage_log_sqlite_path(),
         &ts,
         api,
+        api_key_name,
         "running",
         provider,
         model,
@@ -4130,6 +4272,7 @@ fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
         config.usage_log_sqlite_path(),
         &ts,
         event.api,
+        event.api_key_name,
         event.status,
         event.provider,
         event.model,
@@ -4148,6 +4291,7 @@ fn log_usage_sqlite(
     path: PathBuf,
     ts: &str,
     api: &str,
+    api_key_name: &str,
     status: &str,
     provider: &str,
     model: &str,
@@ -4166,10 +4310,11 @@ fn log_usage_sqlite(
         INSERT INTO usage_logs
             (
                 ts, api, status, channel, request_model, upstream_model,
-                latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source
+                latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source,
+                api_key_name
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         "#,
         params![
             ts,
@@ -4183,7 +4328,8 @@ fn log_usage_sqlite(
             input_tokens,
             output_tokens,
             error,
-            token_source
+            token_source,
+            api_key_name
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -4269,7 +4415,8 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             error TEXT NOT NULL DEFAULT '',
-            token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown'
+            token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown',
+            api_key_name TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts ON usage_logs(ts);
         CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(status);
@@ -4280,6 +4427,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "first_token_ms", "INTEGER")?;
     ensure_column(conn, "input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 
@@ -4345,6 +4493,7 @@ mod tests {
             clients: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Mutex::new(HashMap::new())),
             keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
+            api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -4366,6 +4515,63 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_eq!(names.iter().filter(|name| **name == "primary").count(), 1);
         assert_eq!(names.iter().filter(|name| **name == "backup").count(), 1);
+    }
+
+    #[test]
+    fn api_key_concurrency_limit_rejects_sixth_request_by_default() {
+        let state = test_state();
+        let permits = (0..5)
+            .map(|_| state.acquire_api_key_permit("sk-local", 5).unwrap())
+            .collect::<Vec<_>>();
+
+        let err = state.acquire_api_key_permit("sk-local", 5).unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(err.message.contains("并发数已达上限"));
+
+        drop(permits);
+        assert!(state.acquire_api_key_permit("sk-local", 5).is_ok());
+    }
+
+    #[test]
+    fn api_key_concurrency_is_configured_per_key() {
+        let state = test_state();
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+auth:
+  enabled: true
+  api_keys:
+    - key: sk-a
+      enabled: true
+      max_concurrency: 2
+    - key: sk-b
+      enabled: true
+      max_concurrency: 1
+providers: []
+"#,
+        )
+        .unwrap();
+        let mut headers_a = HeaderMap::new();
+        insert_header(&mut headers_a, "authorization", "Bearer sk-a");
+        let mut headers_b = HeaderMap::new();
+        insert_header(&mut headers_b, "authorization", "Bearer sk-b");
+
+        let a1 = authorize_and_acquire(&state, &cfg, &headers_a).unwrap();
+        let a2 = authorize_and_acquire(&state, &cfg, &headers_a).unwrap();
+        let err = authorize_and_acquire(&state, &cfg, &headers_a).unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let b1 = authorize_and_acquire(&state, &cfg, &headers_b).unwrap();
+        assert_eq!(
+            authorize_and_acquire(&state, &cfg, &headers_b)
+                .unwrap_err()
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        drop(a1);
+        assert!(authorize_and_acquire(&state, &cfg, &headers_a).is_ok());
+        drop(a2);
+        drop(b1);
     }
 
     #[test]
@@ -5088,6 +5294,7 @@ mod tests {
             path.clone(),
             "2026-07-14 12:00:00",
             "responses",
+            "local-key",
             "ok",
             "test-provider",
             "gpt-test",
@@ -5104,7 +5311,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         let row = conn
             .query_row(
-                "SELECT first_token_ms, latency_ms, input_tokens, output_tokens FROM usage_logs",
+                "SELECT first_token_ms, latency_ms, input_tokens, output_tokens, api_key_name FROM usage_logs",
                 [],
                 |row| {
                     Ok((
@@ -5112,12 +5319,16 @@ mod tests {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .unwrap();
 
-        assert_eq!(row, (Some(1_234), 197_320, 142_286, 793));
+        assert_eq!(
+            row,
+            (Some(1_234), 197_320, 142_286, 793, "local-key".to_string())
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -5131,6 +5342,7 @@ mod tests {
             path.clone(),
             "2026-07-15 12:00:00",
             "responses",
+            "local-key",
             "running",
             "test-provider",
             "gpt-test",
@@ -5220,6 +5432,7 @@ mod tests {
             path.clone(),
             "2026-07-15 12:00:00",
             "responses",
+            "local-key",
             "ok",
             "test-provider",
             "gpt-test",
@@ -5249,6 +5462,7 @@ mod tests {
             path.clone(),
             "2026-07-15 12:00:00",
             "responses",
+            "local-key",
             "running",
             "test-provider",
             "gpt-test",

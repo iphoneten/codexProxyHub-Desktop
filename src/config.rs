@@ -42,14 +42,27 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub admin_key: Option<String>,
     #[serde(default)]
+    pub max_concurrency_per_key: Option<usize>,
+    #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admin_key: None,
+            max_concurrency_per_key: None,
+            api_keys: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +74,8 @@ pub struct ApiKeyConfig {
     pub enabled: bool,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -343,7 +358,41 @@ mod tests {
 
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 8000);
+        assert_eq!(cfg.auth.max_concurrency_per_key, None);
         assert!(cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn api_key_default_concurrency_is_unset_and_resolves_in_proxy() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+auth:
+  enabled: true
+  api_keys:
+    - key: sk-local
+providers: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.auth.api_keys[0].max_concurrency, None);
+    }
+
+    #[test]
+    fn api_key_can_set_own_concurrency() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+auth:
+  enabled: true
+  api_keys:
+    - key: sk-local
+      max_concurrency: 9
+providers: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.auth.api_keys[0].max_concurrency, Some(9));
     }
 
     #[test]

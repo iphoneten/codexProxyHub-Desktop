@@ -69,6 +69,7 @@ providers:
 | `name` | string | `default` | Key 名称，仅用于展示和区分。 |
 | `enabled` | bool | `true` | 是否启用该 Key。 |
 | `created_at` | string | `""` | 创建时间，仅用于展示。 |
+| `max_concurrency` | number | `5` | 该 API Key 允许同时处理的最大请求数，超过会返回 429。 |
 
 客户端请求示例：
 
