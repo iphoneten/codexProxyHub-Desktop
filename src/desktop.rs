@@ -4,7 +4,6 @@ use crate::{
 };
 use eframe::egui;
 use parking_lot::{Mutex, RwLock};
-use rusqlite::Connection;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
@@ -1249,7 +1248,8 @@ fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
     if !path.exists() {
         return Ok(LogTotals::default());
     }
-    let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    let conn = proxy::open_usage_log_connection(path)
+        .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     let (input_tokens, output_tokens) = conn
@@ -1290,7 +1290,8 @@ fn clear_sqlite_logs(path_buf: PathBuf) -> Result<(), String> {
     if !path_buf.exists() {
         return Ok(());
     }
-    let conn = Connection::open(&path_buf).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    let conn = proxy::open_usage_log_connection(path_buf)
+        .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     conn.execute("DELETE FROM usage_logs", [])
@@ -1314,7 +1315,8 @@ fn read_sqlite_log_page(
     if !path.exists() {
         return Ok((Vec::new(), 0));
     }
-    let conn = Connection::open(path).map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
+    let conn = proxy::open_usage_log_connection(path)
+        .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     let total = conn

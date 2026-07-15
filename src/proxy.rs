@@ -280,6 +280,8 @@ pub async fn run_server(
         initial.server.host.as_str()
     };
     let addr: SocketAddr = format!("{}:{}", bind_host, initial.server.port).parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    recover_interrupted_usage_logs(initial.usage_log_sqlite_path());
     let state = AppState {
         config,
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -314,7 +316,6 @@ pub async fn run_server(
         )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = shutdown.await;
@@ -3522,58 +3523,67 @@ fn commit_result(
                     usage: _,
                     first_token_ms,
                     error: Some(error),
-                }) => finalize_stream_log(
-                    &cfg,
-                    log_id,
-                    started,
-                    UsageLogEvent {
-                        api: &api,
-                        provider: &provider,
-                        model: &model,
-                        upstream_model: &upstream_model,
-                        status: "error",
-                        error: Some(&error),
-                        usage: TokenUsage::default(),
-                        first_token_ms,
-                        token_source: None,
-                    },
-                ),
+                }) => {
+                    finalize_stream_log(
+                        &cfg,
+                        log_id,
+                        started,
+                        UsageLogEvent {
+                            api: &api,
+                            provider: &provider,
+                            model: &model,
+                            upstream_model: &upstream_model,
+                            status: "error",
+                            error: Some(&error),
+                            usage: TokenUsage::default(),
+                            first_token_ms,
+                            token_source: None,
+                        },
+                    )
+                    .await
+                }
                 Ok(StreamOutcome {
                     usage,
                     first_token_ms,
                     error: None,
-                }) => finalize_stream_log(
-                    &cfg,
-                    log_id,
-                    started,
-                    UsageLogEvent {
-                        api: &api,
-                        provider: &provider,
-                        model: &model,
-                        upstream_model: &upstream_model,
-                        status: "ok",
-                        error: None,
-                        usage,
-                        first_token_ms,
-                        token_source: None,
-                    },
-                ),
-                Err(_) => finalize_stream_log(
-                    &cfg,
-                    log_id,
-                    started,
-                    UsageLogEvent {
-                        api: &api,
-                        provider: &provider,
-                        model: &model,
-                        upstream_model: &upstream_model,
-                        status: "error",
-                        error: Some("流式结果状态通道异常关闭"),
-                        usage: TokenUsage::default(),
-                        first_token_ms: None,
-                        token_source: None,
-                    },
-                ),
+                }) => {
+                    finalize_stream_log(
+                        &cfg,
+                        log_id,
+                        started,
+                        UsageLogEvent {
+                            api: &api,
+                            provider: &provider,
+                            model: &model,
+                            upstream_model: &upstream_model,
+                            status: "ok",
+                            error: None,
+                            usage,
+                            first_token_ms,
+                            token_source: None,
+                        },
+                    )
+                    .await
+                }
+                Err(_) => {
+                    finalize_stream_log(
+                        &cfg,
+                        log_id,
+                        started,
+                        UsageLogEvent {
+                            api: &api,
+                            provider: &provider,
+                            model: &model,
+                            upstream_model: &upstream_model,
+                            status: "error",
+                            error: Some("流式结果状态通道异常关闭"),
+                            usage: TokenUsage::default(),
+                            first_token_ms: None,
+                            token_source: None,
+                        },
+                    )
+                    .await
+                }
             }
         });
     } else {
@@ -4063,7 +4073,7 @@ fn update_usage_log(
     id: i64,
     started: Instant,
     event: &UsageLogEvent<'_>,
-) -> bool {
+) -> rusqlite::Result<usize> {
     update_usage_log_sqlite(
         config.usage_log_sqlite_path(),
         id,
@@ -4076,18 +4086,38 @@ fn update_usage_log(
         event.usage.output,
         event.token_source.unwrap_or("upstream_or_unknown"),
     )
-    .is_ok_and(|updated| updated > 0)
 }
 
-fn finalize_stream_log(
+async fn finalize_stream_log(
     config: &AppConfig,
     log_id: Option<i64>,
     started: Instant,
     event: UsageLogEvent<'_>,
 ) {
-    if !log_id.is_some_and(|id| update_usage_log(config, id, started, &event)) {
-        log_usage(config, started, event);
+    if let Some(id) = log_id {
+        for attempt in 0..3 {
+            match update_usage_log(config, id, started, &event) {
+                Ok(updated) if updated > 0 => return,
+                Ok(_) => break,
+                Err(err) if sqlite_lock_error(&err) && attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                }
+                Err(_) => break,
+            }
+        }
     }
+    log_usage(config, started, event);
+}
+
+fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
@@ -4129,10 +4159,7 @@ fn log_usage_sqlite(
     output_tokens: i64,
     token_source: &str,
 ) -> rusqlite::Result<i64> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let conn = Connection::open(path)?;
+    let conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
     conn.execute(
         r#"
@@ -4175,7 +4202,7 @@ fn update_usage_log_sqlite(
     output_tokens: i64,
     token_source: &str,
 ) -> rusqlite::Result<usize> {
-    let conn = Connection::open(path)?;
+    let conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
     conn.execute(
         r#"
@@ -4196,6 +4223,34 @@ fn update_usage_log_sqlite(
             id
         ],
     )
+}
+
+pub(crate) fn open_usage_log_connection(path: PathBuf) -> rusqlite::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
+}
+
+fn recover_interrupted_usage_logs(path: PathBuf) {
+    let Ok(conn) = open_usage_log_connection(path) else {
+        return;
+    };
+    if ensure_usage_log_schema(&conn).is_err() {
+        return;
+    }
+    let _ = conn.execute(
+        r#"
+        UPDATE usage_logs
+        SET status = 'error', error = '代理上次退出前请求未完成'
+        WHERE status = 'running'
+        "#,
+        [],
+    );
 }
 
 pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -5123,6 +5178,100 @@ mod tests {
 
         assert_eq!(updated, 1);
         assert_eq!(row, (1, "ok".to_string(), 12_345, Some(456), 321, 45));
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn usage_log_connection_enables_wal_and_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-sqlite-config-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+
+        let conn = open_usage_log_connection(path.clone()).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout, 5_000);
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_allows_log_writes_while_reader_transaction_is_open() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-concurrent-log-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+        let mut reader = open_usage_log_connection(path.clone()).unwrap();
+        ensure_usage_log_schema(&reader).unwrap();
+        let read_tx = reader.transaction().unwrap();
+        let _: i64 = read_tx
+            .query_row("SELECT COUNT(*) FROM usage_logs", [], |row| row.get(0))
+            .unwrap();
+
+        let id = log_usage_sqlite(
+            path.clone(),
+            "2026-07-15 12:00:00",
+            "responses",
+            "ok",
+            "test-provider",
+            "gpt-test",
+            "gpt-upstream",
+            123,
+            Some(45),
+            "",
+            10,
+            2,
+            "upstream_or_unknown",
+        )
+        .unwrap();
+
+        assert!(id > 0);
+        drop(read_tx);
+        drop(reader);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_recovers_stale_running_logs() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-stale-log-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+        log_usage_sqlite(
+            path.clone(),
+            "2026-07-15 12:00:00",
+            "responses",
+            "running",
+            "test-provider",
+            "gpt-test",
+            "gpt-upstream",
+            0,
+            None,
+            "",
+            0,
+            0,
+            "upstream_or_unknown",
+        )
+        .unwrap();
+
+        recover_interrupted_usage_logs(path.clone());
+
+        let conn = open_usage_log_connection(path.clone()).unwrap();
+        let row = conn
+            .query_row("SELECT status, error FROM usage_logs", [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        assert_eq!(row.0, "error");
+        assert!(row.1.contains("上次退出"));
         drop(conn);
         let _ = fs::remove_file(path);
     }
