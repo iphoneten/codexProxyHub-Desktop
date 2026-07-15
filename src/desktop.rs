@@ -92,7 +92,6 @@ enum AppView {
     Overview,
     Providers,
     Auth,
-    Routing,
     Logs,
     Settings,
     About,
@@ -448,7 +447,7 @@ impl eframe::App for HubApp {
 
         egui::SidePanel::left("navigation")
             .resizable(false)
-            .exact_width(248.0)
+            .exact_width(180.0)
             .show(ctx, |ui| {
                 side_navigation(ui, self);
             });
@@ -480,8 +479,6 @@ impl eframe::App for HubApp {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    overview_header(ui, config, &self.server.lock());
-                                    ui.add_space(14.0);
                                     overview_analytics_section(
                                         ui,
                                         config,
@@ -497,49 +494,27 @@ impl eframe::App for HubApp {
                                 });
                         }
                         AppView::Providers => {
-                            ui.vertical(|ui| {
-                                overview_header(ui, config, &self.server.lock());
-                                ui.add_space(14.0);
-                                provider_section(
-                                    ui,
-                                    config,
-                                    &mut self.selected_provider,
-                                    &mut self.message,
-                                    &mut self.provider_mapping_drafts,
-                                    &mut self.provider_header_drafts,
-                                    self.keepalive_status.as_ref(),
-                                );
-                            });
+                            provider_section(
+                                ui,
+                                config,
+                                &mut self.selected_provider,
+                                &mut self.message,
+                                &mut self.provider_mapping_drafts,
+                                &mut self.provider_header_drafts,
+                                self.keepalive_status.as_ref(),
+                            );
                         }
                         AppView::Auth => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    overview_header(ui, config, &self.server.lock());
-                                    ui.add_space(14.0);
                                     auth_section(ui, config, &mut self.new_key_name);
-                                });
-                        }
-                        AppView::Routing => {
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    overview_header(ui, config, &self.server.lock());
-                                    ui.add_space(14.0);
-                                    routing_section(
-                                        ui,
-                                        config,
-                                        &mut self.routing_drafts,
-                                        &mut self.routing_drafts_source,
-                                    );
                                 });
                         }
                         AppView::Logs => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    overview_header(ui, config, &self.server.lock());
-                                    ui.add_space(14.0);
                                     logs_section(
                                         ui,
                                         config,
@@ -553,10 +528,15 @@ impl eframe::App for HubApp {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    overview_header(ui, config, &self.server.lock());
-                                    ui.add_space(14.0);
                                     ui.set_max_width(640.0);
                                     server_section(ui, config);
+                                    ui.add_space(14.0);
+                                    routing_section(
+                                        ui,
+                                        config,
+                                        &mut self.routing_drafts,
+                                        &mut self.routing_drafts_source,
+                                    );
                                 });
                         }
                         AppView::About => {}
@@ -589,7 +569,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                     );
                     ui.label(
                         egui::RichText::new(format!(
-                            "Rust desktop proxy console · v{}",
+                            "API 路由与代理网关控制台 · v{}",
                             crate::app_version()
                         ))
                         .size(12.0)
@@ -598,6 +578,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                 });
                 ui.add_space(20.0);
                 server_badge(ui, &app.server.lock());
+
+                if let Some(ref config) = app.config {
+                    let enabled_providers = config.providers.iter().filter(|p| p.enabled).count();
+                    let model_count = config.providers.iter().filter(|p| p.enabled).map(|p| p.models.len()).sum::<usize>();
+                    let (auth_status, auth_color) = if config.auth.enabled {
+                        ("开启", good())
+                    } else {
+                        ("关闭", muteds())
+                    };
+
+                    ui.add_space(16.0);
+                    metric_badge(ui, "启用渠道", &enabled_providers.to_string(), accent());
+                    ui.add_space(8.0);
+                    metric_badge(ui, "模型数量", &model_count.to_string(), egui::Color32::from_rgb(110, 106, 220));
+                    ui.add_space(8.0);
+                    metric_badge(ui, "安全鉴权", auth_status, auth_color);
+                }
+
                 let running = app.server.lock().running;
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -677,26 +675,16 @@ fn side_navigation(ui: &mut egui::Ui, app: &mut HubApp) {
     let mut next_view = app.view;
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(248, 250, 252))
-        .stroke(egui::Stroke::new(1.0, border()))
+        .stroke(egui::Stroke::NONE)
         .inner_margin(egui::Margin::symmetric(14.0, 16.0))
         .show(ui, |ui| {
             ui.set_min_height(ui.available_height());
             nav_item(ui, &mut next_view, AppView::Overview, "概览");
             nav_item(ui, &mut next_view, AppView::Providers, "渠道");
             nav_item(ui, &mut next_view, AppView::Auth, "鉴权");
-            nav_item(ui, &mut next_view, AppView::Routing, "路由");
             nav_item(ui, &mut next_view, AppView::Logs, "日志");
             nav_item(ui, &mut next_view, AppView::Settings, "设置");
             nav_item(ui, &mut next_view, AppView::About, "关于");
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            ui.label(
-                egui::RichText::new("OpenAI-compatible local proxy")
-                    .small()
-                    .color(muteds()),
-            );
         });
     app.view = next_view;
 }
@@ -729,57 +717,7 @@ fn nav_item(ui: &mut egui::Ui, view: &mut AppView, target: AppView, title: &str)
     ui.add_space(4.0);
 }
 
-fn overview_header(ui: &mut egui::Ui, config: &AppConfig, server: &ServerHandle) {
-    let enabled = config.providers.iter().filter(|p| p.enabled).count();
-    let model_count: usize = config
-        .providers
-        .iter()
-        .filter(|p| p.enabled)
-        .map(|p| p.models.len())
-        .sum();
-    ui.horizontal_wrapped(|ui| {
-        metric_tile(
-            ui,
-            "代理状态",
-            if server.running {
-                "运行中"
-            } else {
-                "未运行"
-            },
-            server.endpoint.as_str(),
-            if server.running { good() } else { muteds() },
-        );
-        metric_tile(
-            ui,
-            "启用渠道",
-            &enabled.to_string(),
-            "参与模型路由",
-            accent(),
-        );
-        metric_tile(
-            ui,
-            "模型数量",
-            &model_count.to_string(),
-            "来自启用渠道",
-            egui::Color32::from_rgb(110, 106, 220),
-        );
-        metric_tile(
-            ui,
-            "鉴权",
-            if config.auth.enabled {
-                "开启"
-            } else {
-                "关闭"
-            },
-            &format!("{} keys", config.auth.api_keys.len()),
-            if config.auth.enabled {
-                good()
-            } else {
-                muteds()
-            },
-        );
-    });
-}
+
 
 fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, color: egui::Color32) {
     egui::Frame::none()
@@ -800,6 +738,21 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, color:
                     .color(stat_color()),
             );
             ui.label(egui::RichText::new(detail).size(12.0).color(muteds()));
+        });
+}
+
+fn metric_badge(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(241, 245, 249))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .show(ui, |ui| {
+            ui.set_min_width(110.0);
+            ui.horizontal(|ui| {
+                metric_icon(ui, color);
+                ui.label(egui::RichText::new(format!("{}:", label)).size(12.0).color(muteds()));
+                ui.label(egui::RichText::new(value).size(12.0).strong().color(stat_color()));
+            });
         });
 }
 
@@ -892,7 +845,8 @@ fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
         ui.horizontal(|ui| {
             field_icon(ui, "network");
             ui.label("Host");
-            ui.text_edit_singleline(&mut config.server.host);
+            ui.add(egui::TextEdit::singleline(&mut config.server.host).desired_width(180.0));
+            ui.add_space(8.0);
             field_icon(ui, "plug");
             ui.label("Port");
             let mut port = config.server.port as i64;
@@ -1248,14 +1202,20 @@ fn routing_section(
 
         if drafts.is_empty() {
             ui.label("未配置映射");
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_sized(egui::vec2(180.0, 20.0), egui::Label::new(egui::RichText::new("源模型").small().color(muteds())));
+                ui.add_space(20.0);
+                ui.add_sized(egui::vec2(260.0, 20.0), egui::Label::new(egui::RichText::new("映射后模型 (逗号分隔)").small().color(muteds())));
+            });
         }
 
         let mut to_remove: Option<usize> = None;
         for (idx, draft) in drafts.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut draft.key);
+                ui.add(egui::TextEdit::singleline(&mut draft.key).desired_width(180.0));
                 ui.label("→");
-                ui.text_edit_singleline(&mut draft.value);
+                ui.add(egui::TextEdit::singleline(&mut draft.value).desired_width(260.0));
                 if ui.button("删除").clicked() {
                     to_remove = Some(idx);
                 }
@@ -1409,13 +1369,9 @@ fn logs_section(
             .rounding(6.0)
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("usage_logs")
-                            .striped(true)
-                            .min_col_width(80.0)
+                egui::Grid::new("usage_logs")
+                    .striped(true)
+                    .min_col_width(80.0)
                             .show(ui, |ui| {
                                 table_header(ui, "时间");
                                 table_header(ui, "状态");
@@ -1447,7 +1403,6 @@ fn logs_section(
                             });
                     });
             });
-    });
 }
 
 fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut AppMessage>) {
@@ -2413,23 +2368,31 @@ fn about_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::none()
-        .fill(surface())
-        .stroke(egui::Stroke::new(1.0, border()))
-        .rounding(8.0)
-        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(title)
-                        .size(18.0)
-                        .strong()
-                        .color(heading_color()),
-                );
-                ui.add_space(8.0);
-                add_contents(ui);
-            });
-        });
+    let width = ui.available_width().min(600.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::none()
+                .fill(surface())
+                .stroke(egui::Stroke::new(1.0, border()))
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(width - 32.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(18.0)
+                                .strong()
+                                .color(heading_color()),
+                        );
+                        ui.add_space(8.0);
+                        add_contents(ui);
+                    });
+                });
+        },
+    );
 }
 
 fn server_badge(ui: &mut egui::Ui, server: &ServerHandle) {
