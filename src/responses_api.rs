@@ -544,7 +544,17 @@ where
                             continue;
                         };
                         if data.trim() == "[DONE]" {
-                            continue;
+                            if !state.finished {
+                                let terminal = state.build_terminal_chunk();
+                                if send_json_chunk(&tx, &terminal).await.is_err() {
+                                    let _ = u_tx
+                                        .send(StreamOutcome::success(state.usage, first_token_ms));
+                                    return;
+                                }
+                            }
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
+                            return;
                         }
                         let Ok(payload) = serde_json::from_str::<Value>(&data) else {
                             continue;
@@ -567,6 +577,11 @@ where
                                 first_token_ms,
                                 error,
                             ));
+                            return;
+                        }
+                        if state.finished {
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
                             return;
                         }
                     }
@@ -639,6 +654,7 @@ struct StreamState {
     usage: TokenUsage,
     finish_reason: Option<String>,
     finished: bool,
+    text_delta_seen: bool,
 }
 
 impl StreamState {
@@ -656,6 +672,7 @@ impl StreamState {
             usage: TokenUsage::default(),
             finish_reason: None,
             finished: false,
+            text_delta_seen: false,
         }
     }
 
@@ -799,7 +816,18 @@ impl StreamState {
             Some("response.output_text.delta") => {
                 if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
+                        self.text_delta_seen = true;
                         out.push(self.build_chunk(json!({"content": delta}), None));
+                    }
+                }
+            }
+            Some("response.output_text.done") => {
+                if !self.text_delta_seen {
+                    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            self.text_delta_seen = true;
+                            out.push(self.build_chunk(json!({"content": text}), None));
+                        }
                     }
                 }
             }
@@ -955,6 +983,7 @@ impl StreamState {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use std::time::Duration;
 
     #[test]
     fn request_extracts_system_to_instructions() {
@@ -1225,5 +1254,80 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Concurrency limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn stream_translator_closes_after_completed_event_even_if_upstream_stays_open() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) })
+            .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+
+        let (rx, body_stream) = spawn_responses_stream_translator_from_stream(
+            stream,
+            "gpt-test".to_string(),
+            Instant::now(),
+        );
+        let body = axum::body::Body::from_stream(body_stream);
+        let body = tokio::time::timeout(Duration::from_millis(100), to_bytes(body, 1024 * 1024))
+            .await
+            .expect("下游流应在 response.completed 后立即结束")
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let outcome = rx.await.unwrap();
+
+        assert!(text.contains("\"finish_reason\":\"stop\""));
+        assert!(text.contains("[DONE]"));
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.usage.input, 1);
+        assert_eq!(outcome.usage.output, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_translator_waits_after_output_text_done_until_completed() {
+        let event = json!({
+            "type": "response.output_text.done",
+            "text": "你好"
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) })
+            .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+
+        let (_rx, mut body_stream) = spawn_responses_stream_translator_from_stream(
+            stream,
+            "gpt-test".to_string(),
+            Instant::now(),
+        );
+
+        let opening = tokio::time::timeout(Duration::from_millis(100), body_stream.next())
+            .await
+            .expect("应先发送 chat 开始块")
+            .expect("应有 chat 开始块")
+            .unwrap();
+        let content = tokio::time::timeout(Duration::from_millis(100), body_stream.next())
+            .await
+            .expect("应转发 response.output_text.done 文本")
+            .expect("应有文本块")
+            .unwrap();
+        let merged = format!(
+            "{}{}",
+            String::from_utf8(opening.to_vec()).unwrap(),
+            String::from_utf8(content.to_vec()).unwrap()
+        );
+
+        assert!(merged.contains("\"content\":\"你好\""));
+        assert!(!merged.contains("\"finish_reason\":\"stop\""));
+        assert!(!merged.contains("[DONE]"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), body_stream.next())
+                .await
+                .is_err()
+        );
     }
 }

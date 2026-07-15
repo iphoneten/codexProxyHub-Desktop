@@ -182,7 +182,7 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | --- | --- | --- | --- |
 | `connect_timeout` | number | `10` | 连接超时秒数，限制 DNS/TCP/TLS/连接建立阶段。代理会按该值缓存 reqwest Client。 |
 | `request_timeout` | number | `60` | 请求超时秒数。非流式请求限制整个请求；流式请求分别限制等待响应头和等待首个有效输出，SSE 已开始正常输出后不限制总时长。 |
-| `stream_idle_timeout` | number | `0` | 流式响应开始后，连续多少秒没有收到上游新数据就主动中断。`0` 表示关闭。适合不稳定渠道，例如 `60`。 |
+| `stream_idle_timeout` | number | `0` | 流式响应开始后，连续多少秒没有收到上游新数据就主动中断。`0` 表示关闭，本地会继续等待上游返回完成事件。 |
 | `stream_max_duration` | number | `0` | 流式响应开始后允许持续的最大秒数。`0` 表示关闭。设置过短会误杀长输出或工具任务。 |
 | `timeout` | number | 无 | 旧字段。仍可读取，会映射到 `request_timeout`；保存新配置时建议使用 `request_timeout`。 |
 
@@ -197,7 +197,25 @@ max_retries: 0
 ```
 
 如果希望坏渠道尽快切换，可以降低 `request_timeout`，但不要设得太小，否则首包慢的上游会被误判失败。
-如果希望避免上游进入流式后长时间拖住任务，可以给不稳定渠道设置 `stream_idle_timeout` 或 `stream_max_duration`。流已经开始后无法无缝切换渠道，这类保护会主动中断并在日志中记为 `error`。
+如果希望避免上游进入流式后长时间拖住任务，可以给不稳定渠道设置 `stream_idle_timeout` 或 `stream_max_duration`。流已经开始后无法无缝切换渠道，这类保护会主动中断并在日志中记为 `error`。默认情况下本地不会主动收尾，会继续等待上游返回完成事件。
+
+### 原始 SSE 抓取
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `debug_capture_sse` | bool | `false` | 是否抓取该渠道流式响应的尾部原始 SSE 事件。只建议排查问题时临时开启。 |
+| `debug_sse_path` | string | `logs/raw_sse` | 抓取文件目录。相对路径按配置文件所在目录解析。 |
+| `debug_sse_max_events` | number | `80` | 每次请求最多保留最后多少个 SSE event，避免文件过大。 |
+
+示例：
+
+```yaml
+debug_capture_sse: true
+debug_sse_path: logs/raw_sse
+debug_sse_max_events: 120
+```
+
+说明：原始 SSE 可能包含对话内容、工具参数或上游错误详情。问题定位完成后建议关闭 `debug_capture_sse`。
 
 ### 协议和兼容字段
 
@@ -216,10 +234,10 @@ max_retries: 0
 | `persistent_session` | bool | `false` | 兼容保留 | 旧版持久会话字段，当前核心代理逻辑未启用完整保活机制。 |
 | `persist_interval` | number | `3.0` | 兼容保留 | 持久会话间隔。 |
 | `persist_max_wait` | number | `0` | 兼容保留 | 持久会话最大等待时间。 |
-| `persist_keepalive` | bool | `false` | 兼容保留 | 是否启用 keepalive。 |
-| `persist_keepalive_interval` | number | `30` | 兼容保留 | keepalive 间隔秒数。 |
-| `persist_keepalive_model` | string/null | `null` | 兼容保留 | keepalive 使用的模型。 |
-| `persist_keepalive_prompt` | string | `Hi` | 兼容保留 | keepalive 使用的提示词。 |
+| `persist_keepalive` | bool | `false` | 已生效 | 是否对该渠道启用后台心跳。默认关闭，开启后会产生上游请求和少量 token 消耗。 |
+| `persist_keepalive_interval` | number | `30` | 已生效 | 心跳间隔秒数，最小 5 秒。 |
+| `persist_keepalive_model` | string/null | `null` | 已生效 | 心跳使用的模型。为空时使用该渠道模型列表的第一个模型。 |
+| `persist_keepalive_prompt` | string | `Hi` | 已生效 | 心跳请求使用的提示词。 |
 
 ## 路由和故障转移行为
 

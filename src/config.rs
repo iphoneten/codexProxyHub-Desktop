@@ -122,6 +122,12 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub stream_max_duration: u64,
     #[serde(default)]
+    pub debug_capture_sse: bool,
+    #[serde(default = "default_debug_sse_path")]
+    pub debug_sse_path: String,
+    #[serde(default = "default_debug_sse_max_events")]
+    pub debug_sse_max_events: usize,
+    #[serde(default)]
     pub max_retries: usize,
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -177,7 +183,7 @@ impl AppConfig {
         self.resolve_runtime_path(&self.usage_log.sqlite_path)
     }
 
-    fn resolve_runtime_path(&self, path: &str) -> PathBuf {
+    pub fn resolve_runtime_path(&self, path: &str) -> PathBuf {
         let path_buf = PathBuf::from(path);
         if path_buf.is_absolute() || path.trim().is_empty() {
             return path_buf;
@@ -319,6 +325,12 @@ fn default_usage_backend() -> String {
 }
 fn default_sqlite_path() -> String {
     "logs/proxy_usage.sqlite3".to_string()
+}
+fn default_debug_sse_path() -> String {
+    "logs/raw_sse".to_string()
+}
+fn default_debug_sse_max_events() -> usize {
+    80
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ pub struct HubApp {
     log_view: LogViewState,
     // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
     config_handle: Option<ConfigHandle>,
+    keepalive_status: Option<proxy::KeepaliveStatusHandle>,
     #[cfg(target_os = "macos")]
     tray: Option<MacosTray>,
     #[cfg(target_os = "macos")]
@@ -93,6 +94,7 @@ impl HubApp {
             provider_header_drafts: Vec::new(),
             log_view: LogViewState::default(),
             config_handle: None,
+            keepalive_status: None,
             #[cfg(target_os = "macos")]
             tray: None,
             #[cfg(target_os = "macos")]
@@ -223,9 +225,11 @@ impl HubApp {
         // 建立配置句柄：UI 与运行中的 server 共享同一 Arc<RwLock<Arc<AppConfig>>>
         let handle: ConfigHandle = Arc::new(RwLock::new(Arc::new(config)));
         self.config_handle = Some(Arc::clone(&handle));
+        let keepalive_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        self.keepalive_status = Some(Arc::clone(&keepalive_status));
         let server_state = Arc::clone(&self.server);
         runtime.spawn(async move {
-            let result = proxy::run_server(handle, rx).await;
+            let result = proxy::run_server(handle, rx, keepalive_status).await;
             let mut server = server_state.lock();
             server.running = false;
             server.shutdown = None;
@@ -244,6 +248,7 @@ impl HubApp {
             self.message = "正在停止代理".to_string();
             drop(server);
             self.config_handle = None;
+            self.keepalive_status = None;
         } else {
             self.message = "代理未运行".to_string();
         }
@@ -375,6 +380,7 @@ impl eframe::App for HubApp {
                                     &mut self.message,
                                     &mut self.provider_mapping_drafts,
                                     &mut self.provider_header_drafts,
+                                    self.keepalive_status.as_ref(),
                                 ),
                                 AppView::Auth => auth_section(ui, config, &mut self.new_key_name),
                                 AppView::Routing => routing_section(ui, config),
@@ -1403,6 +1409,7 @@ fn provider_section(
     message: &mut String,
     mapping_drafts: &mut Vec<TextDraft>,
     header_drafts: &mut Vec<TextDraft>,
+    keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
 ) {
     resize_drafts(mapping_drafts, config.providers.len());
     resize_drafts(header_drafts, config.providers.len());
@@ -1447,6 +1454,7 @@ fn provider_section(
                     message,
                     &mut mapping_drafts[idx],
                     &mut header_drafts[idx],
+                    keepalive_status,
                 );
             },
         );
@@ -1541,6 +1549,7 @@ fn provider_detail_panel(
     message: &mut String,
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
+    keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
 ) {
     section(ui, "渠道详情", |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1602,6 +1611,33 @@ fn provider_detail_panel(
                     ui.add(egui::TextEdit::singleline(&mut provider.api_key).password(true));
                     ui.end_row();
                 });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                form_label(ui, "运行状态");
+                if let Some(status_handle) = keepalive_status {
+                    let status = status_handle.read().get(&provider.name).cloned();
+                    match status {
+                        Some(status) => {
+                            if let Some(success) = status.last_success {
+                                ui.colored_label(good(), format!("最近成功 {}", success));
+                            } else {
+                                ui.label(egui::RichText::new("等待首次心跳").color(muteds()));
+                            }
+                            if let Some(error) = status.last_error {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(176, 54, 64),
+                                    format!("最近失败: {}", error),
+                                );
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("等待首次心跳").color(muteds()));
+                        }
+                    }
+                } else {
+                    ui.label(egui::RichText::new("代理未启动").color(muteds()));
+                }
+            });
         });
 
         ui.add_space(12.0);
@@ -1653,6 +1689,58 @@ fn provider_detail_panel(
                         switch(ui, &mut provider.strip_thought);
                         ui.label("过滤");
                     });
+                    ui.end_row();
+
+                    form_label(ui, "抓取 SSE");
+                    ui.horizontal(|ui| {
+                        switch(ui, &mut provider.debug_capture_sse);
+                        ui.label("启用");
+                    });
+                    form_label(ui, "保留事件");
+                    ui.add(
+                        egui::DragValue::new(&mut provider.debug_sse_max_events).range(10..=500),
+                    );
+                    ui.end_row();
+
+                    form_label(ui, "抓取目录");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut provider.debug_sse_path)
+                            .desired_width(220.0),
+                    );
+                    ui.label(egui::RichText::new("排查后建议关闭").color(muteds()));
+                    ui.label("");
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(12.0);
+        form_group(ui, "连接保活", |ui| {
+            egui::Grid::new("provider_keepalive_form")
+                .num_columns(4)
+                .spacing(egui::vec2(14.0, 10.0))
+                .show(ui, |ui| {
+                    form_label(ui, "心跳");
+                    ui.horizontal(|ui| {
+                        switch(ui, &mut provider.persist_keepalive);
+                        ui.label("启用");
+                    });
+                    form_label(ui, "间隔(秒)");
+                    ui.add(
+                        egui::DragValue::new(&mut provider.persist_keepalive_interval)
+                            .range(5..=86400),
+                    );
+                    ui.end_row();
+
+                    form_label(ui, "模型");
+                    let model = provider
+                        .persist_keepalive_model
+                        .get_or_insert_with(String::new);
+                    ui.add(egui::TextEdit::singleline(model).desired_width(220.0));
+                    form_label(ui, "提示词");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut provider.persist_keepalive_prompt)
+                            .desired_width(220.0),
+                    );
                     ui.end_row();
                 });
         });
@@ -2031,6 +2119,9 @@ fn default_provider() -> ProviderConfig {
         request_timeout: 60,
         stream_idle_timeout: 0,
         stream_max_duration: 0,
+        debug_capture_sse: false,
+        debug_sse_path: "logs/raw_sse".to_string(),
+        debug_sse_max_events: 80,
         max_retries: 3,
         weight: 1,
         priority: 1,

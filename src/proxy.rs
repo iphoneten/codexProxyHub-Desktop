@@ -15,7 +15,7 @@ use reqwest::Client;
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     net::SocketAddr,
     path::PathBuf,
@@ -35,16 +35,32 @@ use uuid::Uuid;
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
+#[derive(Clone, Default)]
+pub struct KeepaliveStatus {
+    pub last_attempt: Option<String>,
+    pub last_success: Option<String>,
+    pub last_error: Option<String>,
+}
+
+pub type KeepaliveStatusHandle = Arc<RwLock<HashMap<String, KeepaliveStatus>>>;
 
 #[derive(Clone)]
 struct AppState {
     config: ConfigHandle,
     clients: Arc<Mutex<HashMap<u64, Client>>>,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
+    keepalive_headers: Arc<Mutex<HashMap<String, HeaderMap>>>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
     usage_injection: Arc<Mutex<HashMap<String, bool>>>,
+}
+
+#[derive(Clone)]
+struct RawSseCapture {
+    provider: String,
+    path: String,
+    max_events: usize,
 }
 
 impl AppState {
@@ -79,6 +95,31 @@ impl AppState {
         self.usage_injection
             .lock()
             .insert(provider.name.clone(), false);
+    }
+
+    fn remember_keepalive_headers(&self, provider: &ProviderConfig, request_headers: &HeaderMap) {
+        let headers = keepalive_safe_headers(request_headers);
+        if !headers.is_empty() {
+            self.keepalive_headers
+                .lock()
+                .insert(provider.name.clone(), headers);
+        }
+    }
+
+    fn cached_keepalive_headers(&self, provider: &ProviderConfig) -> Option<HeaderMap> {
+        self.keepalive_headers.lock().get(&provider.name).cloned()
+    }
+
+    fn raw_sse_capture_for(&self, provider: &ProviderConfig) -> Option<RawSseCapture> {
+        provider.debug_capture_sse.then(|| RawSseCapture {
+            provider: provider.name.clone(),
+            path: self
+                .snapshot()
+                .resolve_runtime_path(&provider.debug_sse_path)
+                .display()
+                .to_string(),
+            max_events: provider.debug_sse_max_events.max(10),
+        })
     }
 }
 
@@ -131,6 +172,31 @@ struct ProviderResult {
     usage: TokenUsage,
     // 流式请求会在此提供最终 usage 和流错误；外层收到 Some 时改为异步落日志
     usage_rx: Option<oneshot::Receiver<StreamOutcome>>,
+}
+
+struct AttemptFailure {
+    provider: String,
+    request_model: String,
+    started: Instant,
+    status: StatusCode,
+    message: String,
+}
+
+impl AttemptFailure {
+    fn new(
+        provider: &ProviderConfig,
+        request_model: &str,
+        started: Instant,
+        err: ProxyError,
+    ) -> Self {
+        Self {
+            provider: provider.name.clone(),
+            request_model: request_model.to_string(),
+            started,
+            status: err.status,
+            message: err.message,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -201,7 +267,11 @@ async fn send_stream_request(
     }
 }
 
-pub async fn run_server(config: ConfigHandle, shutdown: oneshot::Receiver<()>) -> Result<()> {
+pub async fn run_server(
+    config: ConfigHandle,
+    shutdown: oneshot::Receiver<()>,
+    keepalive_status: KeepaliveStatusHandle,
+) -> Result<()> {
     // server 监听端口只用启动时那一份配置（改端口无法热切）
     let initial = config.read().clone();
     let bind_host = if initial.server.host == "0.0.0.0" {
@@ -214,8 +284,15 @@ pub async fn run_server(config: ConfigHandle, shutdown: oneshot::Receiver<()>) -
         config,
         clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
     };
+    let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
+    let keepalive_task = tokio::spawn(keepalive_loop(
+        state.clone(),
+        keepalive_status,
+        keepalive_stop_rx,
+    ));
 
     let app = Router::new()
         .route("/", get(index))
@@ -238,12 +315,205 @@ pub async fn run_server(config: ConfigHandle, shutdown: oneshot::Receiver<()>) -
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = shutdown.await;
+            let _ = keepalive_stop_tx.send(());
         })
-        .await?;
+        .await;
+    let _ = keepalive_task.await;
+    result?;
     Ok(())
+}
+
+async fn keepalive_loop(
+    state: AppState,
+    status: KeepaliveStatusHandle,
+    mut stop: oneshot::Receiver<()>,
+) {
+    let mut last_sent: HashMap<String, Instant> = HashMap::new();
+    loop {
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        let config = state.snapshot();
+        let mut active = HashSet::new();
+        for provider in config
+            .providers
+            .iter()
+            .filter(|provider| provider.enabled && provider.persist_keepalive)
+        {
+            active.insert(provider.name.clone());
+            let interval = provider.persist_keepalive_interval.max(5);
+            if last_sent
+                .get(&provider.name)
+                .is_some_and(|sent| sent.elapsed() < Duration::from_secs(interval))
+            {
+                continue;
+            }
+
+            last_sent.insert(provider.name.clone(), Instant::now());
+            let state = state.clone();
+            let provider = provider.clone();
+            let status = Arc::clone(&status);
+            tokio::spawn(async move {
+                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                {
+                    let mut statuses = status.write();
+                    let item = statuses.entry(provider.name.clone()).or_default();
+                    item.last_attempt = Some(now);
+                }
+                let result = send_provider_keepalive(&state, &provider).await;
+                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let mut statuses = status.write();
+                let item = statuses.entry(provider.name.clone()).or_default();
+                match result {
+                    Ok(()) => {
+                        item.last_success = Some(now);
+                        item.last_error = None;
+                    }
+                    Err(err) => {
+                        item.last_error = Some(err.message);
+                    }
+                }
+            });
+        }
+        last_sent.retain(|name, _| active.contains(name));
+    }
+}
+
+async fn send_provider_keepalive(
+    state: &AppState,
+    provider: &ProviderConfig,
+) -> Result<(), ProxyError> {
+    let model = provider
+        .persist_keepalive_model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| provider.models.first().map(String::as_str))
+        .ok_or_else(|| ProxyError::new(StatusCode::BAD_REQUEST, "保活渠道未配置模型"))?
+        .to_string();
+    let prompt = if provider.persist_keepalive_prompt.trim().is_empty() {
+        "Hi"
+    } else {
+        provider.persist_keepalive_prompt.trim()
+    };
+    let (path, body) = build_keepalive_request(provider, &model, prompt)?;
+    let request_headers = state
+        .cached_keepalive_headers(provider)
+        .filter(has_codex_session_headers)
+        .or_else(|| {
+            if provider_keepalive_requires_client_headers(provider) {
+                None
+            } else {
+                Some(keepalive_request_headers())
+            }
+        })
+        .ok_or_else(|| {
+            ProxyError::new(
+                StatusCode::BAD_REQUEST,
+                "等待真实 Codex 请求头，先通过该渠道完成一次请求后会自动保活",
+            )
+        })?;
+
+    let client = state.client_for_provider(provider);
+    let _ = send_json_to_provider(&client, provider, path, &request_headers, body).await?;
+    Ok(())
+}
+
+fn build_keepalive_request(
+    provider: &ProviderConfig,
+    model: &str,
+    prompt: &str,
+) -> Result<(&'static str, Value), ProxyError> {
+    if provider.provider_type == "anthropic" {
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1,
+            "stream": false
+        });
+        apply_model_mapping(provider, &mut body);
+        let body = crate::anthropic::openai_to_anthropic_request(&body).map_err(|err| {
+            ProxyError::new(StatusCode::BAD_REQUEST, format!("保活请求翻译失败: {err}"))
+        })?;
+        return Ok(("/messages", body));
+    }
+
+    if provider_keepalive_prefers_responses(provider) {
+        let chat_body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1,
+            "stream": false
+        });
+        let mut body =
+            crate::responses_api::chat_to_responses_request(&chat_body).map_err(|err| {
+                ProxyError::new(StatusCode::BAD_REQUEST, format!("保活请求翻译失败: {err}"))
+            })?;
+        apply_model_mapping(provider, &mut body);
+        return Ok(("/responses", body));
+    }
+
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1,
+        "stream": false
+    });
+    apply_model_mapping(provider, &mut body);
+    Ok(("/chat/completions", body))
+}
+
+fn keepalive_request_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let session_id = Uuid::new_v4().to_string();
+    insert_header(&mut headers, "x-request-id", &request_id);
+    insert_header(&mut headers, "session_id", &session_id);
+    insert_header(&mut headers, "conversation_id", &session_id);
+    insert_header(&mut headers, "openai-client", "codex_cli_rs");
+    insert_header(&mut headers, "x-stainless-runtime", "rust");
+    insert_header(&mut headers, "x-codex-keepalive", "true");
+    headers
+}
+
+fn provider_keepalive_requires_client_headers(provider: &ProviderConfig) -> bool {
+    provider_keepalive_prefers_responses(provider)
+        && (provider.provider_type == "codex_only"
+            || provider
+                .extra_headers
+                .get("originator")
+                .is_some_and(|value| value.to_ascii_lowercase().contains("codex"))
+            || provider
+                .models
+                .iter()
+                .any(|model| model.to_ascii_lowercase().contains("codex")))
+}
+
+fn has_codex_session_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("session_id") || headers.contains_key("conversation_id")
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    if let (Ok(name), Ok(value)) = (
+        http::header::HeaderName::from_bytes(name.as_bytes()),
+        HeaderValue::from_str(value),
+    ) {
+        headers.insert(name, value);
+    }
+}
+
+fn provider_keepalive_prefers_responses(provider: &ProviderConfig) -> bool {
+    let supports_responses =
+        !matches!(provider.capabilities.get("supports_responses"), Some(false));
+    let supports_chat = !matches!(provider.capabilities.get("supports_chat"), Some(false));
+
+    provider.provider_type == "codex_only"
+        || provider.responses_mode == "native"
+        || (provider.responses_mode == "auto" && supports_responses && !supports_chat)
 }
 
 async fn index(State(state): State<AppState>) -> impl IntoResponse {
@@ -380,17 +650,7 @@ async fn responses(
                     ));
                 }
                 Err(err) => {
-                    let message = err.message;
-                    log_error(
-                        &cfg,
-                        "responses",
-                        &provider.name,
-                        &request_model,
-                        started,
-                        None,
-                        &message,
-                    );
-                    last_error = Some(message);
+                    last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                 }
             }
             continue;
@@ -441,44 +701,51 @@ async fn responses(
                         ));
                     }
                     Err(chat_err) => {
-                        let message = chat_err.message;
-                        log_error(
-                            &cfg,
-                            "responses",
-                            &provider.name,
+                        last_error = Some(AttemptFailure::new(
+                            &provider,
                             &request_model,
                             started,
-                            None,
-                            &message,
-                        );
-                        last_error = Some(message);
+                            chat_err,
+                        ));
                     }
                 }
             }
             Err(err) => {
-                let status = err.status;
-                let message = err.message;
-                log_error(
-                    &cfg,
-                    "responses",
-                    &provider.name,
-                    &request_model,
-                    started,
-                    None,
-                    &message,
-                );
+                let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
-                if should_stop_failover(status) {
-                    return Err(ProxyError::new(status, message));
+                if should_stop_failover(failure.status) {
+                    log_error(
+                        &cfg,
+                        "responses",
+                        &failure.provider,
+                        &failure.request_model,
+                        failure.started,
+                        None,
+                        &failure.message,
+                    );
+                    return Err(ProxyError::new(failure.status, failure.message));
                 }
-                last_error = Some(message);
+                last_error = Some(failure);
             }
         }
     }
 
+    if let Some(failure) = last_error {
+        log_error(
+            &cfg,
+            "responses",
+            &failure.provider,
+            &failure.request_model,
+            failure.started,
+            None,
+            &failure.message,
+        );
+        return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
+    }
+
     Err(ProxyError::new(
         StatusCode::BAD_GATEWAY,
-        last_error.unwrap_or_else(|| format!("模型 '{}' 没有可用渠道", model)),
+        format!("模型 '{}' 没有可用渠道", model),
     ))
 }
 
@@ -558,45 +825,52 @@ async fn forward_openai(
                             ));
                         }
                         Err(fb_err) => {
-                            let msg = fb_err.message;
-                            log_error(
-                                &cfg,
-                                api,
-                                &provider.name,
+                            last_error = Some(AttemptFailure::new(
+                                &provider,
                                 &request_model,
                                 started,
-                                None,
-                                &msg,
-                            );
-                            last_error = Some(msg);
+                                fb_err,
+                            ));
                             continue;
                         }
                     }
                 }
-                let status = err.status;
-                let message = err.message;
-                log_error(
-                    &cfg,
-                    api,
-                    &provider.name,
-                    &request_model,
-                    started,
-                    None,
-                    &message,
-                );
+                let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
-                if should_stop_failover(status) {
-                    return Err(ProxyError::new(status, message));
+                if should_stop_failover(failure.status) {
+                    log_error(
+                        &cfg,
+                        api,
+                        &failure.provider,
+                        &failure.request_model,
+                        failure.started,
+                        None,
+                        &failure.message,
+                    );
+                    return Err(ProxyError::new(failure.status, failure.message));
                 }
-                last_error = Some(message);
+                last_error = Some(failure);
             }
         }
     }
 
+    if let Some(failure) = last_error {
+        log_error(
+            &cfg,
+            api,
+            &failure.provider,
+            &failure.request_model,
+            failure.started,
+            None,
+            &failure.message,
+        );
+        return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
+    }
+
     Err(ProxyError::new(
         StatusCode::BAD_GATEWAY,
-        last_error.unwrap_or_else(|| format!("模型 '{}' 没有可用渠道", model)),
+        format!("模型 '{}' 没有可用渠道", model),
     ))
 }
 
@@ -608,6 +882,7 @@ async fn forward_responses_as_chat(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
+    state.remember_keepalive_headers(provider, headers);
     let chat_body = responses_to_chat_body(&body)?;
     let custom_tool_names = responses_custom_tool_names(body.get("tools"));
     if stream {
@@ -1123,6 +1398,17 @@ fn inspect_responses_sse_probe_event(data: &str) -> SseProbeDecision {
                 SseProbeDecision::Continue
             }
         }
+        Some("response.output_text.done") => {
+            if value
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                SseProbeDecision::Ready
+            } else {
+                SseProbeDecision::Continue
+            }
+        }
         Some("response.output_item.added") => {
             let item_type = value.pointer("/item/type").and_then(Value::as_str);
             if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
@@ -1431,6 +1717,20 @@ where
                                     .await;
                                 }
                             }
+                        }
+                        if chat_stream_completed(&data) {
+                            send_response_stream_done(
+                                &tx,
+                                &response_id,
+                                &item_id,
+                                &model,
+                                created_at,
+                                &full_text,
+                                &tool_calls,
+                            )
+                            .await;
+                            let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
+                            return;
                         }
                     }
                 }
@@ -1746,6 +2046,7 @@ async fn send_to_provider(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
+    state.remember_keepalive_headers(provider, request_headers);
     let client = state.client_for_provider(provider);
     // Anthropic 渠道：对 chat/completions 走独立协议翻译到 /messages
     if provider.provider_type == "anthropic" && path == "/chat/completions" {
@@ -1765,9 +2066,11 @@ async fn send_to_provider(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // 非 anthropic 且未探测到"不接受注入"时，尝试注入 stream_options.include_usage
+        // stream_options.include_usage 只属于 Chat Completions 协议。
+        // 原生 Responses 流会在 response.completed 中携带 usage，注入该字段会被严格上游以 400 拒绝。
         // 拿最新决定；send_body 里保留原始 body，用于探测失败后回退不注入版本
-        let mut probing = state.should_inject_usage(provider);
+        let mut probing =
+            supports_include_usage_injection(path) && state.should_inject_usage(provider);
         let mut send_body = body.clone();
         if probing {
             inject_include_usage(&mut send_body);
@@ -1814,8 +2117,12 @@ async fn send_to_provider(
                         }
                         Err(err) => return Err(err),
                     };
-                    let (usage_rx, body_stream) =
-                        stream_with_usage_probe(stream, probe_kind, started);
+                    let (usage_rx, body_stream) = stream_with_usage_probe(
+                        stream,
+                        probe_kind,
+                        started,
+                        state.raw_sse_capture_for(provider),
+                    );
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -2027,6 +2334,7 @@ async fn send_responses_stream_as_chat(
     responses_body: Value,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
+    state.remember_keepalive_headers(provider, request_headers);
     let request_model = responses_body
         .get("model")
         .and_then(Value::as_str)
@@ -2122,6 +2430,7 @@ async fn send_chat_via_responses(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
+    state.remember_keepalive_headers(provider, request_headers);
     let client = state.client_for_provider(provider);
     let request_model = body
         .get("model")
@@ -2396,7 +2705,9 @@ fn provider_supports_api(provider: &ProviderConfig, api: &str) -> bool {
                 return true;
             }
             match provider.responses_mode.as_str() {
-                "chat" => supports_chat,
+                // 显式指定 chat 代表用户要求将 Responses 请求转换到
+                // /chat/completions，不应再被过期的 supports_chat:false 提前过滤。
+                "chat" => true,
                 "native" => supports_responses,
                 _ => supports_responses || supports_chat,
             }
@@ -2905,7 +3216,11 @@ fn extract_token_usage(value: &Value) -> TokenUsage {
     }
 }
 
-// OpenAI 兼容渠道默认关闭流式 usage，主动补上 stream_options.include_usage=true
+fn supports_include_usage_injection(path: &str) -> bool {
+    path == "/chat/completions"
+}
+
+// Chat Completions 兼容渠道默认关闭流式 usage，主动补上 stream_options.include_usage=true
 fn inject_include_usage(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -2959,6 +3274,7 @@ fn stream_with_usage_probe<S>(
     stream: S,
     kind: SseProbeKind,
     started: Instant,
+    raw_capture: Option<RawSseCapture>,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
@@ -2976,18 +3292,26 @@ where
         let mut stream_error = None;
         let mut client_disconnected = false;
         let mut first_token_ms = None;
-        while let Some(chunk) = stream.next().await {
+        let mut raw_events = raw_capture
+            .as_ref()
+            .map(|capture| VecDeque::with_capacity(capture.max_events));
+        let mut finish_note = "stream ended".to_string();
+        'upstream: loop {
+            let chunk = stream.next().await;
+            let Some(chunk) = chunk else {
+                finish_note = "upstream closed".to_string();
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
-                    // 先原样转发给客户端
-                    if tx.send(Ok(bytes.clone())).await.is_err() {
-                        // 客户端已断开，停止解析节省上游流量
-                        client_disconnected = true;
-                        break;
-                    }
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
+                        if let (Some(capture), Some(events)) =
+                            (raw_capture.as_ref(), raw_events.as_mut())
+                        {
+                            push_raw_sse_event(Some(capture), Some(events), event.clone());
+                        }
                         if let Some(data) = sse_data(&event) {
                             accumulate_usage_from_sse_data(&data, &mut usage);
                             if sse_stream_completed(kind, &data) {
@@ -3006,9 +3330,21 @@ where
                             }
                         }
                     }
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        // 客户端已断开，停止解析节省上游流量
+                        client_disconnected = true;
+                        break;
+                    }
+                    if completed {
+                        if finish_note == "stream ended" {
+                            finish_note = "completed event observed".to_string();
+                        }
+                        break 'upstream;
+                    }
                 }
                 Err(err) => {
                     let message = err.to_string();
+                    finish_note = format!("stream error: {message}");
                     stream_error = Some(message.clone());
                     let _ = tx.send(Err(io::Error::other(message))).await;
                     break;
@@ -3022,28 +3358,123 @@ where
         } else {
             StreamOutcome::success(usage, first_token_ms)
         };
+        if let (Some(capture), Some(events)) = (raw_capture, raw_events) {
+            write_raw_sse_capture(&capture, kind, &finish_note, usage, first_token_ms, &events);
+        }
         let _ = u_tx.send(outcome);
     });
     (u_rx, ReceiverStream::new(rx))
+}
+
+fn push_raw_sse_event(
+    capture: Option<&RawSseCapture>,
+    events: Option<&mut VecDeque<String>>,
+    event: String,
+) {
+    let (Some(capture), Some(events)) = (capture, events) else {
+        return;
+    };
+    if events.len() >= capture.max_events {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn write_raw_sse_capture(
+    capture: &RawSseCapture,
+    kind: SseProbeKind,
+    finish_note: &str,
+    usage: TokenUsage,
+    first_token_ms: Option<i64>,
+    events: &VecDeque<String>,
+) {
+    let dir = PathBuf::from(&capture.path);
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let file_name = format!(
+        "{}-{}-{}.sse.log",
+        ts,
+        sanitize_file_part(&capture.provider),
+        Uuid::new_v4().simple()
+    );
+    let path = dir.join(file_name);
+    let mut out = String::new();
+    out.push_str("# RouteHub raw SSE capture\n");
+    out.push_str(&format!("provider: {}\n", capture.provider));
+    out.push_str(&format!("kind: {}\n", sse_probe_kind_name(kind)));
+    out.push_str(&format!("finish: {finish_note}\n"));
+    out.push_str(&format!("first_token_ms: {:?}\n", first_token_ms));
+    out.push_str(&format!("usage_input: {}\n", usage.input));
+    out.push_str(&format!("usage_output: {}\n", usage.output));
+    out.push_str(&format!("events_kept: {}\n\n", events.len()));
+    for (idx, event) in events.iter().enumerate() {
+        out.push_str(&format!("----- event {} -----\n", idx + 1));
+        out.push_str(event);
+        if !event.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    let _ = fs::write(path, out);
+}
+
+fn sanitize_file_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sse_probe_kind_name(kind: SseProbeKind) -> &'static str {
+    match kind {
+        SseProbeKind::Chat => "chat",
+        SseProbeKind::Responses => "responses",
+        SseProbeKind::Anthropic => "anthropic",
+    }
 }
 
 fn sse_stream_completed(kind: SseProbeKind, data: &str) -> bool {
     if data.trim() == "[DONE]" {
         return true;
     }
+    if matches!(kind, SseProbeKind::Chat) {
+        return chat_stream_completed(data);
+    }
     if !matches!(kind, SseProbeKind::Responses) {
         return false;
     }
+    matches!(
+        serde_json::from_str::<Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref(),
+        Some("response.completed")
+    )
+}
+
+fn chat_stream_completed(data: &str) -> bool {
     serde_json::from_str::<Value>(data)
         .ok()
         .and_then(|value| {
             value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
+                .pointer("/choices/0/finish_reason")
+                .filter(|reason| !reason.is_null())
+                .cloned()
         })
-        .as_deref()
-        == Some("response.completed")
+        .is_some()
 }
 
 fn sse_stream_error(kind: SseProbeKind, data: &str) -> Option<String> {
@@ -3265,6 +3696,51 @@ fn upstream_headers(
         // extra_headers 已经在前面写入过，这里若客户端也发了同名头则以客户端为准
         // （codex CLI 的头才是校验目标，配置里的静态值只是兜底）
         headers.insert(name.clone(), value.clone());
+    }
+    headers
+}
+
+fn keepalive_safe_headers(request_headers: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in request_headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+
+        if matches!(
+            lower.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "api-key"
+                | "openai-api-key"
+                | "x-api-key"
+                | "x-api-token"
+                | "x-auth-token"
+                | "x-goog-api-key"
+                | "cookie"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "transfer-encoding"
+                | "content-type"
+                | "accept"
+                | "accept-encoding"
+        ) {
+            continue;
+        }
+
+        let prefix_match = lower.starts_with("codex-")
+            || lower.starts_with("openai-")
+            || lower.starts_with("x-codex-")
+            || lower.starts_with("x-openai-")
+            || lower.starts_with("x-stainless-")
+            || lower.starts_with("chatgpt-");
+        let exact_match = matches!(
+            lower.as_str(),
+            "user-agent" | "x-request-id" | "originator" | "session_id" | "conversation_id"
+        );
+
+        if prefix_match || exact_match {
+            headers.insert(name.clone(), value.clone());
+        }
     }
     headers
 }
@@ -3703,6 +4179,7 @@ mod tests {
             ))),
             clients: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3777,6 +4254,108 @@ mod tests {
 
         assert!(!provider_prefers_chat_responses(&stale_capability));
         assert!(provider_prefers_chat_responses(&forced_chat));
+    }
+
+    #[test]
+    fn include_usage_injection_is_limited_to_chat_completions() {
+        assert!(supports_include_usage_injection("/chat/completions"));
+        assert!(!supports_include_usage_injection("/responses"));
+        assert!(!supports_include_usage_injection("/completions"));
+    }
+
+    #[test]
+    fn keepalive_applies_model_mapping_and_uses_responses_when_chat_is_unsupported() {
+        let mut p = provider(
+            "openai",
+            "auto",
+            json!({"supports_chat": false, "supports_responses": true}),
+        );
+        p.model_mapping
+            .insert("gpt-5.5".to_string(), "gpt-5.6-sol".to_string());
+
+        let (path, body) = build_keepalive_request(&p, "gpt-5.5", "Hi").unwrap();
+
+        assert_eq!(path, "/responses");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Hi")
+        );
+    }
+
+    #[test]
+    fn keepalive_auto_uses_chat_when_provider_supports_both_apis() {
+        let p = provider(
+            "openai",
+            "auto",
+            json!({"supports_chat": true, "supports_responses": true}),
+        );
+
+        let (path, _) = build_keepalive_request(&p, "gpt-test", "Hi").unwrap();
+
+        assert_eq!(path, "/chat/completions");
+    }
+
+    #[test]
+    fn keepalive_headers_include_codex_session_markers() {
+        let headers = keepalive_request_headers();
+
+        assert!(headers.contains_key("x-request-id"));
+        assert!(headers.contains_key("session_id"));
+        assert!(headers.contains_key("conversation_id"));
+        assert!(headers.contains_key("openai-client"));
+    }
+
+    #[test]
+    fn keepalive_safe_headers_preserve_codex_markers_without_auth() {
+        let mut input = HeaderMap::new();
+        insert_header(&mut input, "authorization", "Bearer local");
+        insert_header(&mut input, "session_id", "session-1");
+        insert_header(&mut input, "conversation_id", "conversation-1");
+        insert_header(&mut input, "x-stainless-runtime", "rust");
+
+        let headers = keepalive_safe_headers(&input);
+
+        assert!(!headers.contains_key("authorization"));
+        assert_eq!(
+            headers
+                .get("session_id")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-1")
+        );
+        assert!(headers.contains_key("conversation_id"));
+        assert!(headers.contains_key("x-stainless-runtime"));
+        assert!(has_codex_session_headers(&headers));
+    }
+
+    #[test]
+    fn codex_responses_keepalive_waits_for_real_client_headers() {
+        let mut p = provider(
+            "openai",
+            "auto",
+            json!({"supports_chat": false, "supports_responses": true}),
+        );
+        p.models.push("gpt-5-codex".to_string());
+        p.extra_headers
+            .insert("originator".to_string(), "codex_cli_rs".to_string());
+
+        assert!(provider_keepalive_requires_client_headers(&p));
+    }
+
+    #[test]
+    fn explicit_chat_mode_is_not_filtered_by_stale_chat_capability() {
+        let explicit_chat = provider(
+            "openai",
+            "chat",
+            json!({"supports_chat": false, "supports_responses": false}),
+        );
+
+        assert!(provider_supports_api(&explicit_chat, "responses"));
+        assert!(!provider_supports_api(&explicit_chat, "chat"));
     }
 
     #[test]
@@ -4072,7 +4651,7 @@ mod tests {
         let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
         let (rx, mut body_stream) =
-            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
         while let Some(chunk) = body_stream.next().await {
             chunk.unwrap();
         }
@@ -4092,7 +4671,7 @@ mod tests {
         let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
         let (rx, mut body_stream) =
-            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
         while let Some(chunk) = body_stream.next().await {
             chunk.unwrap();
         }
@@ -4117,7 +4696,7 @@ mod tests {
         let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
         let (rx, mut body_stream) =
-            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now());
+            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
         while let Some(chunk) = body_stream.next().await {
             chunk.unwrap();
         }
@@ -4126,6 +4705,182 @@ mod tests {
         assert!(outcome.error.is_none());
         assert_eq!(outcome.usage.input, 11);
         assert_eq!(outcome.usage.output, 7);
+    }
+
+    #[tokio::test]
+    async fn responses_stream_closes_after_completed_event_even_if_upstream_stays_open() {
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"status": "completed"}
+        });
+        let bytes = Bytes::from(format!("data: {completed}\n\n"));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) })
+            .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+        assert!(body_stream.next().await.is_some());
+        let ended = tokio::time::timeout(Duration::from_millis(100), body_stream.next())
+            .await
+            .expect("下游流应在 response.completed 后立即结束");
+        assert!(ended.is_none());
+
+        let outcome = rx.await.unwrap();
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_does_not_synthesize_completed_from_output_item_done_tail() {
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 123,
+                "status": "in_progress",
+                "background": false,
+                "completed_at": null,
+                "error": null,
+                "incomplete_details": null,
+                "model": "gpt-5.5",
+                "output": [],
+                "output_text": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            },
+            "sequence_number": 1
+        });
+        let reasoning_done = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "rs_test",
+                "type": "reasoning",
+                "content": [],
+                "encrypted_content": "abc"
+            },
+            "sequence_number": 4
+        });
+        let text_delta = json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_test",
+            "content_index": 0,
+            "delta": "你"
+        });
+        let message_done = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "msg_test",
+                "type": "message",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "你好"}],
+                "phase": "final_answer",
+                "role": "assistant"
+            },
+            "sequence_number": 10
+        });
+        let bytes = Bytes::from(format!(
+            "data: {created}\n\ndata: {reasoning_done}\n\ndata: {text_delta}\n\ndata: {message_done}\n\n"
+        ));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) });
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+        let mut body = String::new();
+        while let Some(chunk) = body_stream.next().await {
+            body.push_str(&String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+        }
+
+        let outcome = rx.await.unwrap();
+        assert!(body.contains("response.output_item.done"));
+        assert!(!body.contains("event: response.completed"));
+        assert!(!body.contains("[DONE]"));
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("上游流在完成事件前断开"));
+        assert!(outcome.first_token_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_waits_for_native_completed_after_commentary_tool_call() {
+        let commentary_text_done = json!({
+            "type": "response.output_text.done",
+            "item_id": "msg_commentary",
+            "text": "正在检查",
+            "sequence_number": 5
+        });
+        let commentary_done = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "msg_commentary",
+                "type": "message",
+                "status": "completed",
+                "phase": "commentary",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "正在检查"}]
+            },
+            "sequence_number": 6
+        });
+        let tool_added = json!({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "ctc_test",
+                "type": "custom_tool_call",
+                "status": "in_progress",
+                "call_id": "call_test",
+                "name": "exec"
+            },
+            "sequence_number": 7
+        });
+        let tool_done = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "ctc_test",
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": "call_test",
+                "name": "exec",
+                "input": "{}"
+            },
+            "sequence_number": 8
+        });
+        let first = Bytes::from(format!(
+            "data: {commentary_text_done}\n\ndata: {commentary_done}\n\ndata: {tool_added}\n\ndata: {tool_done}\n\n"
+        ));
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 17, "output_tokens": 3, "total_tokens": 20}
+            },
+            "sequence_number": 9
+        });
+        let delayed_completed = futures_util::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<Bytes, io::Error>(Bytes::from(format!("data: {completed}\n\n")))
+        });
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(first) })
+            .chain(delayed_completed)
+            .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+
+        let (rx, mut body_stream) =
+            stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+        let mut body = String::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(1), body_stream.next())
+            .await
+            .expect("工具调用结束后应继续等待上游原生 response.completed")
+        {
+            body.push_str(&String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+        }
+
+        let outcome = rx.await.unwrap();
+        assert_eq!(body.matches("\"type\":\"response.completed\"").count(), 1);
+        assert!(body.contains("response.output_item.done"));
+        assert!(!body.contains("event: response.completed"));
+        assert_eq!(outcome.usage.input, 17);
+        assert_eq!(outcome.usage.output, 3);
+        assert!(outcome.error.is_none());
     }
 
     #[tokio::test]
@@ -4144,7 +4899,7 @@ mod tests {
         let stream = apply_stream_watchdog(stream, 0, 1, "test");
 
         let (rx, mut body_stream) =
-            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now());
+            stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
         while let Some(chunk) = body_stream.next().await {
             let _ = chunk;
         }
