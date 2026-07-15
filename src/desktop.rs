@@ -60,7 +60,6 @@ struct TextDraft {
     source: String,
 }
 
-#[derive(Default)]
 struct LogViewState {
     rows: Vec<LogRow>,
     loaded_path: String,
@@ -68,6 +67,21 @@ struct LogViewState {
     total: usize,
     last_refresh: Option<Instant>,
     totals: LogTotals,
+    live: bool,
+}
+
+impl Default for LogViewState {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            loaded_path: String::new(),
+            page: 0,
+            total: 0,
+            last_refresh: None,
+            totals: LogTotals::default(),
+            live: true,
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1058,10 +1072,11 @@ fn logs_section(
     if log_view.loaded_path != source_key {
         log_view.page = 0;
         refresh_logs(config, log_view, Some(message));
-    } else if log_view
-        .last_refresh
-        .map(|t| t.elapsed() >= std::time::Duration::from_secs(3))
-        .unwrap_or(true)
+    } else if log_view.live
+        && log_view
+            .last_refresh
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+            .unwrap_or(true)
     {
         // 定时静默刷新：保留当前分页与状态栏消息
         refresh_logs(config, log_view, None);
@@ -1072,6 +1087,11 @@ fn logs_section(
             if soft_button(ui, "刷新").clicked() {
                 refresh_logs(config, log_view, Some(message));
             }
+            switch(ui, &mut log_view.live).on_hover_text("自动刷新请求日志");
+            ui.label(
+                egui::RichText::new(if log_view.live { "实时" } else { "已暂停" })
+                    .color(if log_view.live { good() } else { muteds() }),
+            );
             if soft_button(ui, "清空").clicked() {
                 match clear_logs(config) {
                     Ok(()) => {
@@ -1158,8 +1178,7 @@ fn logs_section(
                                 table_header(ui, "渠道");
                                 table_header(ui, "模型");
                                 table_header(ui, "Token");
-                                table_header(ui, "首字(秒)");
-                                table_header(ui, "总耗时(秒)");
+                                table_header(ui, "用时/首字(秒)");
                                 table_header(ui, "错误");
                                 ui.end_row();
 
@@ -1170,8 +1189,11 @@ fn logs_section(
                                     ui.label(&row.channel);
                                     model_cell(ui, row);
                                     ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
-                                    ui.label(&row.first_token);
-                                    ui.label(&row.latency);
+                                    ui.label(format!(
+                                        "{}/{}",
+                                        row.display_latency(),
+                                        row.first_token
+                                    ));
                                     ui.label(egui::RichText::new(&row.error).color(muteds()));
                                     ui.end_row();
                                 }
@@ -1359,6 +1381,21 @@ struct LogRow {
     error: String,
 }
 
+impl LogRow {
+    fn display_latency(&self) -> String {
+        if self.status != "running" {
+            return self.latency.clone();
+        }
+        chrono::NaiveDateTime::parse_from_str(&self.ts, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|started| {
+                let elapsed = chrono::Local::now().naive_local() - started;
+                format!("{:.2}", elapsed.num_milliseconds().max(0) as f64 / 1000.0)
+            })
+            .unwrap_or_else(|| self.latency.clone())
+    }
+}
+
 fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
     ui.vertical(|ui| {
         ui.label(&row.model);
@@ -1392,14 +1429,16 @@ fn forward_arrow(ui: &mut egui::Ui) {
 }
 
 fn status_text(status: &str) -> egui::RichText {
-    let color = if status == "ok" || status == "stream_started" {
-        good()
+    let (label, color) = if status == "running" {
+        ("运行中", accent())
+    } else if status == "ok" || status == "stream_started" {
+        ("成功", good())
     } else if status == "-" || status == "raw" {
-        muteds()
+        (status, muteds())
     } else {
-        egui::Color32::from_rgb(176, 54, 64)
+        ("失败", egui::Color32::from_rgb(176, 54, 64))
     };
-    egui::RichText::new(status).strong().color(color)
+    egui::RichText::new(label).strong().color(color)
 }
 
 fn provider_section(

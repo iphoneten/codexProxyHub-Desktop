@@ -3499,7 +3499,7 @@ fn sse_stream_error(kind: SseProbeKind, data: &str) -> Option<String> {
     )
 }
 
-// 若结果自带 usage 通道，则延迟到流结束再写日志；否则按同步 usage 立即落库
+// 流式请求先写入 running 记录，流结束后原地更新，日志页可以实时看到进行中的请求。
 fn commit_result(
     cfg: Arc<AppConfig>,
     api: &str,
@@ -3510,6 +3510,8 @@ fn commit_result(
     stream: bool,
 ) -> Response {
     if let Some(rx) = result.usage_rx.take() {
+        let log_id =
+            log_stream_started(&cfg, api, provider, model, &result.upstream_model, started);
         let api = api.to_string();
         let provider = provider.to_string();
         let model = model.to_string();
@@ -3520,45 +3522,58 @@ fn commit_result(
                     usage: _,
                     first_token_ms,
                     error: Some(error),
-                }) => {
-                    log_error(
-                        &cfg,
-                        &api,
-                        &provider,
-                        &model,
-                        started,
+                }) => finalize_stream_log(
+                    &cfg,
+                    log_id,
+                    started,
+                    UsageLogEvent {
+                        api: &api,
+                        provider: &provider,
+                        model: &model,
+                        upstream_model: &upstream_model,
+                        status: "error",
+                        error: Some(&error),
+                        usage: TokenUsage::default(),
                         first_token_ms,
-                        &error,
-                    );
-                }
+                        token_source: None,
+                    },
+                ),
                 Ok(StreamOutcome {
                     usage,
                     first_token_ms,
                     error: None,
-                }) => {
-                    log_success(
-                        &cfg,
-                        &api,
-                        &provider,
-                        &model,
-                        &upstream_model,
+                }) => finalize_stream_log(
+                    &cfg,
+                    log_id,
+                    started,
+                    UsageLogEvent {
+                        api: &api,
+                        provider: &provider,
+                        model: &model,
+                        upstream_model: &upstream_model,
+                        status: "ok",
+                        error: None,
                         usage,
-                        started,
                         first_token_ms,
-                        false,
-                    );
-                }
-                Err(_) => {
-                    log_error(
-                        &cfg,
-                        &api,
-                        &provider,
-                        &model,
-                        started,
-                        None,
-                        "流式结果状态通道异常关闭",
-                    );
-                }
+                        token_source: None,
+                    },
+                ),
+                Err(_) => finalize_stream_log(
+                    &cfg,
+                    log_id,
+                    started,
+                    UsageLogEvent {
+                        api: &api,
+                        provider: &provider,
+                        model: &model,
+                        upstream_model: &upstream_model,
+                        status: "error",
+                        error: Some("流式结果状态通道异常关闭"),
+                        usage: TokenUsage::default(),
+                        first_token_ms: None,
+                        token_source: None,
+                    },
+                ),
             }
         });
     } else {
@@ -4016,6 +4031,65 @@ fn log_error(
     );
 }
 
+fn log_stream_started(
+    config: &AppConfig,
+    api: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    started: Instant,
+) -> Option<i64> {
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    log_usage_sqlite(
+        config.usage_log_sqlite_path(),
+        &ts,
+        api,
+        "running",
+        provider,
+        model,
+        upstream_model,
+        started.elapsed().as_millis() as i64,
+        None,
+        "",
+        0,
+        0,
+        "upstream_or_unknown",
+    )
+    .ok()
+}
+
+fn update_usage_log(
+    config: &AppConfig,
+    id: i64,
+    started: Instant,
+    event: &UsageLogEvent<'_>,
+) -> bool {
+    update_usage_log_sqlite(
+        config.usage_log_sqlite_path(),
+        id,
+        event.status,
+        event.upstream_model,
+        started.elapsed().as_millis() as i64,
+        event.first_token_ms,
+        event.error.unwrap_or(""),
+        event.usage.input,
+        event.usage.output,
+        event.token_source.unwrap_or("upstream_or_unknown"),
+    )
+    .is_ok_and(|updated| updated > 0)
+}
+
+fn finalize_stream_log(
+    config: &AppConfig,
+    log_id: Option<i64>,
+    started: Instant,
+    event: UsageLogEvent<'_>,
+) {
+    if !log_id.is_some_and(|id| update_usage_log(config, id, started, &event)) {
+        log_usage(config, started, event);
+    }
+}
+
 fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEvent<'_>) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let latency_ms = started.elapsed().as_millis() as i64;
@@ -4054,7 +4128,7 @@ fn log_usage_sqlite(
     input_tokens: i64,
     output_tokens: i64,
     token_source: &str,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<i64> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -4085,7 +4159,43 @@ fn log_usage_sqlite(
             token_source
         ],
     )?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_usage_log_sqlite(
+    path: PathBuf,
+    id: i64,
+    status: &str,
+    upstream_model: &str,
+    latency_ms: i64,
+    first_token_ms: Option<i64>,
+    error: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    token_source: &str,
+) -> rusqlite::Result<usize> {
+    let conn = Connection::open(path)?;
+    ensure_usage_log_schema(&conn)?;
+    conn.execute(
+        r#"
+        UPDATE usage_logs
+        SET status = ?1, upstream_model = ?2, latency_ms = ?3, first_token_ms = ?4,
+            input_tokens = ?5, output_tokens = ?6, error = ?7, token_source = ?8
+        WHERE id = ?9
+        "#,
+        params![
+            status,
+            upstream_model,
+            latency_ms,
+            first_token_ms,
+            input_tokens,
+            output_tokens,
+            error,
+            token_source,
+            id
+        ],
+    )
 }
 
 pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -4953,6 +5063,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(row, (Some(1_234), 197_320, 142_286, 793));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_stream_log_updates_running_row_in_place() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-live-log-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+        let id = log_usage_sqlite(
+            path.clone(),
+            "2026-07-15 12:00:00",
+            "responses",
+            "running",
+            "test-provider",
+            "gpt-test",
+            "gpt-upstream",
+            0,
+            None,
+            "",
+            0,
+            0,
+            "upstream_or_unknown",
+        )
+        .unwrap();
+
+        let updated = update_usage_log_sqlite(
+            path.clone(),
+            id,
+            "ok",
+            "gpt-upstream",
+            12_345,
+            Some(456),
+            "",
+            321,
+            45,
+            "upstream_or_unknown",
+        )
+        .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT COUNT(*), status, latency_ms, first_token_ms, input_tokens, output_tokens FROM usage_logs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated, 1);
+        assert_eq!(row, (1, "ok".to_string(), 12_345, Some(456), 321, 45));
+        drop(conn);
         let _ = fs::remove_file(path);
     }
 
