@@ -464,7 +464,18 @@ async fn send_provider_keepalive(
         })?;
 
     let client = state.client_for_provider(provider);
-    let _ = send_json_to_provider(&client, provider, path, &request_headers, body).await?;
+    let _ = if is_google_native_provider(provider) {
+        send_json_to_provider_with_headers(
+            &client,
+            provider,
+            &path,
+            google_ai_headers(provider, &request_headers, false),
+            body,
+        )
+        .await?
+    } else {
+        send_json_to_provider(&client, provider, &path, &request_headers, body).await?
+    };
     Ok(())
 }
 
@@ -472,7 +483,7 @@ fn build_keepalive_request(
     provider: &ProviderConfig,
     model: &str,
     prompt: &str,
-) -> Result<(&'static str, Value), ProxyError> {
+) -> Result<(String, Value), ProxyError> {
     if provider.provider_type == "anthropic" {
         let mut body = json!({
             "model": model,
@@ -484,7 +495,29 @@ fn build_keepalive_request(
         let body = crate::anthropic::openai_to_anthropic_request(&body).map_err(|err| {
             ProxyError::new(StatusCode::BAD_REQUEST, format!("保活请求翻译失败: {err}"))
         })?;
-        return Ok(("/messages", body));
+        return Ok(("/messages".to_string(), body));
+    }
+
+    if is_google_native_provider(provider) {
+        let mut body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1,
+            "stream": false
+        });
+        apply_model_mapping(provider, &mut body);
+        let request_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(model)
+            .to_string();
+        let body = crate::google_ai::openai_to_google_request(&body).map_err(|err| {
+            ProxyError::new(StatusCode::BAD_REQUEST, format!("保活请求翻译失败: {err}"))
+        })?;
+        return Ok((
+            crate::google_ai::generate_content_path(&request_model, false),
+            body,
+        ));
     }
 
     if provider_keepalive_prefers_responses(provider) {
@@ -499,7 +532,7 @@ fn build_keepalive_request(
                 ProxyError::new(StatusCode::BAD_REQUEST, format!("保活请求翻译失败: {err}"))
             })?;
         apply_model_mapping(provider, &mut body);
-        return Ok(("/responses", body));
+        return Ok(("/responses".to_string(), body));
     }
 
     let mut body = json!({
@@ -509,7 +542,7 @@ fn build_keepalive_request(
         "stream": false
     });
     apply_model_mapping(provider, &mut body);
-    Ok(("/chat/completions", body))
+    Ok(("/chat/completions".to_string(), body))
 }
 
 fn keepalive_request_headers() -> HeaderMap {
@@ -825,7 +858,10 @@ async fn responses(
             &failure.message,
             &api_key_name,
         );
-        return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
+        return Err(ProxyError::new(
+            final_failover_status(failure.status),
+            failure.message,
+        ));
     }
 
     Err(ProxyError::new(
@@ -837,7 +873,18 @@ async fn responses(
 fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool {
     provider.responses_mode == "chat"
         || provider.provider_type == "anthropic"
+        || is_google_native_provider(provider)
         || is_google_openai_endpoint(&provider.base_url)
+}
+
+fn final_failover_status(status: StatusCode) -> StatusCode {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::REQUEST_TIMEOUT
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => status,
+        _ => StatusCode::BAD_GATEWAY,
+    }
 }
 
 async fn forward_openai(
@@ -958,7 +1005,10 @@ async fn forward_openai(
             &failure.message,
             &api_key_name,
         );
-        return Err(ProxyError::new(StatusCode::BAD_GATEWAY, failure.message));
+        return Err(ProxyError::new(
+            final_failover_status(failure.status),
+            failure.message,
+        ));
     }
 
     Err(ProxyError::new(
@@ -996,30 +1046,34 @@ async fn forward_responses_as_chat(
         .await;
     }
 
-    let upstream = if provider.provider_type == "anthropic" {
-        let result = send_to_provider(
-            state,
-            provider,
-            "/chat/completions",
-            headers,
-            chat_body,
-            false,
-            started,
-        )
-        .await?;
-        response_json(result.response).await?
-    } else {
-        let client = state.client_for_provider(provider);
-        let value =
-            send_json_to_provider(&client, provider, "/chat/completions", headers, chat_body)
-                .await?;
-        // send_json_to_provider 只做 HTTP 层错误处理，这里作为 chat 语义调用者要自己校验结构
-        // 因为该函数被复用在多种 path，不能在里面按 path 分支校验
-        if let Err(msg) = validate_upstream_chat_json(&value) {
-            return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
-        }
-        value
-    };
+    let mut upstream =
+        if provider.provider_type == "anthropic" || is_google_native_provider(provider) {
+            let result = send_to_provider(
+                state,
+                provider,
+                "/chat/completions",
+                headers,
+                chat_body,
+                false,
+                started,
+            )
+            .await?;
+            response_json(result.response).await?
+        } else {
+            let client = state.client_for_provider(provider);
+            let value =
+                send_json_to_provider(&client, provider, "/chat/completions", headers, chat_body)
+                    .await?;
+            // send_json_to_provider 只做 HTTP 层错误处理，这里作为 chat 语义调用者要自己校验结构
+            // 因为该函数被复用在多种 path，不能在里面按 path 分支校验
+            if let Err(msg) = validate_upstream_chat_json(&value) {
+                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
+            }
+            value
+        };
+    if provider.strip_thought {
+        strip_thought_from_chat_json(&mut upstream);
+    }
     let wrapped = chat_to_response(
         upstream,
         body.get("model")
@@ -1066,6 +1120,24 @@ async fn send_chat_stream_as_responses(
     custom_tool_names: HashSet<String>,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
+    if is_google_native_provider(provider) {
+        let result = send_to_provider(
+            state,
+            provider,
+            "/chat/completions",
+            request_headers,
+            body,
+            true,
+            started,
+        )
+        .await?;
+        let stream = result
+            .response
+            .into_body()
+            .into_data_stream()
+            .map(|item| item.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
+        return chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started);
+    }
     if provider.provider_type == "anthropic" {
         let client = state.client_for_provider(provider);
         return send_anthropic_chat_stream_as_responses(
@@ -1103,7 +1175,13 @@ async fn send_chat_stream_as_responses(
                         format!("{} body={}", msg, clean_upstream_error(&text)),
                     ));
                 }
-                return chat_stream_to_responses(resp, request_model, custom_tool_names, started);
+                return chat_stream_to_responses(
+                    resp,
+                    request_model,
+                    custom_tool_names,
+                    started,
+                    provider.strip_thought,
+                );
             }
             Ok(resp) => {
                 let status =
@@ -1225,10 +1303,16 @@ fn chat_stream_to_responses(
     request_model: String,
     custom_tool_names: HashSet<String>,
     started: Instant,
+    strip_thought: bool,
 ) -> Result<ProviderResult, ProxyError> {
     let stream = resp
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+    let stream: ProxyByteStream = if strip_thought {
+        Box::pin(strip_thought_from_chat_sse_stream(stream))
+    } else {
+        Box::pin(stream)
+    };
     chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started)
 }
 
@@ -2130,6 +2214,239 @@ fn chat_stream_delta(data: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[derive(Default)]
+struct ThoughtStripper {
+    inside: bool,
+    pending: String,
+}
+
+impl ThoughtStripper {
+    fn push(&mut self, text: &str) -> String {
+        const OPEN: &str = "<thought>";
+        const CLOSE: &str = "</thought>";
+        self.pending.push_str(text);
+        let mut out = String::new();
+        loop {
+            if self.inside {
+                if let Some(idx) = self.pending.find(CLOSE) {
+                    self.pending.drain(..idx + CLOSE.len());
+                    self.inside = false;
+                    continue;
+                }
+                self.pending.clear();
+                break;
+            }
+            if let Some(idx) = self.pending.find(OPEN) {
+                out.push_str(&self.pending[..idx]);
+                self.pending.drain(..idx + OPEN.len());
+                self.inside = true;
+                continue;
+            }
+            let keep = thought_open_prefix_suffix_len(&self.pending);
+            let emit_len = self.pending.len().saturating_sub(keep);
+            if emit_len > 0 {
+                out.push_str(&self.pending[..emit_len]);
+                self.pending.drain(..emit_len);
+            }
+            break;
+        }
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside {
+            self.pending.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn thought_open_prefix_suffix_len(text: &str) -> usize {
+    const OPEN: &str = "<thought>";
+    (1..OPEN.len())
+        .rev()
+        .find(|len| text.ends_with(&OPEN[..*len]))
+        .unwrap_or(0)
+}
+
+fn strip_thought_text(text: &str) -> String {
+    let mut stripper = ThoughtStripper::default();
+    let mut out = stripper.push(text);
+    out.push_str(&stripper.finish());
+    out.trim_start().to_string()
+}
+
+fn strip_thought_from_chat_json(value: &mut Value) {
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        if let Some(content) = choice.pointer_mut("/message/content") {
+            strip_thought_from_content_value(content);
+        }
+        if let Some(content) = choice.pointer_mut("/delta/content") {
+            strip_thought_from_content_value(content);
+        }
+        if let Some(text_value) = choice.get_mut("text") {
+            if let Some(text) = text_value.as_str() {
+                *text_value = Value::String(strip_thought_text(text));
+            }
+        }
+    }
+}
+
+fn strip_thought_from_content_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = strip_thought_text(text);
+        }
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(text_value) = part.get_mut("text") {
+                    if let Some(text) = text_value.as_str() {
+                        *text_value = Value::String(strip_thought_text(text));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_thought_from_chat_sse_stream<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>>
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let mut stream = Box::pin(stream);
+        let mut buffer = String::new();
+        let mut stripper = ThoughtStripper::default();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some((event, consumed)) = next_sse_event(&buffer) {
+                        buffer.drain(..consumed);
+                        let Some(data) = sse_data(&event) else {
+                            if tx
+                                .send(Ok(Bytes::from(format!("{event}\n\n"))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+                        if data.trim() == "[DONE]" {
+                            let tail = stripper.finish();
+                            if !tail.is_empty() {
+                                let value = json!({
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": tail},
+                                        "finish_reason": null
+                                    }]
+                                });
+                                if send_chat_data_sse(&tx, &value).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if tx
+                                .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+                            if tx
+                                .send(Ok(Bytes::from(format!("{event}\n\n"))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        };
+                        strip_thought_from_chat_stream_value(&mut value, &mut stripper);
+                        if chat_stream_value_is_empty_delta(&value) {
+                            continue;
+                        }
+                        if send_chat_data_sse(&tx, &value).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(buffer))).await;
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
+fn strip_thought_from_chat_stream_value(value: &mut Value, stripper: &mut ThoughtStripper) {
+    let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
+            if let Some(content) = delta.get_mut("content") {
+                if let Some(text) = content.as_str() {
+                    let cleaned = stripper.push(text);
+                    if cleaned.is_empty() {
+                        delta.remove("content");
+                    } else {
+                        *content = Value::String(cleaned);
+                    }
+                }
+            }
+        }
+        if let Some(text_value) = choice.get_mut("text") {
+            if let Some(text) = text_value.as_str() {
+                *text_value = Value::String(stripper.push(text));
+            }
+        }
+    }
+}
+
+fn chat_stream_value_is_empty_delta(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().all(|choice| {
+                let finish_reason = choice.get("finish_reason").is_some_and(|v| !v.is_null());
+                let delta_empty = choice
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .is_none_or(Map::is_empty);
+                let text_empty = choice
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty);
+                !finish_reason && delta_empty && text_empty
+            })
+        })
+}
+
+async fn send_chat_data_sse(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    value: &Value,
+) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    tx.send(Ok(Bytes::from(format!("data: {value}\n\n")))).await
+}
+
 async fn send_to_provider(
     state: &AppState,
     provider: &ProviderConfig,
@@ -2141,6 +2458,19 @@ async fn send_to_provider(
 ) -> Result<ProviderResult, ProxyError> {
     state.remember_keepalive_headers(provider, request_headers);
     let client = state.client_for_provider(provider);
+    // Google AI Studio 原生渠道：OpenAI chat 请求翻译到 GenerateContent。
+    // 如果 base_url 已经是 Google 的 /openai 兼容端点，则仍走普通 OpenAI 兼容路径。
+    if is_google_native_provider(provider) && path == "/chat/completions" {
+        return send_to_google_ai_provider(
+            &client,
+            provider,
+            request_headers,
+            body,
+            stream,
+            started,
+        )
+        .await;
+    }
     // Anthropic 渠道：对 chat/completions 走独立协议翻译到 /messages
     if provider.provider_type == "anthropic" && path == "/chat/completions" {
         return send_to_anthropic_provider(
@@ -2216,6 +2546,12 @@ async fn send_to_provider(
                         started,
                         state.raw_sse_capture_for(provider),
                     );
+                    let body_stream: ProxyByteStream =
+                        if provider.strip_thought && path == "/chat/completions" {
+                            Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                        } else {
+                            Box::pin(body_stream)
+                        };
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -2266,7 +2602,7 @@ async fn send_to_provider(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let value = send_json_to_provider(&client, provider, path, request_headers, body).await?;
+    let mut value = send_json_to_provider(&client, provider, path, request_headers, body).await?;
     // 上游可能返回 HTTP 200 + 假 JSON（rawchat 一类跑路中转站的典型症状）
     // 结构不合规就当作该 provider 失败，抛 502 让上层 failover 到下个渠道
     let validation = match path {
@@ -2277,6 +2613,9 @@ async fn send_to_provider(
     };
     if let Err(msg) = validation {
         return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
+    }
+    if provider.strip_thought && path == "/chat/completions" {
+        strip_thought_from_chat_json(&mut value);
     }
     let upstream_model = response_model(&value).unwrap_or(request_model);
     let usage = extract_token_usage(&value);
@@ -2353,6 +2692,11 @@ async fn send_to_anthropic_provider(
                         }
                         Err(err) => return Err(err),
                     };
+                    let body_stream: ProxyByteStream = if provider.strip_thought {
+                        Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                    } else {
+                        Box::pin(body_stream)
+                    };
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -2376,8 +2720,11 @@ async fn send_to_anthropic_provider(
                 if let Err(msg) = validate_upstream_anthropic_json(&value) {
                     return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
                 }
-                let translated =
+                let mut translated =
                     crate::anthropic::anthropic_to_openai_response(value, &request_model);
+                if provider.strip_thought {
+                    strip_thought_from_chat_json(&mut translated);
+                }
                 let upstream_model = translated
                     .get("model")
                     .and_then(Value::as_str)
@@ -2415,6 +2762,126 @@ async fn send_to_anthropic_provider(
     Err(ProxyError::new(
         StatusCode::BAD_GATEWAY,
         "Anthropic 上游请求失败",
+    ))
+}
+
+// Google AI Studio 原生渠道专用：OpenAI chat 请求翻译到 GenerateContent，响应/流反向翻译回 OpenAI
+async fn send_to_google_ai_provider(
+    client: &Client,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    body: Value,
+    stream: bool,
+    started: Instant,
+) -> Result<ProviderResult, ProxyError> {
+    let request_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let google_body = crate::google_ai::openai_to_google_request(&body)
+        .map_err(|err| ProxyError::new(StatusCode::BAD_REQUEST, format!("协议翻译失败: {err}")))?;
+    let path = crate::google_ai::generate_content_path(&request_model, stream);
+    let url = upstream_url(provider, &path);
+    let req = client
+        .post(url)
+        .headers(google_ai_headers(provider, request_headers, stream))
+        .json(&google_body);
+
+    for attempt in 0..=provider.max_retries {
+        let send_result = if stream {
+            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
+        } else {
+            req.try_clone()
+                .unwrap()
+                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
+                .send()
+                .await
+                .map_err(UpstreamSendError::Request)
+        };
+        match send_result {
+            Ok(resp) if resp.status().is_success() => {
+                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                if stream {
+                    if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(ProxyError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!("{} body={}", msg, clean_upstream_error(&text)),
+                        ));
+                    }
+                    let (usage_rx, body_stream) = crate::google_ai::spawn_stream_translator(
+                        resp.bytes_stream(),
+                        request_model.clone(),
+                        started,
+                    );
+                    let body_stream: ProxyByteStream = if provider.strip_thought {
+                        Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                    } else {
+                        Box::pin(body_stream)
+                    };
+                    let response = Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(Body::from_stream(body_stream))
+                        .map_err(|e| ProxyError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    return Ok(ProviderResult {
+                        response,
+                        upstream_model: request_model,
+                        usage: TokenUsage::default(),
+                        usage_rx: Some(usage_rx),
+                    });
+                }
+                let value = resp.json::<Value>().await.map_err(|e| {
+                    ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Google AI JSON 解析失败: {e}"),
+                    )
+                })?;
+                if value.get("candidates").is_none() {
+                    return Err(ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "Google AI 响应缺少 candidates",
+                    ));
+                }
+                let mut translated =
+                    crate::google_ai::google_to_openai_response(value, &request_model);
+                if provider.strip_thought {
+                    strip_thought_from_chat_json(&mut translated);
+                }
+                let usage = extract_token_usage(&translated);
+                return Ok(ProviderResult {
+                    response: (StatusCode::OK, Json(translated)).into_response(),
+                    upstream_model: request_model,
+                    usage,
+                    usage_rx: None,
+                });
+            }
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let retry_after = parse_retry_after(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                if attempt < provider.max_retries && retryable_status(status) {
+                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    continue;
+                }
+                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+            }
+            Err(err) if attempt < provider.max_retries => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                if err.retryable() {
+                    continue;
+                }
+                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            }
+            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+        }
+    }
+    Err(ProxyError::new(
+        StatusCode::BAD_GATEWAY,
+        "Google AI 上游请求失败",
     ))
 }
 
@@ -2617,12 +3084,29 @@ async fn send_json_to_provider(
     request_headers: &HeaderMap,
     body: Value,
 ) -> Result<Value, ProxyError> {
+    send_json_to_provider_with_headers(
+        client,
+        provider,
+        path,
+        upstream_headers(provider, request_headers, false),
+        body,
+    )
+    .await
+}
+
+async fn send_json_to_provider_with_headers(
+    client: &Client,
+    provider: &ProviderConfig,
+    path: &str,
+    headers: HeaderMap,
+    body: Value,
+) -> Result<Value, ProxyError> {
     let url = upstream_url(provider, path);
     for attempt in 0..=provider.max_retries {
         let result = client
             .post(url.clone())
             .timeout(Duration::from_secs(provider.request_timeout.max(1)))
-            .headers(upstream_headers(provider, request_headers, false))
+            .headers(headers.clone())
             .json(&body)
             .send()
             .await;
@@ -3741,6 +4225,61 @@ fn upstream_url(provider: &ProviderConfig, path: &str) -> String {
     format!("{}{}", provider.base_url.trim_end_matches('/'), path)
 }
 
+fn is_google_native_provider(provider: &ProviderConfig) -> bool {
+    provider.provider_type == "google_ai_studio" && !is_google_openai_endpoint(&provider.base_url)
+}
+
+fn google_ai_headers(
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    stream: bool,
+) -> HeaderMap {
+    let mut headers = keepalive_safe_headers(request_headers);
+    if let Ok(value) = HeaderValue::from_str(&provider.api_key) {
+        headers.insert("x-goog-api-key", value);
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static(if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }),
+    );
+    if stream {
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
+    for (name, value) in &provider.extra_headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "authorization"
+                | "content-type"
+                | "accept"
+                | "host"
+                | "content-length"
+                | "x-api-key"
+                | "x-goog-api-key"
+        ) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
 fn upstream_headers(
     provider: &ProviderConfig,
     request_headers: &HeaderMap,
@@ -4496,6 +5035,41 @@ mod tests {
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[test]
+    fn strip_thought_removes_non_stream_chat_content() {
+        let mut value = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<thought>internal notes</thought>你好"
+                }
+            }]
+        });
+        strip_thought_from_chat_json(&mut value);
+        assert_eq!(value["choices"][0]["message"]["content"], "你好");
+    }
+
+    #[tokio::test]
+    async fn strip_thought_handles_stream_tags_across_chunks() {
+        let first = r#"data: {"choices":[{"index":0,"delta":{"content":"<thou"}}]}"#;
+        let second =
+            r#"data: {"choices":[{"index":0,"delta":{"content":"ght>hidden</thought>你好"}}]}"#;
+        let done = "data: [DONE]";
+        let stream = futures_util::stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from(format!("{first}\n\n"))),
+            Ok::<Bytes, io::Error>(Bytes::from(format!("{second}\n\n{done}\n\n"))),
+        ]);
+        let mut stream = Box::pin(strip_thought_from_chat_sse_stream(stream));
+        let mut out = String::new();
+        while let Some(chunk) = stream.next().await {
+            out.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert!(!out.contains("<thought>"));
+        assert!(!out.contains("hidden"));
+        assert!(out.contains("你好"));
+        assert!(out.contains("[DONE]"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 mod anthropic;
 mod config;
 mod desktop;
+mod google_ai;
 #[cfg(target_os = "macos")]
 mod macos_tray;
 mod proxy;

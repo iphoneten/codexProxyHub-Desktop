@@ -1989,6 +1989,10 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         request = request
             .header("x-api-key", &provider.api_key)
             .header("anthropic-version", "2023-06-01");
+    } else if provider.provider_type == "google_ai_studio"
+        && !crate::proxy::is_google_openai_endpoint(&provider.base_url)
+    {
+        request = request.header("x-goog-api-key", &provider.api_key);
     } else {
         request = request.bearer_auth(&provider.api_key);
     }
@@ -1996,7 +2000,13 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "authorization" | "content-type" | "accept" | "host" | "content-length" | "x-api-key"
+            "authorization"
+                | "content-type"
+                | "accept"
+                | "host"
+                | "content-length"
+                | "x-api-key"
+                | "x-goog-api-key"
         ) {
             continue;
         }
@@ -2030,7 +2040,7 @@ fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String
                     .or_else(|| item.get("name"))
                     .and_then(|value| value.as_str())
             }) {
-                push_unique(&mut models, id);
+                push_unique(&mut models, id.trim_start_matches("models/"));
             }
         }
     }

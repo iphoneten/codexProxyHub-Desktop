@@ -19,4 +19,15 @@ usage_log:
 # debug_capture_sse: true
 # debug_sse_path: logs/raw_sse
 # debug_sse_max_events: 120
+# Google AI Studio 原生 API 示例：
+# - name: google-ai
+#   enabled: true
+#   provider_type: google_ai_studio
+#   base_url: https://generativelanguage.googleapis.com/v1beta
+#   api_key: YOUR_GOOGLE_AI_STUDIO_KEY
+#   models: [gemini-2.5-pro, gemini-2.5-flash]
+#   capabilities:
+#     supports_chat: true
+#     supports_responses: false
+#   responses_mode: chat
 providers: []
