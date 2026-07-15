@@ -4,8 +4,19 @@ use crate::{
 };
 use eframe::egui;
 use parking_lot::{Mutex, RwLock};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{runtime::Runtime, sync::oneshot};
+
+mod analytics;
+mod assets;
+
+use analytics::{overview_analytics_section, OverviewAnalyticsState};
+use assets::AnimatedGif;
 
 #[cfg(target_os = "macos")]
 use crate::macos_tray::{activate_app, app_is_active, MacosTray, TrayAction};
@@ -23,7 +34,9 @@ pub struct HubApp {
     provider_header_drafts: Vec<TextDraft>,
     routing_drafts: Vec<RoutingDraft>,
     routing_drafts_source: String,
+    loading_gif: Option<AnimatedGif>,
     log_view: LogViewState,
+    overview_analytics: OverviewAnalyticsState,
     // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
     config_handle: Option<ConfigHandle>,
     keepalive_status: Option<proxy::KeepaliveStatusHandle>,
@@ -53,6 +66,7 @@ struct ServerHandle {
     endpoint: String,
     shutdown: Option<oneshot::Sender<()>>,
     last_error: Option<String>,
+    started_at: Option<Instant>,
 }
 
 #[derive(Default, Clone)]
@@ -115,7 +129,13 @@ impl HubApp {
             provider_header_drafts: Vec::new(),
             routing_drafts: Vec::new(),
             routing_drafts_source: String::new(),
+            loading_gif: AnimatedGif::load(
+                &cc.egui_ctx,
+                "loading",
+                include_bytes!("../assets/loading.gif"),
+            ),
             log_view: LogViewState::default(),
+            overview_analytics: OverviewAnalyticsState::default(),
             config_handle: None,
             keepalive_status: None,
             #[cfg(target_os = "macos")]
@@ -153,6 +173,7 @@ impl HubApp {
                 self.routing_drafts.clear();
                 self.routing_drafts_source.clear();
                 self.log_view = LogViewState::default();
+                self.overview_analytics = OverviewAnalyticsState::default();
                 self.message = err.to_string();
             }
         }
@@ -166,6 +187,7 @@ impl HubApp {
         self.routing_drafts.clear();
         self.routing_drafts_source.clear();
         self.log_view = LogViewState::default();
+        self.overview_analytics = OverviewAnalyticsState::default();
     }
 
     fn save_config(&mut self) {
@@ -248,6 +270,7 @@ impl HubApp {
             server.endpoint = endpoint.clone();
             server.shutdown = Some(tx);
             server.last_error = None;
+            server.started_at = Some(Instant::now());
         }
         // 建立配置句柄：UI 与运行中的 server 共享同一 Arc<RwLock<Arc<AppConfig>>>
         let handle: ConfigHandle = Arc::new(RwLock::new(Arc::new(config)));
@@ -260,6 +283,7 @@ impl HubApp {
             let mut server = server_state.lock();
             server.running = false;
             server.shutdown = None;
+            server.started_at = None;
             if let Err(err) = result {
                 server.last_error = Some(err.to_string());
             }
@@ -272,6 +296,7 @@ impl HubApp {
         if let Some(tx) = server.shutdown.take() {
             let _ = tx.send(());
             server.running = false;
+            server.started_at = None;
             self.message = "正在停止代理".to_string();
             drop(server);
             self.config_handle = None;
@@ -381,7 +406,7 @@ impl eframe::App for HubApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if self.view == AppView::About {
-                                about_section(ui, &self.config_path, &self.server.lock());
+                                about_section(ui, &self.server.lock());
                                 return;
                             }
 
@@ -399,6 +424,12 @@ impl eframe::App for HubApp {
                             match self.view {
                                 AppView::Overview => {
                                     server_section(ui, config);
+                                    ui.add_space(12.0);
+                                    overview_analytics_section(
+                                        ui,
+                                        config,
+                                        &mut self.overview_analytics,
+                                    );
                                     ui.add_space(12.0);
                                     provider_summary_section(
                                         ui,
@@ -423,16 +454,25 @@ impl eframe::App for HubApp {
                                     &mut self.routing_drafts,
                                     &mut self.routing_drafts_source,
                                 ),
-                                AppView::Logs => {
-                                    logs_section(ui, config, &mut self.log_view, &mut self.message)
-                                }
+                                AppView::Logs => logs_section(
+                                    ui,
+                                    config,
+                                    &mut self.log_view,
+                                    &mut self.message,
+                                    self.loading_gif.as_ref(),
+                                ),
                                 AppView::About => {}
                             }
                         });
                 });
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let repaint_ms = if self.log_view.rows.iter().any(|row| row.status == "running") {
+            100
+        } else {
+            500
+        };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
 }
 
@@ -653,6 +693,14 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, color:
         });
 }
 
+fn loading_icon(ui: &mut egui::Ui, loading_gif: Option<&AnimatedGif>, size: egui::Vec2) {
+    if let Some(gif) = loading_gif {
+        ui.add(egui::Image::new(gif.texture()).fit_to_exact_size(size));
+    } else {
+        metric_icon(ui, good());
+    }
+}
+
 fn metric_icon(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.5, color);
@@ -675,7 +723,18 @@ fn provider_summary_section(
                 table_header(ui, "优先级");
                 table_header(ui, "模型");
                 ui.end_row();
-                for (idx, provider) in config.providers.iter_mut().enumerate() {
+                let mut ordered: Vec<usize> = (0..config.providers.len()).collect();
+                ordered.sort_by(|left, right| {
+                    let a = &config.providers[*left];
+                    let b = &config.providers[*right];
+                    b.enabled
+                        .cmp(&a.enabled)
+                        .then_with(|| a.priority.cmp(&b.priority))
+                        .then_with(|| b.weight.cmp(&a.weight))
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                for idx in ordered {
+                    let provider = &mut config.providers[idx];
                     switch(ui, &mut provider.enabled);
                     if ui.link(&provider.name).clicked() {
                         *selected_provider = Some(idx);
@@ -1137,6 +1196,7 @@ fn logs_section(
     config: &AppConfig,
     log_view: &mut LogViewState,
     message: &mut String,
+    loading_gif: Option<&AnimatedGif>,
 ) {
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
@@ -1257,7 +1317,7 @@ fn logs_section(
 
                                 for row in &log_view.rows {
                                     ui.monospace(&row.ts);
-                                    ui.label(status_text(&row.status));
+                                    log_status_cell(ui, &row.status, loading_gif);
                                     ui.label(row.api_key_label());
                                     ui.label(&row.api);
                                     ui.label(&row.channel);
@@ -1486,16 +1546,13 @@ impl LogRow {
 fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
     ui.vertical(|ui| {
         ui.label(&row.model);
-        // 上游模型为空时不渲染 ↳ 那一行，避免冗余
-        if !row.upstream_model.trim().is_empty() {
+        // 上游模型为空或与请求模型一致时不渲染第二行，避免冗余
+        let upstream = row.upstream_model.trim();
+        if !upstream.is_empty() && upstream != row.model.trim() {
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
                 forward_arrow(ui);
-                ui.label(
-                    egui::RichText::new(&row.upstream_model)
-                        .size(11.0)
-                        .color(muteds()),
-                );
+                ui.label(egui::RichText::new(upstream).size(11.0).color(muteds()));
             });
         }
     });
@@ -1526,6 +1583,17 @@ fn status_text(status: &str) -> egui::RichText {
         ("失败", egui::Color32::from_rgb(176, 54, 64))
     };
     egui::RichText::new(label).strong().color(color)
+}
+
+fn log_status_cell(ui: &mut egui::Ui, status: &str, loading_gif: Option<&AnimatedGif>) {
+    if status == "running" {
+        ui.horizontal(|ui| {
+            loading_icon(ui, loading_gif, egui::vec2(14.0, 14.0));
+            ui.label(status_text(status));
+        });
+    } else {
+        ui.label(status_text(status));
+    }
 }
 
 fn provider_section(
@@ -2137,7 +2205,7 @@ fn push_unique(models: &mut Vec<String>, id: &str) {
     }
 }
 
-fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
+fn about_section(ui: &mut egui::Ui, server: &ServerHandle) {
     section(ui, "关于 RouteHub", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -2166,7 +2234,6 @@ fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
 
     section(ui, "运行信息", |ui| {
         about_info_row(ui, "版本", crate::app_version());
-        about_info_row(ui, "配置文件", config_path);
         about_info_row(
             ui,
             "代理状态",
@@ -2178,6 +2245,9 @@ fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
         );
         if server.running {
             about_info_row(ui, "本地接口", &server.endpoint);
+            if let Some(started_at) = server.started_at {
+                about_info_row(ui, "运行时长", &format_duration(started_at.elapsed()));
+            }
         }
     });
 
@@ -2190,11 +2260,21 @@ fn about_section(ui: &mut egui::Ui, config_path: &str, server: &ServerHandle) {
             if soft_button(ui, "复制仓库地址").clicked() {
                 ui.output_mut(|output| output.copied_text = repository.to_string());
             }
-            if soft_button(ui, "复制配置路径").clicked() {
-                ui.output_mut(|output| output.copied_text = config_path.to_string());
-            }
         });
     });
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let total = duration.as_secs();
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}天 {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
 }
 
 fn about_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
