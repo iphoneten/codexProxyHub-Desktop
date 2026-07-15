@@ -4,7 +4,7 @@ use crate::{
 };
 use eframe::egui;
 use parking_lot::{Mutex, RwLock};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{runtime::Runtime, sync::oneshot};
 
 #[cfg(target_os = "macos")]
@@ -21,6 +21,8 @@ pub struct HubApp {
     new_key_name: String,
     provider_mapping_drafts: Vec<TextDraft>,
     provider_header_drafts: Vec<TextDraft>,
+    routing_drafts: Vec<RoutingDraft>,
+    routing_drafts_source: String,
     log_view: LogViewState,
     // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
     config_handle: Option<ConfigHandle>,
@@ -57,6 +59,12 @@ struct ServerHandle {
 struct TextDraft {
     text: String,
     source: String,
+}
+
+#[derive(Default, Clone)]
+struct RoutingDraft {
+    key: String,
+    value: String,
 }
 
 struct LogViewState {
@@ -105,6 +113,8 @@ impl HubApp {
             new_key_name: String::new(),
             provider_mapping_drafts: Vec::new(),
             provider_header_drafts: Vec::new(),
+            routing_drafts: Vec::new(),
+            routing_drafts_source: String::new(),
             log_view: LogViewState::default(),
             config_handle: None,
             keepalive_status: None,
@@ -140,6 +150,8 @@ impl HubApp {
                 self.config = None;
                 self.provider_mapping_drafts.clear();
                 self.provider_header_drafts.clear();
+                self.routing_drafts.clear();
+                self.routing_drafts_source.clear();
                 self.log_view = LogViewState::default();
                 self.message = err.to_string();
             }
@@ -151,6 +163,8 @@ impl HubApp {
         self.selected_provider = Some(0);
         self.provider_mapping_drafts.clear();
         self.provider_header_drafts.clear();
+        self.routing_drafts.clear();
+        self.routing_drafts_source.clear();
         self.log_view = LogViewState::default();
     }
 
@@ -403,7 +417,12 @@ impl eframe::App for HubApp {
                                     self.keepalive_status.as_ref(),
                                 ),
                                 AppView::Auth => auth_section(ui, config, &mut self.new_key_name),
-                                AppView::Routing => routing_section(ui, config),
+                                AppView::Routing => routing_section(
+                                    ui,
+                                    config,
+                                    &mut self.routing_drafts,
+                                    &mut self.routing_drafts_source,
+                                ),
                                 AppView::Logs => {
                                     logs_section(ui, config, &mut self.log_view, &mut self.message)
                                 }
@@ -1026,52 +1045,91 @@ fn mask_api_key(key: &str) -> String {
     format!("{prefix}****{suffix}")
 }
 
-fn routing_section(ui: &mut egui::Ui, config: &mut AppConfig) {
+fn routing_section(
+    ui: &mut egui::Ui,
+    config: &mut AppConfig,
+    drafts: &mut Vec<RoutingDraft>,
+    drafts_source: &mut String,
+) {
     section(ui, "模型映射", |ui| {
-        if config.routing.model_fallbacks.is_empty() {
+        // 用一个稳定的 Vec 草稿作为编辑源，避免每帧从 HashMap 拷贝造成:
+        //   1. HashMap 遍历顺序不稳，行会跳动
+        //   2. 编辑 key 的中间态和其它行同名，clear+insert 会覆盖掉别的行
+        //   3. 新增行默认 key 与已有 key 冲突时被吞掉
+        // 只有当外部配置指纹变化（导入/重载/删除等）时才从 config 重建草稿。
+        let source = routing_source_signature(&config.routing.model_fallbacks);
+        if drafts.is_empty() && !config.routing.model_fallbacks.is_empty()
+            || *drafts_source != source
+        {
+            *drafts = config
+                .routing
+                .model_fallbacks
+                .iter()
+                .map(|(k, v)| RoutingDraft {
+                    key: k.clone(),
+                    value: v.join(", "),
+                })
+                .collect();
+            drafts.sort_by(|a, b| a.key.cmp(&b.key));
+            *drafts_source = source;
+        }
+
+        if drafts.is_empty() {
             ui.label("未配置映射");
         }
-        // 取出 entries 到 Vec，使两侧均可编辑（HashMap 遍历时无法修改 key）。
-        let mut entries: Vec<(String, Vec<String>)> = config
-            .routing
-            .model_fallbacks
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+
         let mut to_remove: Option<usize> = None;
-        for (idx, (src, dsts)) in entries.iter_mut().enumerate() {
-            let mut dst_text = dsts.join(", ");
+        for (idx, draft) in drafts.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(src);
+                ui.text_edit_singleline(&mut draft.key);
                 ui.label("→");
-                if ui.text_edit_singleline(&mut dst_text).changed() {
-                    *dsts = dst_text
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect();
-                }
+                ui.text_edit_singleline(&mut draft.value);
                 if ui.button("删除").clicked() {
                     to_remove = Some(idx);
                 }
             });
         }
         if let Some(idx) = to_remove {
-            entries.remove(idx);
+            drafts.remove(idx);
         }
         if ui.button("新增映射").clicked() {
-            entries.push(("model-name".to_string(), vec!["target-model".to_string()]));
+            drafts.push(RoutingDraft::default());
         }
-        // 写回 HashMap，空 key 丢弃。
-        config.routing.model_fallbacks.clear();
-        for (k, v) in entries {
-            let key = k.trim().to_string();
-            if !key.is_empty() {
-                config.routing.model_fallbacks.insert(key, v);
+
+        // 把稳定草稿同步回 HashMap：空 key 丢弃，重复 key 保留最后一个。
+        let mut next = HashMap::new();
+        for draft in drafts.iter() {
+            let key = draft.key.trim().to_string();
+            if key.is_empty() {
+                continue;
             }
+            let values: Vec<String> = draft
+                .value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            next.insert(key, values);
+        }
+        if config.routing.model_fallbacks != next {
+            config.routing.model_fallbacks = next;
+            *drafts_source = routing_source_signature(&config.routing.model_fallbacks);
         }
     });
+}
+
+fn routing_source_signature(map: &HashMap<String, Vec<String>>) -> String {
+    let mut items: Vec<(&String, &Vec<String>)> = map.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    let mut buf = String::new();
+    for (k, v) in items {
+        buf.push_str(k);
+        buf.push('=');
+        buf.push_str(&v.join(","));
+        buf.push('\n');
+    }
+    buf
 }
 
 fn logs_section(
