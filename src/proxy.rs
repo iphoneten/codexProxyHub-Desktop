@@ -4574,6 +4574,95 @@ providers: []
         drop(b1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn api_key_concurrent_tasks_respect_max_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        const MAX_CONCURRENCY: usize = 5;
+        const TOTAL_TASKS: usize = 12;
+
+        let state = Arc::new(test_state());
+        let cfg = Arc::new(
+            serde_yaml::from_str::<AppConfig>(&format!(
+                r#"
+auth:
+  enabled: true
+  api_keys:
+    - key: sk-load
+      enabled: true
+      max_concurrency: {MAX_CONCURRENCY}
+providers: []
+"#
+            ))
+            .unwrap(),
+        );
+
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        // 让所有任务同时进入 acquire 阶段，模拟真实并发压力
+        let start = Arc::new(Barrier::new(TOTAL_TASKS));
+
+        let mut joins = Vec::with_capacity(TOTAL_TASKS);
+        for _ in 0..TOTAL_TASKS {
+            let state = Arc::clone(&state);
+            let cfg = Arc::clone(&cfg);
+            let start = Arc::clone(&start);
+            let admitted = Arc::clone(&admitted);
+            let rejected = Arc::clone(&rejected);
+            let peak = Arc::clone(&peak);
+            let active = Arc::clone(&active);
+
+            joins.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, "authorization", "Bearer sk-load");
+                match authorize_and_acquire(&state, &cfg, &headers) {
+                    Ok(access) => {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // 模拟任务在执行，保持 permit 一小段时间
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        drop(access);
+                    }
+                    Err(err) => {
+                        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+                        rejected.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+
+        for join in joins {
+            join.await.unwrap();
+        }
+
+        assert_eq!(admitted.load(Ordering::SeqCst), MAX_CONCURRENCY);
+        assert_eq!(
+            rejected.load(Ordering::SeqCst),
+            TOTAL_TASKS - MAX_CONCURRENCY
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENCY);
+
+        // 所有任务结束后名额应完全释放，可以再次拿满 MAX_CONCURRENCY 个
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, "authorization", "Bearer sk-load");
+        let reacquired = (0..MAX_CONCURRENCY)
+            .map(|_| authorize_and_acquire(&state, &cfg, &headers).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorize_and_acquire(&state, &cfg, &headers)
+                .unwrap_err()
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(reacquired);
+    }
+
     #[test]
     fn upstream_auth_errors_do_not_stop_provider_failover() {
         assert!(!should_stop_failover(StatusCode::UNAUTHORIZED));
