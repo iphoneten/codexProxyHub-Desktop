@@ -21,12 +21,49 @@ use assets::AnimatedGif;
 #[cfg(target_os = "macos")]
 use crate::macos_tray::{activate_app, app_is_active, MacosTray, TrayAction};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MessageKind {
+    Info,
+    Success,
+    Error,
+}
+
+impl Default for MessageKind {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AppMessage {
+    text: String,
+    kind: MessageKind,
+}
+
+impl Default for AppMessage {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            kind: MessageKind::Info,
+        }
+    }
+}
+
+impl AppMessage {
+    fn new(text: impl Into<String>, kind: MessageKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
+
 pub struct HubApp {
     config_path: String,
     config: Option<AppConfig>,
     selected_provider: Option<usize>,
     view: AppView,
-    message: String,
+    message: AppMessage,
     runtime: Option<Runtime>,
     server: Arc<Mutex<ServerHandle>>,
     new_key_name: String,
@@ -57,6 +94,7 @@ enum AppView {
     Auth,
     Routing,
     Logs,
+    Settings,
     About,
 }
 
@@ -121,7 +159,7 @@ impl HubApp {
             config: None,
             selected_provider: None,
             view: AppView::Overview,
-            message: String::new(),
+            message: AppMessage::default(),
             runtime,
             server: Arc::new(Mutex::new(ServerHandle::default())),
             new_key_name: String::new(),
@@ -151,7 +189,7 @@ impl HubApp {
         #[cfg(target_os = "macos")]
         match MacosTray::new(&cc.egui_ctx) {
             Ok(tray) => app.tray = Some(tray),
-            Err(err) => app.message = err,
+            Err(err) => app.message = AppMessage::new(err, MessageKind::Error),
         }
         #[cfg(target_os = "macos")]
         {
@@ -164,7 +202,7 @@ impl HubApp {
         match AppConfig::load(PathBuf::from(self.config_path.trim())) {
             Ok(config) => {
                 self.replace_config(config);
-                self.message = "配置已加载".to_string();
+                self.message = AppMessage::new("配置已加载", MessageKind::Success);
             }
             Err(err) => {
                 self.config = None;
@@ -174,7 +212,7 @@ impl HubApp {
                 self.routing_drafts_source.clear();
                 self.log_view = LogViewState::default();
                 self.overview_analytics = OverviewAnalyticsState::default();
-                self.message = err.to_string();
+                self.message = AppMessage::new(err.to_string(), MessageKind::Error);
             }
         }
     }
@@ -192,12 +230,12 @@ impl HubApp {
 
     fn save_config(&mut self) {
         let Some(config) = self.config.as_ref() else {
-            self.message = "没有可保存的配置".to_string();
+            self.message = AppMessage::new("没有可保存的配置", MessageKind::Error);
             return;
         };
         match config.save(PathBuf::from(self.config_path.trim())) {
-            Ok(()) => self.message = "配置已保存".to_string(),
-            Err(err) => self.message = err.to_string(),
+            Ok(()) => self.message = AppMessage::new("配置已保存", MessageKind::Success),
+            Err(err) => self.message = AppMessage::new(err.to_string(), MessageKind::Error),
         }
     }
 
@@ -212,19 +250,28 @@ impl HubApp {
                 Ok(()) => match AppConfig::load(&target_path) {
                     Ok(config) => {
                         self.replace_config(config);
-                        self.message = format!("配置已导入: {}", source_path.display());
+                        self.message = AppMessage::new(
+                            format!("配置已导入: {}", source_path.display()),
+                            MessageKind::Success,
+                        );
                     }
-                    Err(err) => self.message = err.to_string(),
+                    Err(err) => self.message = AppMessage::new(err.to_string(), MessageKind::Error),
                 },
-                Err(err) => self.message = format!("导入配置写入失败: {err}"),
+                Err(err) => {
+                    self.message =
+                        AppMessage::new(format!("导入配置写入失败: {err}"), MessageKind::Error)
+                }
             },
-            Err(err) => self.message = format!("导入配置无效: {err}"),
+            Err(err) => {
+                self.message =
+                    AppMessage::new(format!("导入配置无效: {err}"), MessageKind::Error)
+            }
         }
     }
 
     fn export_config(&mut self) {
         let Some(config) = self.config.as_ref() else {
-            self.message = "没有可导出的配置".to_string();
+            self.message = AppMessage::new("没有可导出的配置", MessageKind::Error);
             return;
         };
         let Some(target_path) = config_file_dialog(&self.config_path)
@@ -235,26 +282,34 @@ impl HubApp {
         };
 
         match config.save(&target_path) {
-            Ok(()) => self.message = format!("配置已导出: {}", target_path.display()),
-            Err(err) => self.message = format!("导出配置失败: {err}"),
+            Ok(()) => {
+                self.message = AppMessage::new(
+                    format!("配置已导出: {}", target_path.display()),
+                    MessageKind::Success,
+                )
+            }
+            Err(err) => {
+                self.message =
+                    AppMessage::new(format!("导出配置失败: {err}"), MessageKind::Error)
+            }
         }
     }
 
     fn start_server(&mut self) {
         let Some(runtime) = self.runtime.as_ref() else {
-            self.message = "Tokio runtime 初始化失败".to_string();
+            self.message = AppMessage::new("Tokio runtime 初始化失败", MessageKind::Error);
             return;
         };
         if self.server.lock().running {
-            self.message = "代理已经在运行".to_string();
+            self.message = AppMessage::new("代理已经在运行", MessageKind::Error);
             return;
         }
         let Some(config) = self.config.clone() else {
-            self.message = "请先加载配置".to_string();
+            self.message = AppMessage::new("请先加载配置", MessageKind::Error);
             return;
         };
         if let Err(err) = proxy::validate_config(&config) {
-            self.message = err.to_string();
+            self.message = AppMessage::new(err.to_string(), MessageKind::Error);
             return;
         }
 
@@ -288,7 +343,7 @@ impl HubApp {
                 server.last_error = Some(err.to_string());
             }
         });
-        self.message = format!("代理已启动: {}", endpoint);
+        self.message = AppMessage::new(format!("代理已启动: {}", endpoint), MessageKind::Success);
     }
 
     fn stop_server(&mut self) {
@@ -297,12 +352,12 @@ impl HubApp {
             let _ = tx.send(());
             server.running = false;
             server.started_at = None;
-            self.message = "正在停止代理".to_string();
+            self.message = AppMessage::new("正在停止代理", MessageKind::Info);
             drop(server);
             self.config_handle = None;
             self.keepalive_status = None;
         } else {
-            self.message = "代理未运行".to_string();
+            self.message = AppMessage::new("代理未运行", MessageKind::Error);
         }
     }
 
@@ -366,14 +421,14 @@ impl eframe::App for HubApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.window_hidden = true;
-            self.message = "窗口已隐藏，代理继续在状态栏运行".to_string();
+            self.message = AppMessage::new("窗口已隐藏，代理继续在状态栏运行", MessageKind::Info);
         }
 
         #[cfg(target_os = "windows")]
         if ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.message = "窗口已最小化，代理继续运行".to_string();
+            self.message = AppMessage::new("窗口已最小化，代理继续运行", MessageKind::Info);
         }
 
         // 把 UI 修改推送到运行中的代理，确保 provider.enabled 等改动即时生效
@@ -402,29 +457,31 @@ impl eframe::App for HubApp {
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(18.0, 16.0))
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.view == AppView::About {
+                    if self.view == AppView::About {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                                 about_section(ui, &self.server.lock());
-                                return;
-                            }
+                            });
+                        return;
+                    }
 
-                            let Some(config) = self.config.as_mut() else {
-                                empty_state(
-                                    ui,
-                                    "未加载配置",
-                                    "请确认 config.yaml 路径，然后点击重新加载。",
-                                );
-                                return;
-                            };
+                    let Some(config) = self.config.as_mut() else {
+                        empty_state(
+                            ui,
+                            "未加载配置",
+                            "请确认 config.yaml 路径，然后点击重新加载。",
+                        );
+                        return;
+                    };
 
-                            overview_header(ui, config, &self.server.lock());
-                            ui.add_space(14.0);
-                            match self.view {
-                                AppView::Overview => {
-                                    server_section(ui, config);
-                                    ui.add_space(12.0);
+                    match self.view {
+                        AppView::Overview => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    overview_header(ui, config, &self.server.lock());
+                                    ui.add_space(14.0);
                                     overview_analytics_section(
                                         ui,
                                         config,
@@ -437,8 +494,13 @@ impl eframe::App for HubApp {
                                         &mut self.selected_provider,
                                         &mut self.view,
                                     );
-                                }
-                                AppView::Providers => provider_section(
+                                });
+                        }
+                        AppView::Providers => {
+                            ui.vertical(|ui| {
+                                overview_header(ui, config, &self.server.lock());
+                                ui.add_space(14.0);
+                                provider_section(
                                     ui,
                                     config,
                                     &mut self.selected_provider,
@@ -446,24 +508,59 @@ impl eframe::App for HubApp {
                                     &mut self.provider_mapping_drafts,
                                     &mut self.provider_header_drafts,
                                     self.keepalive_status.as_ref(),
-                                ),
-                                AppView::Auth => auth_section(ui, config, &mut self.new_key_name),
-                                AppView::Routing => routing_section(
-                                    ui,
-                                    config,
-                                    &mut self.routing_drafts,
-                                    &mut self.routing_drafts_source,
-                                ),
-                                AppView::Logs => logs_section(
-                                    ui,
-                                    config,
-                                    &mut self.log_view,
-                                    &mut self.message,
-                                    self.loading_gif.as_ref(),
-                                ),
-                                AppView::About => {}
-                            }
-                        });
+                                );
+                            });
+                        }
+                        AppView::Auth => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    overview_header(ui, config, &self.server.lock());
+                                    ui.add_space(14.0);
+                                    auth_section(ui, config, &mut self.new_key_name);
+                                });
+                        }
+                        AppView::Routing => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    overview_header(ui, config, &self.server.lock());
+                                    ui.add_space(14.0);
+                                    routing_section(
+                                        ui,
+                                        config,
+                                        &mut self.routing_drafts,
+                                        &mut self.routing_drafts_source,
+                                    );
+                                });
+                        }
+                        AppView::Logs => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    overview_header(ui, config, &self.server.lock());
+                                    ui.add_space(14.0);
+                                    logs_section(
+                                        ui,
+                                        config,
+                                        &mut self.log_view,
+                                        &mut self.message,
+                                        self.loading_gif.as_ref(),
+                                    );
+                                });
+                        }
+                        AppView::Settings => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    overview_header(ui, config, &self.server.lock());
+                                    ui.add_space(14.0);
+                                    ui.set_max_width(640.0);
+                                    server_section(ui, config);
+                                });
+                        }
+                        AppView::About => {}
+                    }
                 });
         });
 
@@ -504,24 +601,31 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                 let running = app.server.lock().running;
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("⚙ 配置管理", |ui| {
+                        if ui.button("💾 保存配置").clicked() {
+                            app.save_config();
+                            ui.close_menu();
+                        }
+                        if ui.button("🔄 重新加载").clicked() {
+                            app.load_config();
+                            ui.close_menu();
+                        }
+                        if ui.button("📤 导出配置").clicked() {
+                            app.export_config();
+                            ui.close_menu();
+                        }
+                        if ui.button("📥 导入配置").clicked() {
+                            app.import_config();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.add_space(8.0);
                     if running {
                         if danger_button(ui, "停止代理").clicked() {
                             app.stop_server();
                         }
                     } else if primary_button(ui, "启动代理").clicked() {
                         app.start_server();
-                    }
-                    if soft_button(ui, "保存配置").clicked() {
-                        app.save_config();
-                    }
-                    if soft_button(ui, "重新加载").clicked() {
-                        app.load_config();
-                    }
-                    if soft_button(ui, "导出配置").clicked() {
-                        app.export_config();
-                    }
-                    if soft_button(ui, "导入配置").clicked() {
-                        app.import_config();
                     }
                 });
             });
@@ -550,12 +654,17 @@ fn status_bar(ui: &mut egui::Ui, app: &HubApp) {
                         .color(egui::Color32::from_rgb(70, 75, 84)),
                 );
                 ui.separator();
-                let message = if app.message.trim().is_empty() {
+                let text = if app.message.text.trim().is_empty() {
                     "暂无操作"
                 } else {
-                    app.message.as_str()
+                    app.message.text.as_str()
                 };
-                ui.label(egui::RichText::new(message).color(muteds()));
+                let color = match app.message.kind {
+                    MessageKind::Info => muteds(),
+                    MessageKind::Success => good(),
+                    MessageKind::Error => egui::Color32::from_rgb(239, 68, 68),
+                };
+                ui.label(egui::RichText::new(text).color(color));
                 if let Some(err) = app.server.lock().last_error.clone() {
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(176, 54, 64), err);
@@ -577,6 +686,7 @@ fn side_navigation(ui: &mut egui::Ui, app: &mut HubApp) {
             nav_item(ui, &mut next_view, AppView::Auth, "鉴权");
             nav_item(ui, &mut next_view, AppView::Routing, "路由");
             nav_item(ui, &mut next_view, AppView::Logs, "日志");
+            nav_item(ui, &mut next_view, AppView::Settings, "设置");
             nav_item(ui, &mut next_view, AppView::About, "关于");
             ui.add_space(18.0);
             ui.separator();
@@ -736,7 +846,8 @@ fn provider_summary_section(
                 for idx in ordered {
                     let provider = &mut config.providers[idx];
                     switch(ui, &mut provider.enabled);
-                    if ui.link(&provider.name).clicked() {
+                    let link_text = egui::RichText::new(&provider.name).strong().color(accent());
+                    if ui.link(link_text).clicked() {
                         *selected_provider = Some(idx);
                         *view = AppView::Providers;
                     }
@@ -1016,6 +1127,7 @@ fn generate_api_key() -> String {
 
 fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut String) {
     section(ui, "鉴权", |ui| {
+        ui.set_max_width(640.0);
         ui.horizontal(|ui| {
             switch(ui, &mut config.auth.enabled);
             ui.label("启用 API 秘钥鉴权");
@@ -1111,6 +1223,7 @@ fn routing_section(
     drafts_source: &mut String,
 ) {
     section(ui, "模型映射", |ui| {
+        ui.set_max_width(640.0);
         // 用一个稳定的 Vec 草稿作为编辑源，避免每帧从 HashMap 拷贝造成:
         //   1. HashMap 遍历顺序不稳，行会跳动
         //   2. 编辑 key 的中间态和其它行同名，clear+insert 会覆盖掉别的行
@@ -1195,7 +1308,7 @@ fn logs_section(
     ui: &mut egui::Ui,
     config: &AppConfig,
     log_view: &mut LogViewState,
-    message: &mut String,
+    message: &mut AppMessage,
     loading_gif: Option<&AnimatedGif>,
 ) {
     const LOG_PAGE_SIZE: usize = 20;
@@ -1229,9 +1342,9 @@ fn logs_section(
                     Ok(()) => {
                         log_view.page = 0;
                         refresh_logs(config, log_view, None);
-                        *message = "已清空日志".to_string();
+                        *message = AppMessage::new("已清空日志", MessageKind::Success);
                     }
-                    Err(err) => *message = err,
+                    Err(err) => *message = AppMessage::new(err, MessageKind::Error),
                 }
             }
         });
@@ -1337,7 +1450,7 @@ fn logs_section(
     });
 }
 
-fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut String>) {
+fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut AppMessage>) {
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
     log_view.loaded_path = format!("sqlite:{}", path.display());
@@ -1370,7 +1483,8 @@ fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option
     }
     if let Some(msg) = message {
         match note {
-            Ok(text) | Err(text) => *msg = text,
+            Ok(text) => *msg = AppMessage::new(text, MessageKind::Success),
+            Err(text) => *msg = AppMessage::new(text, MessageKind::Error),
         }
     }
 }
@@ -1600,7 +1714,7 @@ fn provider_section(
     ui: &mut egui::Ui,
     config: &mut AppConfig,
     selected: &mut Option<usize>,
-    message: &mut String,
+    message: &mut AppMessage,
     mapping_drafts: &mut Vec<TextDraft>,
     header_drafts: &mut Vec<TextDraft>,
     keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
@@ -1645,14 +1759,19 @@ fn provider_section(
                 }
                 *selected = Some(idx);
                 let provider = &mut config.providers[idx];
-                provider_detail_panel(
-                    ui,
-                    provider,
-                    message,
-                    &mut mapping_drafts[idx],
-                    &mut header_drafts[idx],
-                    keepalive_status,
-                );
+                egui::ScrollArea::vertical()
+                    .id_source("provider_detail_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        provider_detail_panel(
+                            ui,
+                            provider,
+                            message,
+                            &mut mapping_drafts[idx],
+                            &mut header_drafts[idx],
+                            keepalive_status,
+                        );
+                    });
             },
         );
     });
@@ -1743,7 +1862,7 @@ fn provider_list_panel(ui: &mut egui::Ui, config: &mut AppConfig, selected: &mut
 fn provider_detail_panel(
     ui: &mut egui::Ui,
     provider: &mut ProviderConfig,
-    message: &mut String,
+    message: &mut AppMessage,
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
     keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
@@ -1967,11 +2086,16 @@ fn provider_detail_panel(
                         Ok(models) => {
                             let count = models.len();
                             provider.models = models;
-                            *message =
-                                format!("已同步渠道 [{}] 的 {} 个模型", provider.name, count);
+                            *message = AppMessage::new(
+                                format!("已同步渠道 [{}] 的 {} 个模型", provider.name, count),
+                                MessageKind::Success,
+                            );
                         }
                         Err(err) => {
-                            *message = format!("同步渠道 [{}] 模型失败: {err}", provider.name);
+                            *message = AppMessage::new(
+                                format!("同步渠道 [{}] 模型失败: {err}", provider.name),
+                                MessageKind::Error,
+                            );
                         }
                     }
                 }
