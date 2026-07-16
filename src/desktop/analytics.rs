@@ -15,6 +15,26 @@ struct OverviewAnalyticsData {
     totals: LogTotals,
     status_counts: Vec<(String, i64)>,
     channel_counts: Vec<(String, i64)>,
+    api_key_counts: Vec<(String, i64)>,
+    api_key_tokens: Vec<(String, i64)>,
+    channel_usage: HashMap<String, ChannelUsage>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub(super) struct ChannelUsage {
+    pub(super) requests: i64,
+    pub(super) input_tokens: i64,
+    pub(super) output_tokens: i64,
+}
+
+impl OverviewAnalyticsState {
+    pub(super) fn channel_usage(&self, channel: &str) -> ChannelUsage {
+        self.data
+            .channel_usage
+            .get(channel)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 pub(super) fn overview_analytics_section(
@@ -23,7 +43,7 @@ pub(super) fn overview_analytics_section(
     analytics: &mut OverviewAnalyticsState,
 ) {
     refresh_overview_analytics(config, analytics);
-    section(ui, "请求分析", |ui| {
+    section(ui, "统计分析", |ui| {
         if let Some(error) = analytics.error.as_deref() {
             ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(176, 54, 64)));
             return;
@@ -60,13 +80,14 @@ pub(super) fn overview_analytics_section(
         });
         ui.add_space(10.0);
 
-        ui.columns(3, |columns| {
+        ui.columns(5, |columns| {
             analytics_bar_group(
                 &mut columns[0],
                 "状态分布",
                 &analytics.data.status_counts,
                 accent(),
                 |status| status_label(status).to_string(),
+                5,
             );
             analytics_bar_group(
                 &mut columns[1],
@@ -74,6 +95,7 @@ pub(super) fn overview_analytics_section(
                 &analytics.data.channel_counts,
                 good(),
                 |value| value.to_string(),
+                5,
             );
             let token_items = vec![
                 ("输入".to_string(), analytics.data.totals.input_tokens),
@@ -85,6 +107,23 @@ pub(super) fn overview_analytics_section(
                 &token_items,
                 egui::Color32::from_rgb(110, 106, 220),
                 |value| value.to_string(),
+                5,
+            );
+            analytics_bar_group(
+                &mut columns[3],
+                "API Key 请求",
+                &analytics.data.api_key_counts,
+                accent(),
+                |value| value.to_string(),
+                6,
+            );
+            analytics_bar_group(
+                &mut columns[4],
+                "API Key Token",
+                &analytics.data.api_key_tokens,
+                egui::Color32::from_rgb(110, 106, 220),
+                |value| value.to_string(),
+                6,
             );
         });
     });
@@ -110,6 +149,7 @@ fn analytics_bar_group(
     items: &[(String, i64)],
     color: egui::Color32,
     label: impl Fn(&str) -> String,
+    limit: usize,
 ) {
     ui.label(
         egui::RichText::new(title)
@@ -118,7 +158,7 @@ fn analytics_bar_group(
             .color(heading_color()),
     );
     ui.add_space(4.0);
-    let display_items = top_items_with_other(items, 5);
+    let display_items = top_items_with_other(items, limit);
     let max = display_items
         .iter()
         .map(|(_, value)| *value)
@@ -215,6 +255,22 @@ fn read_overview_analytics(path: PathBuf) -> Result<OverviewAnalyticsData, Strin
              ORDER BY COUNT(*) DESC
              LIMIT 8",
         )?,
+        api_key_counts: read_group_counts(
+            &conn,
+            "SELECT COALESCE(NULLIF(api_key_name, ''), '未命名'), COUNT(*)
+             FROM usage_logs
+             GROUP BY COALESCE(NULLIF(api_key_name, ''), '未命名')
+             ORDER BY COUNT(*) DESC",
+        )?,
+        api_key_tokens: read_group_counts(
+            &conn,
+            "SELECT COALESCE(NULLIF(api_key_name, ''), '未命名'),
+                    COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM usage_logs
+             GROUP BY COALESCE(NULLIF(api_key_name, ''), '未命名')
+             ORDER BY COALESCE(SUM(input_tokens + output_tokens), 0) DESC",
+        )?,
+        channel_usage: read_channel_usage(&conn)?,
     })
 }
 
@@ -226,6 +282,35 @@ fn read_group_counts(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<(Stri
         })
         .map_err(|err| err.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+fn read_channel_usage(
+    conn: &rusqlite::Connection,
+) -> Result<HashMap<String, ChannelUsage>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT channel, COUNT(*),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0)
+             FROM usage_logs
+             WHERE channel != ''
+             GROUP BY channel",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ChannelUsage {
+                    requests: row.get::<_, i64>(1)?,
+                    input_tokens: row.get::<_, i64>(2)?,
+                    output_tokens: row.get::<_, i64>(3)?,
+                },
+            ))
+        })
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
         .map_err(|err| err.to_string())
 }
 

@@ -262,8 +262,7 @@ impl HubApp {
                 }
             },
             Err(err) => {
-                self.message =
-                    AppMessage::new(format!("导入配置无效: {err}"), MessageKind::Error)
+                self.message = AppMessage::new(format!("导入配置无效: {err}"), MessageKind::Error)
             }
         }
     }
@@ -288,8 +287,7 @@ impl HubApp {
                 )
             }
             Err(err) => {
-                self.message =
-                    AppMessage::new(format!("导出配置失败: {err}"), MessageKind::Error)
+                self.message = AppMessage::new(format!("导出配置失败: {err}"), MessageKind::Error)
             }
         }
     }
@@ -490,6 +488,7 @@ impl eframe::App for HubApp {
                                         config,
                                         &mut self.selected_provider,
                                         &mut self.view,
+                                        &self.overview_analytics,
                                     );
                                 });
                         }
@@ -581,7 +580,12 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
 
                 if let Some(ref config) = app.config {
                     let enabled_providers = config.providers.iter().filter(|p| p.enabled).count();
-                    let model_count = config.providers.iter().filter(|p| p.enabled).map(|p| p.models.len()).sum::<usize>();
+                    let model_count = config
+                        .providers
+                        .iter()
+                        .filter(|p| p.enabled)
+                        .map(|p| p.models.len())
+                        .sum::<usize>();
                     let (auth_status, auth_color) = if config.auth.enabled {
                         ("开启", good())
                     } else {
@@ -591,7 +595,12 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                     ui.add_space(16.0);
                     metric_badge(ui, "启用渠道", &enabled_providers.to_string(), accent());
                     ui.add_space(8.0);
-                    metric_badge(ui, "模型数量", &model_count.to_string(), egui::Color32::from_rgb(110, 106, 220));
+                    metric_badge(
+                        ui,
+                        "模型数量",
+                        &model_count.to_string(),
+                        egui::Color32::from_rgb(110, 106, 220),
+                    );
                     ui.add_space(8.0);
                     metric_badge(ui, "安全鉴权", auth_status, auth_color);
                 }
@@ -717,8 +726,6 @@ fn nav_item(ui: &mut egui::Ui, view: &mut AppView, target: AppView, title: &str)
     ui.add_space(4.0);
 }
 
-
-
 fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, color: egui::Color32) {
     egui::Frame::none()
         .fill(surface())
@@ -750,8 +757,17 @@ fn metric_badge(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color3
             ui.set_min_width(110.0);
             ui.horizontal(|ui| {
                 metric_icon(ui, color);
-                ui.label(egui::RichText::new(format!("{}:", label)).size(12.0).color(muteds()));
-                ui.label(egui::RichText::new(value).size(12.0).strong().color(stat_color()));
+                ui.label(
+                    egui::RichText::new(format!("{}:", label))
+                        .size(12.0)
+                        .color(muteds()),
+                );
+                ui.label(
+                    egui::RichText::new(value)
+                        .size(12.0)
+                        .strong()
+                        .color(stat_color()),
+                );
             });
         });
 }
@@ -774,6 +790,7 @@ fn provider_summary_section(
     config: &mut AppConfig,
     selected_provider: &mut Option<usize>,
     view: &mut AppView,
+    analytics: &OverviewAnalyticsState,
 ) {
     section(ui, "渠道概览", |ui| {
         egui::Grid::new("provider_summary")
@@ -785,6 +802,8 @@ fn provider_summary_section(
                 table_header(ui, "类型");
                 table_header(ui, "优先级");
                 table_header(ui, "模型");
+                table_header(ui, "请求");
+                table_header(ui, "Token");
                 ui.end_row();
                 let mut ordered: Vec<usize> = (0..config.providers.len()).collect();
                 ordered.sort_by(|left, right| {
@@ -825,6 +844,11 @@ fn provider_summary_section(
                         egui::Color32::from_rgb(248, 250, 252),
                         text_color(),
                     );
+                    let usage = analytics.channel_usage(&provider.name);
+                    ui.label(format_compact_tokens(usage.requests));
+                    ui.label(format_compact_tokens(
+                        usage.input_tokens + usage.output_tokens,
+                    ));
                     ui.end_row();
                 }
             });
@@ -1204,9 +1228,19 @@ fn routing_section(
             ui.label("未配置映射");
         } else {
             ui.horizontal(|ui| {
-                ui.add_sized(egui::vec2(180.0, 20.0), egui::Label::new(egui::RichText::new("源模型").small().color(muteds())));
+                ui.add_sized(
+                    egui::vec2(180.0, 20.0),
+                    egui::Label::new(egui::RichText::new("源模型").small().color(muteds())),
+                );
                 ui.add_space(20.0);
-                ui.add_sized(egui::vec2(260.0, 20.0), egui::Label::new(egui::RichText::new("映射后模型 (逗号分隔)").small().color(muteds())));
+                ui.add_sized(
+                    egui::vec2(260.0, 20.0),
+                    egui::Label::new(
+                        egui::RichText::new("映射后模型 (逗号分隔)")
+                            .small()
+                            .color(muteds()),
+                    ),
+                );
             });
         }
 
@@ -1372,37 +1406,33 @@ fn logs_section(
                 egui::Grid::new("usage_logs")
                     .striped(true)
                     .min_col_width(80.0)
-                            .show(ui, |ui| {
-                                table_header(ui, "时间");
-                                table_header(ui, "状态");
-                                table_header(ui, "API Key");
-                                table_header(ui, "接口");
-                                table_header(ui, "渠道");
-                                table_header(ui, "模型");
-                                table_header(ui, "Token");
-                                table_header(ui, "用时/首字(秒)");
-                                table_header(ui, "错误");
-                                ui.end_row();
+                    .show(ui, |ui| {
+                        table_header(ui, "时间");
+                        table_header(ui, "状态");
+                        table_header(ui, "API Key");
+                        table_header(ui, "接口");
+                        table_header(ui, "渠道");
+                        table_header(ui, "模型");
+                        table_header(ui, "Token");
+                        table_header(ui, "用时/首字(秒)");
+                        table_header(ui, "错误");
+                        ui.end_row();
 
-                                for row in &log_view.rows {
-                                    ui.monospace(&row.ts);
-                                    log_status_cell(ui, &row.status, loading_gif);
-                                    ui.label(row.api_key_label());
-                                    ui.label(&row.api);
-                                    ui.label(&row.channel);
-                                    model_cell(ui, row);
-                                    ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
-                                    ui.label(format!(
-                                        "{}/{}",
-                                        row.display_latency(),
-                                        row.first_token
-                                    ));
-                                    ui.label(egui::RichText::new(&row.error).color(muteds()));
-                                    ui.end_row();
-                                }
-                            });
+                        for row in &log_view.rows {
+                            ui.monospace(&row.ts);
+                            log_status_cell(ui, &row.status, loading_gif);
+                            ui.label(row.api_key_label());
+                            ui.label(&row.api);
+                            ui.label(&row.channel);
+                            model_cell(ui, row);
+                            ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
+                            ui.label(format!("{}/{}", row.display_latency(), row.first_token));
+                            ui.label(egui::RichText::new(&row.error).color(muteds()));
+                            ui.end_row();
+                        }
                     });
             });
+    });
 }
 
 fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut AppMessage>) {
@@ -2368,7 +2398,7 @@ fn about_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let width = ui.available_width().min(600.0);
+    let width = ui.available_width();
     ui.allocate_ui_with_layout(
         egui::vec2(width, 0.0),
         egui::Layout::top_down(egui::Align::Min),
