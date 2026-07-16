@@ -5,7 +5,7 @@ use crate::{
 use eframe::egui;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -580,12 +580,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
 
                 if let Some(ref config) = app.config {
                     let enabled_providers = config.providers.iter().filter(|p| p.enabled).count();
-                    let model_count = config
-                        .providers
-                        .iter()
-                        .filter(|p| p.enabled)
-                        .map(|p| p.models.len())
-                        .sum::<usize>();
+                    let model_count = unique_model_count(config);
                     let (auth_status, auth_color) = if config.auth.enabled {
                         ("开启", good())
                     } else {
@@ -2454,6 +2449,20 @@ fn display_host(host: &str) -> &str {
     } else {
         host
     }
+}
+
+fn unique_model_count(config: &AppConfig) -> usize {
+    let mut models = HashSet::new();
+    for provider in config.providers.iter().filter(|provider| provider.enabled) {
+        for model in &provider.models {
+            models.insert(model.trim().to_string());
+        }
+        for model in provider.model_mapping.keys() {
+            models.insert(model.trim().to_string());
+        }
+    }
+    models.remove("");
+    models.len()
 }
 
 fn default_provider() -> ProviderConfig {

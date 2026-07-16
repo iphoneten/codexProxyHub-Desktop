@@ -594,12 +594,10 @@ fn provider_keepalive_prefers_responses(provider: &ProviderConfig) -> bool {
         || (provider.responses_mode == "auto" && supports_responses && !supports_chat)
 }
 
-async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    let cfg = state.snapshot();
+async fn index(State(_state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "name": "RouteHub",
         "ok": true,
-        "base_url": format!("http://{}:{}/v1", display_host(&cfg.server.host), cfg.server.port),
         "endpoints": [
             "/health",
             "/v1/models",
@@ -4637,14 +4635,6 @@ pub(crate) fn validate_upstream_sse_content_type(
             "上游流式响应 Content-Type 异常（疑似假响应）: {}",
             truncate(&value)
         ))
-    }
-}
-
-fn display_host(host: &str) -> &str {
-    if host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        host
     }
 }
 
