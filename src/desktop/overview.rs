@@ -1,12 +1,12 @@
-use crate::config::AppConfig;
-use crate::proxy;
-use eframe::egui;
-use std::time::Instant;
 use super::analytics::OverviewAnalyticsState;
 use super::common::{
     accent, badge, format_compact_tokens, good, muteds, section, switch, table_header, text_color,
 };
 use super::AppView;
+use crate::config::AppConfig;
+use crate::proxy;
+use eframe::egui;
+use std::time::Instant;
 
 pub fn provider_summary_section(
     ui: &mut egui::Ui,
@@ -44,13 +44,15 @@ pub fn provider_summary_section(
                     let provider = &mut config.providers[idx];
                     switch(ui, &mut provider.enabled);
                     let name_color = if provider.enabled { accent() } else { muteds() };
-                    let link_text = egui::RichText::new(&provider.name).strong().color(name_color);
+                    let link_text = egui::RichText::new(&provider.name)
+                        .strong()
+                        .color(name_color);
                     if ui.link(link_text).clicked() {
                         *selected_provider = Some(idx);
                         *view = AppView::Providers;
                     }
                     ui.label(&provider.provider_type);
-                    provider_runtime_badge(ui, circuit_status, &provider.name);
+                    provider_runtime_badge(ui, provider.enabled, circuit_status, &provider.name);
                     ui.horizontal(|ui| {
                         badge(
                             ui,
@@ -84,9 +86,20 @@ pub fn provider_summary_section(
 
 fn provider_runtime_badge(
     ui: &mut egui::Ui,
+    provider_enabled: bool,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
     provider_name: &str,
 ) {
+    if !provider_enabled {
+        badge(
+            ui,
+            "未启用",
+            egui::Color32::from_rgb(248, 250, 252),
+            muteds(),
+        );
+        return;
+    }
+
     let Some(status_handle) = circuit_status else {
         badge(
             ui,
