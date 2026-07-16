@@ -35,7 +35,18 @@ use uuid::Uuid;
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
-#[derive(Clone, Default)]
+const PROVIDER_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
+const PROVIDER_CIRCUIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderCircuitStatus {
+    #[default]
+    Healthy,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct KeepaliveStatus {
     pub last_attempt: Option<String>,
     pub last_success: Option<String>,
@@ -43,6 +54,226 @@ pub struct KeepaliveStatus {
 }
 
 pub type KeepaliveStatusHandle = Arc<RwLock<HashMap<String, KeepaliveStatus>>>;
+
+#[derive(Clone, Debug, Default)]
+pub struct ProviderCircuitSnapshot {
+    pub status: ProviderCircuitStatus,
+    pub failures: usize,
+    pub inflight: usize,
+    pub open_until: Option<Instant>,
+    pub last_error: Option<String>,
+}
+
+pub type ProviderCircuitStatusHandle = Arc<RwLock<HashMap<String, ProviderCircuitSnapshot>>>;
+
+#[derive(Clone, Debug)]
+enum ProviderCircuitPhase {
+    Closed,
+    Open { until: Instant },
+    HalfOpen { probe_in_flight: bool },
+}
+
+#[derive(Clone, Debug)]
+struct ProviderCircuit {
+    phase: ProviderCircuitPhase,
+    consecutive_failures: usize,
+    last_error: Option<String>,
+    last_changed: Instant,
+}
+
+impl Default for ProviderCircuit {
+    fn default() -> Self {
+        Self {
+            phase: ProviderCircuitPhase::Closed,
+            consecutive_failures: 0,
+            last_error: None,
+            last_changed: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProviderCircuitGuard {
+    provider: String,
+    circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
+    statuses: ProviderCircuitStatusHandle,
+    inflight: Arc<AtomicUsize>,
+    half_open_probe: bool,
+    completed: bool,
+}
+
+impl ProviderCircuitGuard {
+    fn mark_success(mut self) {
+        let mut circuits = self.circuits.lock();
+        let circuit = circuits.entry(self.provider.clone()).or_default();
+        if !self.half_open_probe
+            && matches!(
+                circuit.phase,
+                ProviderCircuitPhase::Open { .. } | ProviderCircuitPhase::HalfOpen { .. }
+            )
+        {
+            self.completed = true;
+            return;
+        }
+        circuits.insert(
+            self.provider.clone(),
+            ProviderCircuit {
+                phase: ProviderCircuitPhase::Closed,
+                consecutive_failures: 0,
+                last_error: None,
+                last_changed: Instant::now(),
+            },
+        );
+        drop(circuits);
+        let mut statuses = self.statuses.write();
+        let status = statuses.entry(self.provider.clone()).or_default();
+        status.status = ProviderCircuitStatus::Healthy;
+        status.failures = 0;
+        status.open_until = None;
+        status.last_error = None;
+        self.completed = true;
+    }
+
+    fn mark_failure(mut self, status: StatusCode, message: &str, retry_after: Option<Duration>) {
+        if !circuit_breaker_failure(status) {
+            self.mark_success();
+            return;
+        }
+
+        let mut circuits = self.circuits.lock();
+        let circuit = circuits.entry(self.provider.clone()).or_default();
+        circuit.last_error = Some(message.to_string());
+        circuit.last_changed = Instant::now();
+
+        if !self.half_open_probe {
+            match circuit.phase.clone() {
+                ProviderCircuitPhase::Open { until } => {
+                    circuit.consecutive_failures += 1;
+                    let until = if status == StatusCode::TOO_MANY_REQUESTS {
+                        until.max(
+                            Instant::now()
+                                + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN),
+                        )
+                    } else {
+                        until
+                    };
+                    circuit.phase = ProviderCircuitPhase::Open { until };
+                    let failures = circuit.consecutive_failures;
+                    drop(circuits);
+                    self.update_failure_status(
+                        ProviderCircuitStatus::Open,
+                        failures,
+                        Some(until),
+                        message,
+                    );
+                    self.completed = true;
+                    return;
+                }
+                ProviderCircuitPhase::HalfOpen { .. } => {
+                    circuit.consecutive_failures += 1;
+                    let failures = circuit.consecutive_failures;
+                    drop(circuits);
+                    self.update_failure_status(
+                        ProviderCircuitStatus::HalfOpen,
+                        failures,
+                        None,
+                        message,
+                    );
+                    self.completed = true;
+                    return;
+                }
+                ProviderCircuitPhase::Closed => {}
+            }
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            circuit.consecutive_failures += 1;
+            let until = Instant::now() + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN);
+            circuit.phase = ProviderCircuitPhase::Open { until };
+            let failures = circuit.consecutive_failures;
+            drop(circuits);
+            self.update_failure_status(ProviderCircuitStatus::Open, failures, Some(until), message);
+            self.completed = true;
+            return;
+        }
+
+        circuit.consecutive_failures += 1;
+        let opened = matches!(circuit.phase, ProviderCircuitPhase::HalfOpen { .. })
+            || circuit.consecutive_failures >= PROVIDER_CIRCUIT_FAILURE_THRESHOLD;
+        let until = opened.then(|| Instant::now() + PROVIDER_CIRCUIT_DEFAULT_COOLDOWN);
+        if let Some(until) = until {
+            circuit.phase = ProviderCircuitPhase::Open { until };
+        } else {
+            circuit.phase = ProviderCircuitPhase::Closed;
+        }
+        let failures = circuit.consecutive_failures;
+        drop(circuits);
+        self.update_failure_status(
+            if opened {
+                ProviderCircuitStatus::Open
+            } else {
+                ProviderCircuitStatus::Healthy
+            },
+            failures,
+            until,
+            message,
+        );
+        self.completed = true;
+    }
+
+    fn update_failure_status(
+        &self,
+        circuit_status: ProviderCircuitStatus,
+        failures: usize,
+        open_until: Option<Instant>,
+        message: &str,
+    ) {
+        let mut statuses = self.statuses.write();
+        let status = statuses.entry(self.provider.clone()).or_default();
+        status.status = circuit_status;
+        status.failures = failures;
+        status.open_until = open_until;
+        status.last_error = Some(message.to_string());
+    }
+}
+
+impl Drop for ProviderCircuitGuard {
+    fn drop(&mut self) {
+        if !self.completed && self.half_open_probe {
+            let until = Instant::now() + PROVIDER_CIRCUIT_DEFAULT_COOLDOWN;
+            let failures = {
+                let mut circuits = self.circuits.lock();
+                let circuit = circuits.entry(self.provider.clone()).or_default();
+                circuit.phase = ProviderCircuitPhase::Open { until };
+                circuit.last_error = Some("半开探测请求中断".to_string());
+                circuit.last_changed = Instant::now();
+                circuit.consecutive_failures = circuit
+                    .consecutive_failures
+                    .max(PROVIDER_CIRCUIT_FAILURE_THRESHOLD);
+                circuit.consecutive_failures
+            };
+            self.update_failure_status(
+                ProviderCircuitStatus::Open,
+                failures,
+                Some(until),
+                "半开探测请求中断",
+            );
+        }
+
+        let remaining = self.inflight.fetch_sub(1, Ordering::AcqRel) - 1;
+        let mut statuses = self.statuses.write();
+        statuses.entry(self.provider.clone()).or_default().inflight = remaining;
+    }
+}
+
+fn circuit_breaker_failure(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+        || status == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        || status.is_server_error()
+}
 
 #[derive(Clone)]
 struct ApiKeyLimiter {
@@ -65,6 +296,9 @@ struct AppState {
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     keepalive_headers: Arc<Mutex<HashMap<String, HeaderMap>>>,
     api_key_limiters: Arc<Mutex<HashMap<String, ApiKeyLimiter>>>,
+    provider_circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
+    provider_loads: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
+    provider_statuses: ProviderCircuitStatusHandle,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
@@ -166,6 +400,70 @@ impl AppState {
             )
         })
     }
+
+    fn begin_provider_attempt(&self, provider: &str) -> Result<ProviderCircuitGuard, ProxyError> {
+        let now = Instant::now();
+        let mut circuits = self.provider_circuits.lock();
+        let circuit = circuits.entry(provider.to_string()).or_default();
+        let mut half_open_probe = false;
+
+        match &mut circuit.phase {
+            ProviderCircuitPhase::Closed => {}
+            ProviderCircuitPhase::Open { until } if *until > now => {
+                let remaining = until.saturating_duration_since(now).as_secs().max(1);
+                return Err(ProxyError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("渠道 '{provider}' 熔断冷却中，约 {remaining} 秒后重试"),
+                ));
+            }
+            ProviderCircuitPhase::Open { .. } => {
+                half_open_probe = true;
+                circuit.phase = ProviderCircuitPhase::HalfOpen {
+                    probe_in_flight: true,
+                };
+                circuit.last_changed = now;
+                let mut statuses = self.provider_statuses.write();
+                let status = statuses.entry(provider.to_string()).or_default();
+                status.status = ProviderCircuitStatus::HalfOpen;
+                status.open_until = None;
+            }
+            ProviderCircuitPhase::HalfOpen { probe_in_flight } => {
+                if *probe_in_flight {
+                    return Err(ProxyError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("渠道 '{provider}' 正在半开探测"),
+                    ));
+                }
+                half_open_probe = true;
+                *probe_in_flight = true;
+                circuit.last_changed = now;
+            }
+        }
+        drop(circuits);
+
+        let inflight = {
+            let mut loads = self.provider_loads.lock();
+            loads
+                .entry(provider.to_string())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone()
+        };
+        let current_inflight = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+        self.provider_statuses
+            .write()
+            .entry(provider.to_string())
+            .or_default()
+            .inflight = current_inflight;
+
+        Ok(ProviderCircuitGuard {
+            provider: provider.to_string(),
+            circuits: Arc::clone(&self.provider_circuits),
+            statuses: Arc::clone(&self.provider_statuses),
+            inflight,
+            half_open_probe,
+            completed: false,
+        })
+    }
 }
 
 fn build_http_client(connect_timeout: u64) -> Client {
@@ -244,10 +542,26 @@ impl AttemptFailure {
     }
 }
 
+fn begin_attempt_or_record_failure(
+    state: &AppState,
+    provider: &ProviderConfig,
+    request_model: &str,
+    started: Instant,
+) -> Result<ProviderCircuitGuard, AttemptFailure> {
+    state
+        .begin_provider_attempt(&provider.name)
+        .map_err(|err| AttemptFailure::new(provider, request_model, started, err))
+}
+
+fn record_attempt_failure(guard: ProviderCircuitGuard, err: &ProxyError) {
+    guard.mark_failure(err.status, &err.message, err.retry_after);
+}
+
 #[derive(Debug)]
 struct ProxyError {
     status: StatusCode,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl ProxyError {
@@ -255,7 +569,13 @@ impl ProxyError {
         Self {
             status,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     fn retryable(&self) -> bool {
@@ -277,6 +597,14 @@ impl IntoResponse for ProxyError {
         )
             .into_response()
     }
+}
+
+fn upstream_status_error(
+    status: StatusCode,
+    text: &str,
+    retry_after: Option<Duration>,
+) -> ProxyError {
+    ProxyError::new(status, clean_upstream_error(text)).with_retry_after(retry_after)
 }
 
 #[derive(Debug)]
@@ -316,6 +644,7 @@ pub async fn run_server(
     config: ConfigHandle,
     shutdown: oneshot::Receiver<()>,
     keepalive_status: KeepaliveStatusHandle,
+    circuit_status: ProviderCircuitStatusHandle,
 ) -> Result<()> {
     // server 监听端口只用启动时那一份配置（改端口无法热切）
     let initial = config.read().clone();
@@ -333,6 +662,9 @@ pub async fn run_server(
         counters: Arc::new(Mutex::new(HashMap::new())),
         keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
         api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
+        provider_circuits: Arc::new(Mutex::new(HashMap::new())),
+        provider_loads: Arc::new(Mutex::new(HashMap::new())),
+        provider_statuses: circuit_status,
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
     };
     let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
@@ -735,6 +1067,14 @@ async fn responses(
 
     for (provider, request_model) in providers {
         let started = Instant::now();
+        let circuit_guard =
+            match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    last_error = Some(failure);
+                    continue;
+                }
+            };
         let mut upstream_body = with_model(body.clone(), &request_model);
         apply_model_mapping(&provider, &mut upstream_body);
         let upstream_attempt_model = upstream_body
@@ -787,9 +1127,11 @@ async fn responses(
                         early_log_id.take(),
                         permit.take(),
                         &api_key_name,
+                        Some(circuit_guard),
                     ));
                 }
                 Err(err) => {
+                    record_attempt_failure(circuit_guard, &err);
                     finish_failed_attempt_log(
                         &cfg,
                         early_log_id.take(),
@@ -829,6 +1171,7 @@ async fn responses(
                     early_log_id.take(),
                     permit.take(),
                     &api_key_name,
+                    Some(circuit_guard),
                 ));
             }
             Err(err)
@@ -854,9 +1197,11 @@ async fn responses(
                             early_log_id.take(),
                             permit.take(),
                             &api_key_name,
+                            Some(circuit_guard),
                         ));
                     }
                     Err(chat_err) => {
+                        record_attempt_failure(circuit_guard, &chat_err);
                         finish_failed_attempt_log(
                             &cfg,
                             early_log_id.take(),
@@ -877,6 +1222,7 @@ async fn responses(
                 }
             }
             Err(err) => {
+                record_attempt_failure(circuit_guard, &err);
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
                 if should_stop_failover(failure.status) {
@@ -979,6 +1325,14 @@ async fn forward_openai(
 
     for (provider, request_model) in providers {
         let started = Instant::now();
+        let circuit_guard =
+            match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    last_error = Some(failure);
+                    continue;
+                }
+            };
         let mut upstream_body = with_model(body.clone(), &request_model);
         apply_model_mapping(&provider, &mut upstream_body);
         if path == "/chat/completions" {
@@ -1027,6 +1381,7 @@ async fn forward_openai(
                     early_log_id.take(),
                     permit.take(),
                     &api_key_name,
+                    Some(circuit_guard),
                 ));
             }
             Err(err) => {
@@ -1051,9 +1406,11 @@ async fn forward_openai(
                                 early_log_id.take(),
                                 permit.take(),
                                 &api_key_name,
+                                Some(circuit_guard),
                             ));
                         }
                         Err(fb_err) => {
+                            record_attempt_failure(circuit_guard, &fb_err);
                             finish_failed_attempt_log(
                                 &cfg,
                                 early_log_id.take(),
@@ -1074,6 +1431,7 @@ async fn forward_openai(
                         }
                     }
                 }
+                record_attempt_failure(circuit_guard, &err);
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
@@ -1325,7 +1683,7 @@ async fn send_chat_stream_as_responses(
                     attempt += 1;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -1405,7 +1763,7 @@ async fn send_anthropic_chat_stream_as_responses(
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -2707,7 +3065,7 @@ async fn send_to_provider(
                         attempt += 1;
                         continue;
                     }
-                    return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                    return Err(upstream_status_error(status, &text, retry_after));
                 }
                 Err(err) if attempt < provider.max_retries => {
                     tokio::time::sleep(retry_delay(attempt)).await;
@@ -2872,7 +3230,7 @@ async fn send_to_anthropic_provider(
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -2992,7 +3350,7 @@ async fn send_to_google_ai_provider(
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -3090,7 +3448,7 @@ async fn send_responses_stream_as_chat(
                     attempt += 1;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -3187,7 +3545,7 @@ async fn send_chat_via_responses(
                     attempt += 1;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -3251,7 +3609,7 @@ async fn send_json_to_provider_with_headers(
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
                     continue;
                 }
-                return Err(ProxyError::new(status, clean_upstream_error(&text)));
+                return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 tokio::time::sleep(retry_delay(attempt)).await;
@@ -3410,10 +3768,54 @@ fn weighted_order(
     let start = counter.fetch_add(1, Ordering::Relaxed) % expanded.len();
     expanded.rotate_left(start);
     let mut seen = HashSet::new();
-    expanded
+    let mut ordered = expanded
         .into_iter()
         .filter(|provider| seen.insert(provider.name.clone()))
+        .map(|provider| {
+            let health_rank = provider_health_rank(state, &provider.name);
+            let inflight = provider_inflight(state, &provider.name);
+            (provider, health_rank, inflight)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(a, a_health, a_inflight), (b, b_health, b_inflight)| {
+        a_health.cmp(b_health).then_with(|| {
+            let a_weight = a.weight.max(1) as u128;
+            let b_weight = b.weight.max(1) as u128;
+            ((*a_inflight as u128) * b_weight).cmp(&((*b_inflight as u128) * a_weight))
+        })
+    });
+    ordered
+        .into_iter()
+        .map(|(provider, _, _)| provider)
         .collect()
+}
+
+fn provider_health_rank(state: &AppState, provider: &str) -> u8 {
+    state
+        .provider_statuses
+        .read()
+        .get(provider)
+        .map(|status| match status.status {
+            ProviderCircuitStatus::Healthy => {
+                if status.failures == 0 {
+                    0
+                } else {
+                    1
+                }
+            }
+            ProviderCircuitStatus::HalfOpen => 2,
+            ProviderCircuitStatus::Open => 3,
+        })
+        .unwrap_or(0)
+}
+
+fn provider_inflight(state: &AppState, provider: &str) -> usize {
+    state
+        .provider_loads
+        .lock()
+        .get(provider)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 fn provider_supports_model(provider: &ProviderConfig, model: &str) -> bool {
@@ -4262,6 +4664,7 @@ fn commit_result(
     early_log_id: Option<i64>,
     permit: Option<OwnedSemaphorePermit>,
     api_key_name: &str,
+    circuit_guard: Option<ProviderCircuitGuard>,
 ) -> Response {
     if let Some(rx) = result.usage_rx.take() {
         let log_id = early_log_id.or_else(|| {
@@ -4281,12 +4684,16 @@ fn commit_result(
         let model = model.to_string();
         let upstream_model = result.upstream_model.clone();
         tokio::spawn(async move {
+            let mut circuit_guard = circuit_guard;
             match rx.await {
                 Ok(StreamOutcome {
                     usage: _,
                     first_token_ms,
                     error: Some(error),
                 }) => {
+                    if let Some(guard) = circuit_guard.take() {
+                        guard.mark_failure(StatusCode::BAD_GATEWAY, &error, None);
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -4311,6 +4718,9 @@ fn commit_result(
                     first_token_ms,
                     error: None,
                 }) => {
+                    if let Some(guard) = circuit_guard.take() {
+                        guard.mark_success();
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -4331,6 +4741,13 @@ fn commit_result(
                     .await
                 }
                 Err(_) => {
+                    if let Some(guard) = circuit_guard.take() {
+                        guard.mark_failure(
+                            StatusCode::BAD_GATEWAY,
+                            "流式结果状态通道异常关闭",
+                            None,
+                        );
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -4353,6 +4770,9 @@ fn commit_result(
             }
         });
     } else {
+        if let Some(guard) = circuit_guard {
+            guard.mark_success();
+        }
         log_success(
             &cfg,
             api,
@@ -5271,6 +5691,9 @@ mod tests {
             counters: Arc::new(Mutex::new(HashMap::new())),
             keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
+            provider_circuits: Arc::new(Mutex::new(HashMap::new())),
+            provider_loads: Arc::new(Mutex::new(HashMap::new())),
+            provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -5287,6 +5710,174 @@ mod tests {
                 .collect(),
             allowed_providers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn provider_circuit_opens_after_three_consecutive_failures() {
+        let state = test_state();
+
+        for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
+            state
+                .begin_provider_attempt("unstable")
+                .unwrap()
+                .mark_failure(StatusCode::BAD_GATEWAY, "upstream unavailable", None);
+        }
+
+        let err = state.begin_provider_attempt("unstable").unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("熔断冷却中"));
+    }
+
+    #[test]
+    fn provider_circuit_429_opens_immediately_with_retry_after() {
+        let state = test_state();
+        state
+            .begin_provider_attempt("quota-limited")
+            .unwrap()
+            .mark_failure(
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota exceeded",
+                Some(Duration::from_secs(12)),
+            );
+
+        let err = state.begin_provider_attempt("quota-limited").unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("熔断冷却中"));
+        let circuits = state.provider_circuits.lock();
+        let circuit = circuits.get("quota-limited").unwrap();
+        let ProviderCircuitPhase::Open { until } = circuit.phase else {
+            panic!("429 应立即打开熔断器");
+        };
+        assert!(until.saturating_duration_since(Instant::now()) >= Duration::from_secs(11));
+    }
+
+    #[test]
+    fn provider_circuit_ignores_request_validation_failures() {
+        let state = test_state();
+
+        for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
+            state
+                .begin_provider_attempt("valid-provider")
+                .unwrap()
+                .mark_failure(StatusCode::BAD_REQUEST, "invalid request body", None);
+        }
+
+        assert!(state.begin_provider_attempt("valid-provider").is_ok());
+        let circuits = state.provider_circuits.lock();
+        let circuit = circuits.get("valid-provider").unwrap();
+        assert_eq!(circuit.consecutive_failures, 0);
+        assert!(matches!(circuit.phase, ProviderCircuitPhase::Closed));
+    }
+
+    #[test]
+    fn provider_circuit_half_open_allows_only_one_probe_and_success_recovers() {
+        let state = test_state();
+        {
+            let mut circuits = state.provider_circuits.lock();
+            circuits.insert(
+                "recovering".to_string(),
+                ProviderCircuit {
+                    phase: ProviderCircuitPhase::Open {
+                        until: Instant::now() - Duration::from_millis(1),
+                    },
+                    consecutive_failures: PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
+                    last_error: Some("temporary failure".to_string()),
+                    last_changed: Instant::now(),
+                },
+            );
+        }
+
+        let probe = state.begin_provider_attempt("recovering").unwrap();
+        let concurrent = state.begin_provider_attempt("recovering").unwrap_err();
+        assert_eq!(concurrent.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(concurrent.message.contains("正在半开探测"));
+
+        probe.mark_success();
+        assert!(state.begin_provider_attempt("recovering").is_ok());
+    }
+
+    #[test]
+    fn provider_circuit_half_open_drop_returns_to_cooldown() {
+        let state = test_state();
+        {
+            let mut circuits = state.provider_circuits.lock();
+            circuits.insert(
+                "dropped-probe".to_string(),
+                ProviderCircuit {
+                    phase: ProviderCircuitPhase::Open {
+                        until: Instant::now() - Duration::from_millis(1),
+                    },
+                    consecutive_failures: PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
+                    last_error: Some("temporary failure".to_string()),
+                    last_changed: Instant::now(),
+                },
+            );
+        }
+
+        drop(state.begin_provider_attempt("dropped-probe").unwrap());
+
+        let err = state.begin_provider_attempt("dropped-probe").unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("熔断冷却中"));
+    }
+
+    #[test]
+    fn provider_circuit_stale_success_does_not_close_open_circuit() {
+        let state = test_state();
+        let stale = state.begin_provider_attempt("race").unwrap();
+        state.begin_provider_attempt("race").unwrap().mark_failure(
+            StatusCode::BAD_GATEWAY,
+            "failed",
+            None,
+        );
+        state.begin_provider_attempt("race").unwrap().mark_failure(
+            StatusCode::BAD_GATEWAY,
+            "failed",
+            None,
+        );
+        state.begin_provider_attempt("race").unwrap().mark_failure(
+            StatusCode::BAD_GATEWAY,
+            "failed",
+            None,
+        );
+
+        stale.mark_success();
+
+        let err = state.begin_provider_attempt("race").unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn provider_circuit_stale_failure_does_not_interrupt_half_open_probe() {
+        let state = test_state();
+        let stale = state.begin_provider_attempt("half-open-race").unwrap();
+        state
+            .begin_provider_attempt("half-open-race")
+            .unwrap()
+            .mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
+        state
+            .begin_provider_attempt("half-open-race")
+            .unwrap()
+            .mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
+        state
+            .begin_provider_attempt("half-open-race")
+            .unwrap()
+            .mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
+        {
+            let mut circuits = state.provider_circuits.lock();
+            let circuit = circuits.get_mut("half-open-race").unwrap();
+            if let ProviderCircuitPhase::Open { until } = &mut circuit.phase {
+                *until = Instant::now() - Duration::from_millis(1);
+            }
+        }
+
+        let probe = state.begin_provider_attempt("half-open-race").unwrap();
+        stale.mark_failure(StatusCode::BAD_GATEWAY, "late failure", None);
+
+        let concurrent = state.begin_provider_attempt("half-open-race").unwrap_err();
+        assert!(concurrent.message.contains("正在半开探测"));
+        probe.mark_success();
+        assert!(state.begin_provider_attempt("half-open-race").is_ok());
     }
 
     #[test]
@@ -5409,6 +6000,80 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_eq!(names.iter().filter(|name| **name == "primary").count(), 1);
         assert_eq!(names.iter().filter(|name| **name == "backup").count(), 1);
+    }
+
+    #[test]
+    fn weighted_order_prefers_less_loaded_provider_in_same_priority() {
+        let state = test_state();
+        state
+            .provider_loads
+            .lock()
+            .insert("busy".to_string(), Arc::new(AtomicUsize::new(5)));
+        state
+            .provider_loads
+            .lock()
+            .insert("idle".to_string(), Arc::new(AtomicUsize::new(0)));
+
+        let providers = vec![
+            provider_with_name("busy", 1, 1),
+            provider_with_name("idle", 1, 1),
+        ];
+
+        let ordered = weighted_order(&state, "gpt-test", providers);
+        assert_eq!(
+            ordered.first().map(|provider| provider.name.as_str()),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn weighted_order_uses_weight_adjusted_load() {
+        let state = test_state();
+        state
+            .provider_loads
+            .lock()
+            .insert("wide".to_string(), Arc::new(AtomicUsize::new(2)));
+        state
+            .provider_loads
+            .lock()
+            .insert("narrow".to_string(), Arc::new(AtomicUsize::new(1)));
+
+        let providers = vec![
+            provider_with_name("wide", 10, 1),
+            provider_with_name("narrow", 1, 1),
+        ];
+
+        let ordered = weighted_order(&state, "gpt-test", providers);
+        assert_eq!(
+            ordered.first().map(|provider| provider.name.as_str()),
+            Some("wide")
+        );
+    }
+
+    #[test]
+    fn weighted_order_prefers_fully_healthy_provider_over_recent_failures() {
+        let state = test_state();
+        state.provider_statuses.write().insert(
+            "recent-failure".to_string(),
+            ProviderCircuitSnapshot {
+                status: ProviderCircuitStatus::Healthy,
+                failures: 1,
+                inflight: 0,
+                open_until: None,
+                last_error: Some("temporary".to_string()),
+            },
+        );
+
+        let providers = vec![
+            provider_with_name("recent-failure", 1, 1),
+            provider_with_name("clean", 1, 1),
+        ];
+
+        let ordered = weighted_order(&state, "gpt-test", providers);
+        assert_eq!(
+            ordered.first().map(|provider| provider.name.as_str()),
+            Some("clean")
+        );
     }
 
     #[test]

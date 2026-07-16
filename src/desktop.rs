@@ -77,6 +77,7 @@ pub struct HubApp {
     // 运行中的代理服务器共享的配置句柄。UI 修改会推送到这里，服务器每次请求读取最新
     config_handle: Option<ConfigHandle>,
     keepalive_status: Option<proxy::KeepaliveStatusHandle>,
+    circuit_status: Option<proxy::ProviderCircuitStatusHandle>,
     #[cfg(target_os = "macos")]
     tray: Option<MacosTray>,
     #[cfg(target_os = "macos")]
@@ -175,6 +176,7 @@ impl HubApp {
             overview_analytics: OverviewAnalyticsState::default(),
             config_handle: None,
             keepalive_status: None,
+            circuit_status: None,
             #[cfg(target_os = "macos")]
             tray: None,
             #[cfg(target_os = "macos")]
@@ -329,9 +331,11 @@ impl HubApp {
         self.config_handle = Some(Arc::clone(&handle));
         let keepalive_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
         self.keepalive_status = Some(Arc::clone(&keepalive_status));
+        let circuit_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        self.circuit_status = Some(Arc::clone(&circuit_status));
         let server_state = Arc::clone(&self.server);
         runtime.spawn(async move {
-            let result = proxy::run_server(handle, rx, keepalive_status).await;
+            let result = proxy::run_server(handle, rx, keepalive_status, circuit_status).await;
             let mut server = server_state.lock();
             server.running = false;
             server.shutdown = None;
@@ -353,6 +357,7 @@ impl HubApp {
             drop(server);
             self.config_handle = None;
             self.keepalive_status = None;
+            self.circuit_status = None;
         } else {
             self.message = AppMessage::new("代理未运行", MessageKind::Error);
         }
@@ -489,6 +494,7 @@ impl eframe::App for HubApp {
                                         &mut self.selected_provider,
                                         &mut self.view,
                                         &self.overview_analytics,
+                                        self.circuit_status.as_ref(),
                                     );
                                 });
                         }
@@ -501,6 +507,7 @@ impl eframe::App for HubApp {
                                 &mut self.provider_mapping_drafts,
                                 &mut self.provider_header_drafts,
                                 self.keepalive_status.as_ref(),
+                                self.circuit_status.as_ref(),
                             );
                         }
                         AppView::Auth => {
@@ -786,15 +793,17 @@ fn provider_summary_section(
     selected_provider: &mut Option<usize>,
     view: &mut AppView,
     analytics: &OverviewAnalyticsState,
+    circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) {
     section(ui, "渠道概览", |ui| {
         egui::Grid::new("provider_summary")
             .striped(true)
-            .min_col_width(92.0)
+            .min_col_width(84.0)
             .show(ui, |ui| {
                 table_header(ui, "状态");
                 table_header(ui, "名称");
                 table_header(ui, "类型");
+                table_header(ui, "运行");
                 table_header(ui, "优先级");
                 table_header(ui, "模型");
                 table_header(ui, "请求");
@@ -819,6 +828,7 @@ fn provider_summary_section(
                         *view = AppView::Providers;
                     }
                     ui.label(&provider.provider_type);
+                    provider_runtime_badge(ui, circuit_status, &provider.name);
                     ui.horizontal(|ui| {
                         badge(
                             ui,
@@ -848,6 +858,141 @@ fn provider_summary_section(
                 }
             });
     });
+}
+
+fn provider_runtime_badge(
+    ui: &mut egui::Ui,
+    circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
+    provider_name: &str,
+) {
+    let Some(status_handle) = circuit_status else {
+        badge(
+            ui,
+            "未启动",
+            egui::Color32::from_rgb(248, 250, 252),
+            muteds(),
+        );
+        return;
+    };
+    let status = status_handle.read().get(provider_name).cloned();
+    let Some(status) = status else {
+        badge(
+            ui,
+            "待请求",
+            egui::Color32::from_rgb(248, 250, 252),
+            muteds(),
+        );
+        return;
+    };
+
+    match status.status {
+        proxy::ProviderCircuitStatus::Healthy => {
+            if status.failures == 0 {
+                badge(
+                    ui,
+                    &format!("健康 · {}", status.inflight),
+                    egui::Color32::from_rgb(240, 253, 244),
+                    good(),
+                );
+            } else {
+                badge(
+                    ui,
+                    &format!("失败 {}/3 · {}", status.failures, status.inflight),
+                    egui::Color32::from_rgb(255, 247, 237),
+                    egui::Color32::from_rgb(190, 120, 24),
+                );
+            }
+        }
+        proxy::ProviderCircuitStatus::Open => {
+            let text = match status.open_until {
+                Some(until) if until > Instant::now() => {
+                    let remaining = until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs()
+                        .max(1);
+                    format!("熔断 {remaining}s")
+                }
+                _ => "待探测".to_string(),
+            };
+            badge(
+                ui,
+                &text,
+                egui::Color32::from_rgb(254, 242, 242),
+                egui::Color32::from_rgb(176, 54, 64),
+            );
+        }
+        proxy::ProviderCircuitStatus::HalfOpen => {
+            badge(
+                ui,
+                &format!("半开 · {}", status.inflight),
+                egui::Color32::from_rgb(255, 247, 237),
+                egui::Color32::from_rgb(190, 120, 24),
+            );
+        }
+    }
+}
+
+fn provider_circuit_detail(
+    ui: &mut egui::Ui,
+    circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
+    provider_name: &str,
+) {
+    let Some(status_handle) = circuit_status else {
+        ui.label(egui::RichText::new("代理未启动").color(muteds()));
+        return;
+    };
+    let status = status_handle.read().get(provider_name).cloned();
+    let Some(status) = status else {
+        ui.label(egui::RichText::new("等待首次请求").color(muteds()));
+        return;
+    };
+
+    match status.status {
+        proxy::ProviderCircuitStatus::Healthy => {
+            if status.failures == 0 {
+                ui.colored_label(good(), format!("渠道健康，当前并发 {}", status.inflight));
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 120, 24),
+                    format!(
+                        "渠道可用，连续失败 {}/3，当前并发 {}",
+                        status.failures, status.inflight
+                    ),
+                );
+            }
+        }
+        proxy::ProviderCircuitStatus::Open => match status.open_until {
+            Some(until) if until > Instant::now() => {
+                let remaining = until
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .max(1);
+                ui.colored_label(
+                    egui::Color32::from_rgb(176, 54, 64),
+                    format!("渠道已熔断，约 {remaining} 秒后探测"),
+                );
+            }
+            _ => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 120, 24),
+                    "冷却已结束，等待半开探测",
+                );
+            }
+        },
+        proxy::ProviderCircuitStatus::HalfOpen => {
+            ui.colored_label(
+                egui::Color32::from_rgb(190, 120, 24),
+                format!("渠道半开探测中，当前并发 {}", status.inflight),
+            );
+        }
+    }
+
+    if let Some(error) = status.last_error {
+        ui.colored_label(
+            egui::Color32::from_rgb(176, 54, 64),
+            format!("最近请求失败: {}", error),
+        );
+    }
 }
 
 fn empty_state(ui: &mut egui::Ui, title: &str, detail: &str) {
@@ -1889,6 +2034,7 @@ fn provider_section(
     mapping_drafts: &mut Vec<TextDraft>,
     header_drafts: &mut Vec<TextDraft>,
     keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
+    circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) {
     resize_drafts(mapping_drafts, config.providers.len());
     resize_drafts(header_drafts, config.providers.len());
@@ -1941,6 +2087,7 @@ fn provider_section(
                             &mut mapping_drafts[idx],
                             &mut header_drafts[idx],
                             keepalive_status,
+                            circuit_status,
                         );
                     });
             },
@@ -2037,6 +2184,7 @@ fn provider_detail_panel(
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
     keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
+    circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) {
     section(ui, "渠道详情", |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -2124,6 +2272,11 @@ fn provider_detail_panel(
                 } else {
                     ui.label(egui::RichText::new("代理未启动").color(muteds()));
                 }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                form_label(ui, "熔断状态");
+                provider_circuit_detail(ui, circuit_status, &provider.name);
             });
         });
 
