@@ -78,6 +78,8 @@ pub struct ApiKeyConfig {
     pub max_concurrency: Option<usize>,
     #[serde(default)]
     pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

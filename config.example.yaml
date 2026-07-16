@@ -4,6 +4,8 @@ server:
 
 auth:
   enabled: false
+  # 每个 API Key 可配置 allowed_models 与 allowed_providers。
+  # 两者为空列表或包含 "*" 时表示不限制。
   api_keys: []
 
 routing:
@@ -29,5 +31,15 @@ usage_log:
 #   capabilities:
 #     supports_chat: true
 #     supports_responses: false
+#   responses_mode: chat
+# Anthropic Bearer 认证示例（默认使用 x-api-key）：
+# - name: anthropic-bearer
+#   enabled: true
+#   provider_type: anthropic
+#   base_url: https://example.com/v1
+#   api_key: YOUR_ANTHROPIC_TOKEN
+#   models: [claude-sonnet-4-5]
+#   extra_headers:
+#     Authorization: Bearer {api_key}
 #   responses_mode: chat
 providers: []

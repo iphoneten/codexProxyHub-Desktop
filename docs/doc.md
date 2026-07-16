@@ -70,6 +70,8 @@ providers:
 | `enabled` | bool | `true` | 是否启用该 Key。 |
 | `created_at` | string | `""` | 创建时间，仅用于展示。 |
 | `max_concurrency` | number | `5` | 该 API Key 允许同时处理的最大请求数，超过会返回 429。 |
+| `allowed_models` | array<string> | `[]` | 允许访问的模型；空列表或 `*` 表示允许全部模型。 |
+| `allowed_providers` | array<string> | `[]` | 允许使用的渠道名称；空列表或 `*` 表示允许全部渠道，路由与故障转移不会越过该列表。 |
 
 客户端请求示例：
 
@@ -298,6 +300,15 @@ responses_mode: chat
 x-api-key: sk-ant-xxx
 anthropic-version: 2023-06-01
 ```
+
+部分 Anthropic 兼容网关使用 Bearer Token，可通过渠道 `extra_headers` 覆盖默认认证：
+
+```yaml
+extra_headers:
+  Authorization: Bearer {api_key}
+```
+
+`{api_key}` 会在请求发送前替换为该渠道的 `api_key`。配置 Bearer 认证后不会再发送 `x-api-key`。
 
 代理侧仍暴露 OpenAI 兼容接口，上游实际走 Anthropic `/messages`，并在请求/响应之间做协议转换。
 

@@ -55,6 +55,7 @@ struct AuthAccess {
     permit: OwnedSemaphorePermit,
     key_name: String,
     allowed_models: Vec<String>,
+    allowed_providers: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -615,7 +616,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "providers": cfg.providers.iter().filter(|p| p.enabled).count(),
-        "models": collect_models(&cfg).len(),
+        "models": collect_models(&cfg, &[]).len(),
     }))
 }
 
@@ -625,7 +626,7 @@ async fn list_models(
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
-    let data: Vec<Value> = collect_models(&cfg)
+    let data: Vec<Value> = collect_models(&cfg, &auth.allowed_providers)
         .into_iter()
         .filter(|model| api_key_allows_model(&auth, model))
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "route-hub"}))
@@ -640,7 +641,7 @@ async fn get_model(
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
-    if collect_models(&cfg).contains(&model) {
+    if collect_models(&cfg, &auth.allowed_providers).contains(&model) {
         ensure_api_key_allows_model(&auth, &model)?;
         Ok(Json(
             json!({"id": model, "object": "model", "created": 0, "owned_by": "route-hub"}),
@@ -667,6 +668,7 @@ async fn chat_completions(
         "chat",
         Some(auth.permit),
         auth.key_name,
+        auth.allowed_providers,
     )
     .await
 }
@@ -688,6 +690,7 @@ async fn completions(
         "completion",
         Some(auth.permit),
         auth.key_name,
+        auth.allowed_providers,
     )
     .await
 }
@@ -709,6 +712,7 @@ async fn embeddings(
         "embedding",
         Some(auth.permit),
         auth.key_name,
+        auth.allowed_providers,
     )
     .await
 }
@@ -723,8 +727,9 @@ async fn responses(
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
     let api_key_name = auth.key_name;
+    let allowed_providers = auth.allowed_providers;
     let mut permit = Some(auth.permit);
-    let providers = provider_attempts(&cfg, &state, &model, "responses");
+    let providers = provider_attempts(&cfg, &state, &model, "responses", &allowed_providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
 
@@ -903,10 +908,11 @@ async fn forward_openai(
     api: &'static str,
     mut permit: Option<OwnedSemaphorePermit>,
     api_key_name: String,
+    allowed_providers: Vec<String>,
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let model = body_model(&body)?;
-    let providers = provider_attempts(&cfg, &state, &model, api);
+    let providers = provider_attempts(&cfg, &state, &model, api, &allowed_providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
 
@@ -3159,6 +3165,7 @@ fn authorize_and_acquire(
             permit: state.acquire_api_key_permit("__auth_disabled__", 1_000_000)?,
             key_name: String::new(),
             allowed_models: Vec::new(),
+            allowed_providers: Vec::new(),
         });
     }
     let token = headers
@@ -3182,6 +3189,7 @@ fn authorize_and_acquire(
             permit: state.acquire_api_key_permit(token, limit)?,
             key_name: key.name.clone(),
             allowed_models: key.allowed_models.clone(),
+            allowed_providers: key.allowed_providers.clone(),
         })
     } else {
         Err(ProxyError::new(
@@ -3209,11 +3217,19 @@ fn api_key_allows_model(auth: &AuthAccess, model: &str) -> bool {
         })
 }
 
+fn api_key_allows_provider(allowed_providers: &[String], provider_name: &str) -> bool {
+    allowed_providers.is_empty()
+        || allowed_providers
+            .iter()
+            .any(|allowed| allowed.trim() == "*" || allowed.trim() == provider_name.trim())
+}
+
 fn provider_attempts(
     cfg: &AppConfig,
     state: &AppState,
     model: &str,
     api: &str,
+    allowed_providers: &[String],
 ) -> Vec<(ProviderConfig, String)> {
     let mut attempts = vec![model.to_string()];
     if let Some(fallbacks) = cfg.routing.model_fallbacks.get(model) {
@@ -3231,6 +3247,7 @@ fn provider_attempts(
             .iter()
             .filter(|p| {
                 p.enabled
+                    && api_key_allows_provider(allowed_providers, &p.name)
                     && provider_supports_model(p, &request_model)
                     && provider_supports_api(p, api)
             })
@@ -3335,9 +3352,13 @@ fn provider_supports_api(provider: &ProviderConfig, api: &str) -> bool {
     }
 }
 
-fn collect_models(config: &AppConfig) -> Vec<String> {
+fn collect_models(config: &AppConfig, allowed_providers: &[String]) -> Vec<String> {
     let mut models = Vec::new();
-    for provider in config.providers.iter().filter(|p| p.enabled) {
+    for provider in config
+        .providers
+        .iter()
+        .filter(|p| p.enabled && api_key_allows_provider(allowed_providers, &p.name))
+    {
         for model in &provider.models {
             if !models.contains(model) {
                 models.push(model.clone());
@@ -4314,15 +4335,40 @@ fn upstream_headers(
     stream: bool,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
+
+    // 渠道配置是可信配置，允许显式覆盖上游认证；客户端认证头仍在下方被拦截。
+    for (name, value) in &provider.extra_headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "content-type" | "accept" | "host" | "content-length"
+        ) {
+            continue;
+        }
+        let value = value.replace("{api_key}", &provider.api_key);
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+
     if provider.provider_type == "anthropic" {
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&provider.api_key)
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    } else if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", provider.api_key)) {
-        headers.insert(header::AUTHORIZATION, value);
+        if !headers.contains_key(header::AUTHORIZATION) && !headers.contains_key("x-api-key") {
+            headers.insert(
+                "x-api-key",
+                HeaderValue::from_str(&provider.api_key)
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if !headers.contains_key("anthropic-version") {
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        }
+    } else if !headers.contains_key(header::AUTHORIZATION) {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", provider.api_key)) {
+            headers.insert(header::AUTHORIZATION, value);
+        }
     }
     headers.insert(
         header::CONTENT_TYPE,
@@ -4341,22 +4387,6 @@ fn upstream_headers(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
         );
-    }
-
-    for (name, value) in &provider.extra_headers {
-        let lower = name.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "authorization" | "content-type" | "accept" | "host" | "content-length" | "x-api-key"
-        ) {
-            continue;
-        }
-        if let (Ok(name), Ok(value)) = (
-            http::header::HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
     }
 
     // 客户端头透传（与 codeProxyHub 的 _keepalive_safe_headers 对齐）：
@@ -4420,8 +4450,14 @@ fn upstream_headers(
             continue;
         }
 
-        // extra_headers 已经在前面写入过，这里若客户端也发了同名头则以客户端为准
-        // （codex CLI 的头才是校验目标，配置里的静态值只是兜底）
+        // extra_headers 是渠道级显式配置；同名客户端头不覆盖它。
+        if provider
+            .extra_headers
+            .keys()
+            .any(|extra| extra.eq_ignore_ascii_case(name.as_str()))
+        {
+            continue;
+        }
         headers.insert(name.clone(), value.clone());
     }
     headers
@@ -5067,6 +5103,7 @@ mod tests {
                 .iter()
                 .map(|model| model.to_string())
                 .collect(),
+            allowed_providers: Vec::new(),
         }
     }
 
@@ -5085,6 +5122,57 @@ mod tests {
         assert!(ensure_api_key_allows_model(&auth, "gemini-2.5-pro").is_ok());
         let err = ensure_api_key_allows_model(&auth, "gpt-4o").unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn api_key_empty_allowed_providers_allows_every_provider() {
+        assert!(api_key_allows_provider(&[], "openai"));
+        assert!(api_key_allows_provider(&["*".to_string()], "google-ai"));
+    }
+
+    #[test]
+    fn provider_attempts_only_include_allowed_providers_across_fallbacks() {
+        let state = test_state();
+        let mut cfg = (*state.snapshot()).clone();
+        let mut primary = provider_with_name("primary", 1, 1);
+        primary.models = vec!["gpt-test".to_string()];
+        let mut blocked_backup = provider_with_name("blocked-backup", 1, 2);
+        blocked_backup.models = vec!["gpt-test".to_string(), "gpt-fallback".to_string()];
+        let mut allowed_backup = provider_with_name("allowed-backup", 1, 2);
+        allowed_backup.models = vec!["gpt-fallback".to_string()];
+        cfg.providers = vec![primary, blocked_backup, allowed_backup];
+        cfg.routing
+            .model_fallbacks
+            .insert("gpt-test".to_string(), vec!["gpt-fallback".to_string()]);
+
+        let allowed = vec!["primary".to_string(), "allowed-backup".to_string()];
+        let attempts = provider_attempts(&cfg, &state, "gpt-test", "chat", &allowed);
+        let names = attempts
+            .iter()
+            .map(|(provider, model)| (provider.name.as_str(), model.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&("primary", "gpt-test")));
+        assert!(names.contains(&("allowed-backup", "gpt-fallback")));
+        assert!(!names.iter().any(|(name, _)| *name == "blocked-backup"));
+    }
+
+    #[test]
+    fn collect_models_only_exposes_models_from_allowed_providers() {
+        let state = test_state();
+        let mut cfg = (*state.snapshot()).clone();
+        let mut openai = provider_with_name("openai", 1, 1);
+        openai.models = vec!["shared".to_string(), "openai-only".to_string()];
+        let mut google = provider_with_name("google-ai", 1, 1);
+        google.models = vec!["shared".to_string(), "google-only".to_string()];
+        cfg.providers = vec![openai, google];
+
+        let models = collect_models(&cfg, &["openai".to_string()]);
+
+        assert_eq!(
+            models,
+            vec!["openai-only".to_string(), "shared".to_string()]
+        );
     }
 
     #[test]
@@ -5414,6 +5502,98 @@ providers: []
         assert!(headers.contains_key("conversation_id"));
         assert!(headers.contains_key("x-stainless-runtime"));
         assert!(has_codex_session_headers(&headers));
+    }
+
+    #[test]
+    fn upstream_headers_extra_headers_override_client_headers() {
+        let mut p = provider(
+            "openai",
+            "auto",
+            json!({"supports_chat": true, "supports_responses": true}),
+        );
+        p.extra_headers
+            .insert("User-Agent".to_string(), "claude-cli/2.1.142".to_string());
+        p.extra_headers
+            .insert("originator".to_string(), "claude_code".to_string());
+        p.extra_headers
+            .insert("x-app".to_string(), "cli".to_string());
+
+        let mut input = HeaderMap::new();
+        insert_header(&mut input, "User-Agent", "codex_cli_rs/0.116.0");
+        insert_header(&mut input, "originator", "codex_cli_rs");
+        insert_header(&mut input, "x-app", "opencode");
+        insert_header(&mut input, "x-stainless-runtime", "rust");
+
+        let headers = upstream_headers(&p, &input, false);
+
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("claude-cli/2.1.142")
+        );
+        assert_eq!(
+            headers
+                .get("originator")
+                .and_then(|value| value.to_str().ok()),
+            Some("claude_code")
+        );
+        assert_eq!(
+            headers.get("x-app").and_then(|value| value.to_str().ok()),
+            Some("cli")
+        );
+        assert_eq!(
+            headers
+                .get("x-stainless-runtime")
+                .and_then(|value| value.to_str().ok()),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn anthropic_extra_authorization_uses_bearer_instead_of_x_api_key() {
+        let mut p = provider(
+            "anthropic",
+            "chat",
+            json!({"supports_chat": true, "supports_responses": false}),
+        );
+        p.extra_headers
+            .insert("Authorization".to_string(), "Bearer {api_key}".to_string());
+
+        let headers = upstream_headers(&p, &HeaderMap::new(), false);
+
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+    }
+
+    #[test]
+    fn anthropic_defaults_to_x_api_key_authentication() {
+        let p = provider(
+            "anthropic",
+            "chat",
+            json!({"supports_chat": true, "supports_responses": false}),
+        );
+
+        let headers = upstream_headers(&p, &HeaderMap::new(), false);
+
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("sk-test")
+        );
+        assert!(!headers.contains_key(header::AUTHORIZATION));
     }
 
     #[test]

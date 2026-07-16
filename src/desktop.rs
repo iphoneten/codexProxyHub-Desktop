@@ -1100,6 +1100,7 @@ fn generate_api_key() -> String {
 
 fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut String) {
     let selectable_models = selectable_allowed_models(config);
+    let selectable_providers = selectable_allowed_providers(config);
     section(ui, "鉴权", |ui| {
         ui.horizontal(|ui| {
             switch(ui, &mut config.auth.enabled);
@@ -1122,6 +1123,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     max_concurrency: Some(5),
                     allowed_models: Vec::new(),
+                    allowed_providers: Vec::new(),
                 });
                 new_key_name.clear();
             }
@@ -1135,6 +1137,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                 ui.label("名称");
                 ui.label("并发");
                 ui.label("允许模型");
+                ui.label("允许渠道");
                 ui.label("API 秘钥");
                 ui.label("创建时间");
                 ui.label("操作");
@@ -1150,6 +1153,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                             .speed(1),
                     );
                     allowed_models_selector(ui, idx, key, &selectable_models);
+                    allowed_providers_selector(ui, idx, key, &selectable_providers);
                     ui.monospace(mask_api_key(&key.key));
                     ui.label(if key.created_at.trim().is_empty() {
                         "-"
@@ -1190,7 +1194,7 @@ fn allowed_models_selector(
     let popup_id = ui.make_persistent_id(("allowed_models_popup", index));
     let response = ui.add_sized(
         [180.0, 24.0],
-        egui::Button::new(format!("{selected_text}  ▾")),
+        egui::Button::new(format!("{selected_text}  v")),
     );
     if response.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup_id));
@@ -1249,6 +1253,110 @@ fn allowed_models_selector(
 
 fn api_key_allows_all_models(allowed_models: &[String]) -> bool {
     allowed_models.is_empty() || allowed_models.iter().any(|model| model.trim() == "*")
+}
+
+fn allowed_providers_selector(
+    ui: &mut egui::Ui,
+    index: usize,
+    key: &mut ApiKeyConfig,
+    selectable_providers: &[(String, bool)],
+) {
+    let enabled_providers = selectable_providers
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let selected_enabled_count = key
+        .allowed_providers
+        .iter()
+        .filter(|allowed| {
+            enabled_providers
+                .iter()
+                .any(|provider| provider.trim() == allowed.trim())
+        })
+        .count();
+    let all_allowed = api_key_allows_all_providers(&key.allowed_providers);
+    let selected_text = if all_allowed {
+        "全部渠道".to_string()
+    } else {
+        format!("已选 {} 个", selected_enabled_count)
+    };
+    let popup_id = ui.make_persistent_id(("allowed_providers_popup", index));
+    let response = ui.add_sized(
+        [160.0, 24.0],
+        egui::Button::new(format!("{selected_text}  v")),
+    );
+    if response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(200.0);
+            let mut select_all = api_key_allows_all_providers(&key.allowed_providers);
+            if ui.checkbox(&mut select_all, "全部渠道").changed() {
+                if select_all {
+                    key.allowed_providers.clear();
+                } else {
+                    key.allowed_providers = enabled_providers.clone();
+                }
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for (provider, enabled) in selectable_providers {
+                        let all_selected = api_key_allows_all_providers(&key.allowed_providers);
+                        let mut selected = all_selected
+                            || key
+                                .allowed_providers
+                                .iter()
+                                .any(|allowed| allowed.trim() == provider.trim());
+                        ui.add_enabled_ui(*enabled, |ui| {
+                            let response = ui.checkbox(&mut selected, provider.as_str());
+                            let changed = response.changed();
+                            if !*enabled {
+                                response.on_hover_text("渠道未启用，不能勾选");
+                            }
+                            if changed {
+                                if all_selected {
+                                    key.allowed_providers = enabled_providers
+                                        .iter()
+                                        .filter(|candidate| candidate.trim() != provider.trim())
+                                        .cloned()
+                                        .collect();
+                                } else if selected {
+                                    if !key
+                                        .allowed_providers
+                                        .iter()
+                                        .any(|allowed| allowed.trim() == provider.trim())
+                                    {
+                                        key.allowed_providers.push(provider.clone());
+                                    }
+                                } else {
+                                    key.allowed_providers
+                                        .retain(|allowed| allowed.trim() != provider.trim());
+                                }
+                            }
+                        });
+                        if !*enabled && selected && !all_selected {
+                            key.allowed_providers
+                                .retain(|allowed| allowed.trim() != provider.trim());
+                        }
+                    }
+                });
+        },
+    );
+}
+
+fn api_key_allows_all_providers(allowed_providers: &[String]) -> bool {
+    allowed_providers.is_empty()
+        || allowed_providers
+            .iter()
+            .any(|provider| provider.trim() == "*")
 }
 
 fn model_names_match(left: &str, right: &str) -> bool {
@@ -2569,6 +2677,32 @@ fn selectable_allowed_models(config: &AppConfig) -> Vec<String> {
     let mut models = models.into_iter().collect::<Vec<_>>();
     models.sort();
     models
+}
+
+fn selectable_allowed_providers(config: &AppConfig) -> Vec<(String, bool)> {
+    let mut providers = config
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            let name = provider.name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some((name.to_string(), provider.enabled))
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    for key in &config.auth.api_keys {
+        for provider in &key.allowed_providers {
+            let provider = provider.trim();
+            if !provider.is_empty() && provider != "*" {
+                providers.entry(provider.to_string()).or_insert(false);
+            }
+        }
+    }
+    let mut providers = providers.into_iter().collect::<Vec<_>>();
+    providers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    providers
 }
 
 fn default_provider() -> ProviderConfig {
