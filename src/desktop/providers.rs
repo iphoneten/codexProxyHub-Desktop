@@ -1,12 +1,13 @@
+use super::assets::cached_png_texture;
+use super::common::{
+    accent, badge, border, copy_icon_button, form_group, form_label, good, heading_color, muteds,
+    section, surface, switch, text_color,
+};
+use super::{AppMessage, MessageKind, TextDraft};
 use crate::config::{AppConfig, ProviderConfig};
 use crate::proxy;
 use eframe::egui;
 use std::time::Instant;
-use super::common::{
-    accent, badge, border, copy_icon_button, form_group, form_label, good, heading_color,
-    muteds, section, surface, switch, text_color,
-};
-use super::{AppMessage, MessageKind, TextDraft};
 
 pub fn provider_section(
     ui: &mut egui::Ui,
@@ -225,7 +226,56 @@ fn provider_detail_panel(
                     ui.end_row();
 
                     form_label(ui, "API Key");
-                    ui.add(egui::TextEdit::singleline(&mut provider.api_key).password(true));
+                    ui.horizontal(|ui| {
+                        let visibility_id = egui::Id::new((
+                            "provider_api_key_visible",
+                            provider.name.as_str(),
+                            provider.base_url.as_str(),
+                        ));
+                        let mut visible = ui
+                            .ctx()
+                            .data_mut(|data| data.get_temp::<bool>(visibility_id).unwrap_or(false));
+
+                        ui.add(
+                            egui::TextEdit::singleline(&mut provider.api_key)
+                                .password(!visible)
+                                .desired_width(260.0),
+                        );
+
+                        let (icon_name, icon_bytes, tooltip) = if visible {
+                            (
+                                "eye-disable",
+                                include_bytes!("../../assets/eye_disable.png").as_slice(),
+                                "隐藏 API Key",
+                            )
+                        } else {
+                            (
+                                "eye-able",
+                                include_bytes!("../../assets/eye_able.png").as_slice(),
+                                "显示 API Key",
+                            )
+                        };
+
+                        let clicked = if let Some(texture) =
+                            cached_png_texture(ui.ctx(), icon_name, icon_bytes)
+                        {
+                            let image = egui::Image::new(&texture)
+                                .fit_to_exact_size(egui::vec2(18.0, 18.0));
+                            ui.add(egui::Button::image(image).min_size(egui::vec2(30.0, 30.0)))
+                                .on_hover_text(tooltip)
+                                .clicked()
+                        } else {
+                            ui.small_button(if visible { "隐藏" } else { "显示" })
+                                .on_hover_text(tooltip)
+                                .clicked()
+                        };
+
+                        if clicked {
+                            visible = !visible;
+                            ui.ctx()
+                                .data_mut(|data| data.insert_temp(visibility_id, visible));
+                        }
+                    });
                     ui.end_row();
                 });
             ui.add_space(8.0);

@@ -115,7 +115,7 @@ pub(super) fn overview_analytics_section(
                 &mut columns[3],
                 "API Key 请求",
                 &analytics.data.api_key_counts,
-                accent(),
+                egui::Color32::from_rgb(249, 115, 22), // 橙色
                 |value| value.to_string(),
                 6,
             );
@@ -123,7 +123,7 @@ pub(super) fn overview_analytics_section(
                 &mut columns[4],
                 "API Key Token",
                 &analytics.data.api_key_tokens,
-                egui::Color32::from_rgb(110, 106, 220),
+                egui::Color32::from_rgb(236, 72, 153), // 粉色
                 |value| value.to_string(),
                 6,
             );

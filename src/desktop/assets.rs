@@ -5,6 +5,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) fn cached_png_texture(
+    ctx: &egui::Context,
+    name: &'static str,
+    bytes: &'static [u8],
+) -> Option<egui::TextureHandle> {
+    let cache_id = egui::Id::new(("static_png_texture", name));
+    if let Some(texture) = ctx.data_mut(|data| data.get_temp::<egui::TextureHandle>(cache_id)) {
+        return Some(texture);
+    }
+
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let texture = ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(cache_id, texture.clone()));
+    Some(texture)
+}
+
 pub(super) struct AnimatedGif {
     frames: Vec<egui::TextureHandle>,
     delays: Vec<Duration>,

@@ -269,6 +269,7 @@ pub fn form_group(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut
         .rounding(6.0)
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(
                 egui::RichText::new(title)
                     .size(12.0)

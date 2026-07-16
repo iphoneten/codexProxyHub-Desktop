@@ -43,7 +43,8 @@ pub fn provider_summary_section(
                 for idx in ordered {
                     let provider = &mut config.providers[idx];
                     switch(ui, &mut provider.enabled);
-                    let link_text = egui::RichText::new(&provider.name).strong().color(accent());
+                    let name_color = if provider.enabled { accent() } else { muteds() };
+                    let link_text = egui::RichText::new(&provider.name).strong().color(name_color);
                     if ui.link(link_text).clicked() {
                         *selected_provider = Some(idx);
                         *view = AppView::Providers;

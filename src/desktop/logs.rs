@@ -167,7 +167,23 @@ pub fn logs_section(
                             model_cell(ui, row);
                             ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
                             ui.label(format!("{}/{}", row.display_latency(), row.first_token));
-                            ui.label(egui::RichText::new(&row.error).color(muteds()));
+                            let err_display = if row.error.chars().count() > 30 {
+                                let truncated: String = row.error.chars().take(28).collect();
+                                format!("{truncated}...")
+                            } else {
+                                row.error.clone()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&err_display).color(muteds()))
+                                    .on_hover_text(&row.error);
+                                if !row.error.is_empty() {
+                                    if ui.small_button("📋").on_hover_text("复制完整错误信息").clicked() {
+                                        ui.output_mut(|output| {
+                                            output.copied_text = row.error.clone();
+                                        });
+                                    }
+                                }
+                            });
                             ui.end_row();
                         }
                     });

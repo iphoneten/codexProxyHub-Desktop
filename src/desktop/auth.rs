@@ -5,10 +5,9 @@ use super::common::{switch, section};
 
 fn mask_api_key(key: &str) -> String {
     let len = key.chars().count();
-    if len <= 12 {
-        return "*".repeat(len.max(6));
+    if len <= 8 {
+        return "*".repeat(len.max(4));
     }
-    let prefix: String = key.chars().take(8).collect();
     let suffix: String = key
         .chars()
         .rev()
@@ -17,7 +16,7 @@ fn mask_api_key(key: &str) -> String {
         .into_iter()
         .rev()
         .collect();
-    format!("{prefix}****{suffix}")
+    format!("sk-...{}", suffix)
 }
 
 /// 生成随机 API Key，格式与既有配置保持一致：`sk-proxy-` + 32 位小写字母数字。
@@ -90,19 +89,28 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                     );
                     allowed_models_selector(ui, idx, key, &selectable_models);
                     allowed_providers_selector(ui, idx, key, &selectable_providers);
-                    ui.monospace(mask_api_key(&key.key));
-                    ui.label(if key.created_at.trim().is_empty() {
-                        "-"
-                    } else {
-                        key.created_at.as_str()
-                    });
                     ui.horizontal(|ui| {
-                        if ui.button("复制").clicked() {
+                        ui.monospace(mask_api_key(&key.key));
+                        if ui.small_button("📋").on_hover_text("复制 API 秘钥").clicked() {
                             ui.output_mut(|output| {
                                 output.copied_text = key.key.clone();
                             });
                         }
-                        if ui.button("删除").clicked() {
+                    });
+                    let date_str = if key.created_at.len() >= 10 {
+                        &key.created_at[0..10]
+                    } else if key.created_at.trim().is_empty() {
+                        "-"
+                    } else {
+                        key.created_at.as_str()
+                    };
+                    ui.label(date_str).on_hover_text(&key.created_at);
+                    ui.horizontal(|ui| {
+                        let button = egui::Button::new(
+                            egui::RichText::new("删除")
+                                .color(egui::Color32::from_rgb(239, 68, 68)),
+                        );
+                        if ui.add(button).clicked() {
                             remove = Some(idx);
                         }
                     });
@@ -129,7 +137,7 @@ fn allowed_models_selector(
     };
     let popup_id = ui.make_persistent_id(("allowed_models_popup", index));
     let response = ui.add_sized(
-        [180.0, 24.0],
+        [120.0, 24.0],
         egui::Button::new(format!("{selected_text}  v")),
     );
     if response.clicked() {
@@ -219,7 +227,7 @@ fn allowed_providers_selector(
     };
     let popup_id = ui.make_persistent_id(("allowed_providers_popup", index));
     let response = ui.add_sized(
-        [160.0, 24.0],
+        [110.0, 24.0],
         egui::Button::new(format!("{selected_text}  v")),
     );
     if response.clicked() {
