@@ -1,0 +1,25 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+
+  categories:
+    - title: 功能变化
+      labels:
+        - enhancement
+        - feature
+
+    - title: 修复内容
+      labels:
+        - bug
+        - fix
+
+    - title: 升级注意事项
+      labels:
+        - breaking-change
+        - semver-major
+        - dependencies
+
+    - title: 其他变化
+      labels:
+        - "*"
