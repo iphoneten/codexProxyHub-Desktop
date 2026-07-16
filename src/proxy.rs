@@ -737,6 +737,20 @@ async fn responses(
         let started = Instant::now();
         let mut upstream_body = with_model(body.clone(), &request_model);
         apply_model_mapping(&provider, &mut upstream_body);
+        let upstream_attempt_model = upstream_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&request_model);
+        let mut early_log_id = start_stream_attempt_log(
+            &cfg,
+            stream,
+            "responses",
+            &provider.name,
+            &model,
+            upstream_attempt_model,
+            started,
+            &api_key_name,
+        );
 
         // force_chat：判断本次 /responses 请求是否**从一开始就走 chat 翻译**。
         //
@@ -770,11 +784,22 @@ async fn responses(
                         result,
                         started,
                         stream,
+                        early_log_id.take(),
                         permit.take(),
                         &api_key_name,
                     ));
                 }
                 Err(err) => {
+                    finish_failed_attempt_log(
+                        &cfg,
+                        early_log_id.take(),
+                        "responses",
+                        &provider.name,
+                        &model,
+                        started,
+                        &err.message,
+                        &api_key_name,
+                    );
                     last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                 }
             }
@@ -801,6 +826,7 @@ async fn responses(
                     result,
                     started,
                     stream,
+                    early_log_id.take(),
                     permit.take(),
                     &api_key_name,
                 ));
@@ -825,11 +851,22 @@ async fn responses(
                             result,
                             started,
                             stream,
+                            early_log_id.take(),
                             permit.take(),
                             &api_key_name,
                         ));
                     }
                     Err(chat_err) => {
+                        finish_failed_attempt_log(
+                            &cfg,
+                            early_log_id.take(),
+                            "responses",
+                            &provider.name,
+                            &model,
+                            started,
+                            &chat_err.message,
+                            &api_key_name,
+                        );
                         last_error = Some(AttemptFailure::new(
                             &provider,
                             &request_model,
@@ -843,34 +880,58 @@ async fn responses(
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
                 if should_stop_failover(failure.status) {
-                    log_error(
+                    finish_failed_attempt_log(
                         &cfg,
+                        early_log_id.take(),
                         "responses",
                         &failure.provider,
-                        &failure.request_model,
+                        &model,
                         failure.started,
-                        None,
                         &failure.message,
                         &api_key_name,
                     );
+                    if !stream {
+                        log_error(
+                            &cfg,
+                            "responses",
+                            &failure.provider,
+                            &failure.request_model,
+                            failure.started,
+                            None,
+                            &failure.message,
+                            &api_key_name,
+                        );
+                    }
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
+                finish_failed_attempt_log(
+                    &cfg,
+                    early_log_id.take(),
+                    "responses",
+                    &failure.provider,
+                    &model,
+                    failure.started,
+                    &failure.message,
+                    &api_key_name,
+                );
                 last_error = Some(failure);
             }
         }
     }
 
     if let Some(failure) = last_error {
-        log_error(
-            &cfg,
-            "responses",
-            &failure.provider,
-            &failure.request_model,
-            failure.started,
-            None,
-            &failure.message,
-            &api_key_name,
-        );
+        if !stream {
+            log_error(
+                &cfg,
+                "responses",
+                &failure.provider,
+                &failure.request_model,
+                failure.started,
+                None,
+                &failure.message,
+                &api_key_name,
+            );
+        }
         return Err(ProxyError::new(
             final_failover_status(failure.status),
             failure.message,
@@ -923,6 +984,20 @@ async fn forward_openai(
         if path == "/chat/completions" {
             apply_system_prompt_override(&provider, &mut upstream_body);
         }
+        let upstream_attempt_model = upstream_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&request_model);
+        let mut early_log_id = start_stream_attempt_log(
+            &cfg,
+            stream,
+            api,
+            &provider.name,
+            &model,
+            upstream_attempt_model,
+            started,
+            &api_key_name,
+        );
         // chat/completions 路径下预留一份 body 用于 responses fallback
         let fallback_body = if path == "/chat/completions" {
             Some(upstream_body.clone())
@@ -949,6 +1024,7 @@ async fn forward_openai(
                     result,
                     started,
                     stream,
+                    early_log_id.take(),
                     permit.take(),
                     &api_key_name,
                 ));
@@ -972,11 +1048,22 @@ async fn forward_openai(
                                 result,
                                 started,
                                 stream,
+                                early_log_id.take(),
                                 permit.take(),
                                 &api_key_name,
                             ));
                         }
                         Err(fb_err) => {
+                            finish_failed_attempt_log(
+                                &cfg,
+                                early_log_id.take(),
+                                api,
+                                &provider.name,
+                                &model,
+                                started,
+                                &fb_err.message,
+                                &api_key_name,
+                            );
                             last_error = Some(AttemptFailure::new(
                                 &provider,
                                 &request_model,
@@ -991,34 +1078,58 @@ async fn forward_openai(
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
                 if should_stop_failover(failure.status) {
-                    log_error(
+                    finish_failed_attempt_log(
                         &cfg,
+                        early_log_id.take(),
                         api,
                         &failure.provider,
-                        &failure.request_model,
+                        &model,
                         failure.started,
-                        None,
                         &failure.message,
                         &api_key_name,
                     );
+                    if !stream {
+                        log_error(
+                            &cfg,
+                            api,
+                            &failure.provider,
+                            &failure.request_model,
+                            failure.started,
+                            None,
+                            &failure.message,
+                            &api_key_name,
+                        );
+                    }
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
+                finish_failed_attempt_log(
+                    &cfg,
+                    early_log_id.take(),
+                    api,
+                    &failure.provider,
+                    &model,
+                    failure.started,
+                    &failure.message,
+                    &api_key_name,
+                );
                 last_error = Some(failure);
             }
         }
     }
 
     if let Some(failure) = last_error {
-        log_error(
-            &cfg,
-            api,
-            &failure.provider,
-            &failure.request_model,
-            failure.started,
-            None,
-            &failure.message,
-            &api_key_name,
-        );
+        if !stream {
+            log_error(
+                &cfg,
+                api,
+                &failure.provider,
+                &failure.request_model,
+                failure.started,
+                None,
+                &failure.message,
+                &api_key_name,
+            );
+        }
         return Err(ProxyError::new(
             final_failover_status(failure.status),
             failure.message,
@@ -4148,19 +4259,22 @@ fn commit_result(
     mut result: ProviderResult,
     started: Instant,
     stream: bool,
+    early_log_id: Option<i64>,
     permit: Option<OwnedSemaphorePermit>,
     api_key_name: &str,
 ) -> Response {
     if let Some(rx) = result.usage_rx.take() {
-        let log_id = log_stream_started(
-            &cfg,
-            api,
-            provider,
-            model,
-            &result.upstream_model,
-            started,
-            api_key_name,
-        );
+        let log_id = early_log_id.or_else(|| {
+            log_stream_started(
+                &cfg,
+                api,
+                provider,
+                model,
+                &result.upstream_model,
+                started,
+                api_key_name,
+            )
+        });
         let api = api.to_string();
         let api_key_name = api_key_name.to_string();
         let provider = provider.to_string();
@@ -4803,6 +4917,74 @@ fn log_stream_started(
         "upstream_or_unknown",
     )
     .ok()
+}
+
+fn start_stream_attempt_log(
+    config: &AppConfig,
+    stream: bool,
+    api: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    started: Instant,
+    api_key_name: &str,
+) -> Option<i64> {
+    stream.then(|| {
+        log_stream_started(
+            config,
+            api,
+            provider,
+            model,
+            upstream_model,
+            started,
+            api_key_name,
+        )
+    })?
+}
+
+fn finish_failed_attempt_log(
+    config: &AppConfig,
+    log_id: Option<i64>,
+    api: &str,
+    provider: &str,
+    model: &str,
+    started: Instant,
+    error: &str,
+    api_key_name: &str,
+) {
+    let Some(id) = log_id else {
+        return;
+    };
+    if update_usage_log(
+        config,
+        id,
+        started,
+        &UsageLogEvent {
+            api,
+            api_key_name,
+            provider,
+            model,
+            upstream_model: "",
+            status: "error",
+            error: Some(error),
+            usage: TokenUsage::default(),
+            first_token_ms: None,
+            token_source: None,
+        },
+    )
+    .is_err()
+    {
+        log_error(
+            config,
+            api,
+            provider,
+            model,
+            started,
+            None,
+            error,
+            api_key_name,
+        );
+    }
 }
 
 fn update_usage_log(
@@ -6283,6 +6465,73 @@ providers: []
 
         assert_eq!(updated, 1);
         assert_eq!(row, (1, "ok".to_string(), 12_345, Some(456), 321, 45));
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_attempt_log_is_visible_before_upstream_finishes() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-early-stream-log-{}.sqlite3",
+            Uuid::new_v4().simple()
+        ));
+        let config: AppConfig = serde_yaml::from_str(&format!(
+            "usage_log:\n  backend: sqlite\n  sqlite_path: '{}'\nproviders: []\n",
+            path.display()
+        ))
+        .unwrap();
+        let started = Instant::now();
+
+        let id = start_stream_attempt_log(
+            &config,
+            true,
+            "responses",
+            "test-provider",
+            "gpt-test",
+            "gpt-upstream",
+            started,
+            "local-key",
+        )
+        .expect("流式尝试开始时应立即创建日志");
+
+        finish_failed_attempt_log(
+            &config,
+            Some(id),
+            "responses",
+            "test-provider",
+            "gpt-test",
+            started,
+            "上游响应头超时",
+            "local-key",
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT COUNT(*), status, error, channel, request_model FROM usage_logs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            row,
+            (
+                1,
+                "error".to_string(),
+                "上游响应头超时".to_string(),
+                "test-provider".to_string(),
+                "gpt-test".to_string(),
+            )
+        );
         drop(conn);
         let _ = fs::remove_file(path);
     }
