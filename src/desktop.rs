@@ -1099,8 +1099,8 @@ fn generate_api_key() -> String {
 }
 
 fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut String) {
+    let selectable_models = selectable_allowed_models(config);
     section(ui, "鉴权", |ui| {
-        ui.set_max_width(640.0);
         ui.horizontal(|ui| {
             switch(ui, &mut config.auth.enabled);
             ui.label("启用 API 秘钥鉴权");
@@ -1121,6 +1121,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                     enabled: true,
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     max_concurrency: Some(5),
+                    allowed_models: Vec::new(),
                 });
                 new_key_name.clear();
             }
@@ -1133,6 +1134,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                 ui.label("启用");
                 ui.label("名称");
                 ui.label("并发");
+                ui.label("允许模型");
                 ui.label("API 秘钥");
                 ui.label("创建时间");
                 ui.label("操作");
@@ -1147,6 +1149,7 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                             .range(1..=500)
                             .speed(1),
                     );
+                    allowed_models_selector(ui, idx, key, &selectable_models);
                     ui.monospace(mask_api_key(&key.key));
                     ui.label(if key.created_at.trim().is_empty() {
                         "-"
@@ -1170,6 +1173,86 @@ fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mut St
                 }
             });
     });
+}
+
+fn allowed_models_selector(
+    ui: &mut egui::Ui,
+    index: usize,
+    key: &mut ApiKeyConfig,
+    selectable_models: &[String],
+) {
+    let all_allowed = api_key_allows_all_models(&key.allowed_models);
+    let selected_text = if all_allowed {
+        "全部模型".to_string()
+    } else {
+        format!("已选 {} 个", key.allowed_models.len())
+    };
+    let popup_id = ui.make_persistent_id(("allowed_models_popup", index));
+    let response = ui.add_sized(
+        [180.0, 24.0],
+        egui::Button::new(format!("{selected_text}  ▾")),
+    );
+    if response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(220.0);
+            let mut select_all = api_key_allows_all_models(&key.allowed_models);
+            if ui.checkbox(&mut select_all, "全部模型").changed() {
+                if select_all {
+                    key.allowed_models.clear();
+                } else {
+                    key.allowed_models = selectable_models.to_vec();
+                }
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for model in selectable_models {
+                        let all_selected = api_key_allows_all_models(&key.allowed_models);
+                        let mut selected = all_selected
+                            || key
+                                .allowed_models
+                                .iter()
+                                .any(|allowed| model_names_match(allowed, model));
+                        if ui.checkbox(&mut selected, model).changed() {
+                            if all_selected {
+                                key.allowed_models = selectable_models
+                                    .iter()
+                                    .filter(|candidate| !model_names_match(candidate, model))
+                                    .cloned()
+                                    .collect();
+                            } else if selected {
+                                if !key
+                                    .allowed_models
+                                    .iter()
+                                    .any(|allowed| model_names_match(allowed, model))
+                                {
+                                    key.allowed_models.push(model.clone());
+                                }
+                            } else {
+                                key.allowed_models
+                                    .retain(|allowed| !model_names_match(allowed, model));
+                            }
+                        }
+                    }
+                });
+        },
+    );
+}
+
+fn api_key_allows_all_models(allowed_models: &[String]) -> bool {
+    allowed_models.is_empty() || allowed_models.iter().any(|model| model.trim() == "*")
+}
+
+fn model_names_match(left: &str, right: &str) -> bool {
+    left.trim().trim_start_matches("models/") == right.trim().trim_start_matches("models/")
 }
 
 fn mask_api_key(key: &str) -> String {
@@ -2452,6 +2535,10 @@ fn display_host(host: &str) -> &str {
 }
 
 fn unique_model_count(config: &AppConfig) -> usize {
+    available_model_names(config).len()
+}
+
+fn available_model_names(config: &AppConfig) -> Vec<String> {
     let mut models = HashSet::new();
     for provider in config.providers.iter().filter(|provider| provider.enabled) {
         for model in &provider.models {
@@ -2462,7 +2549,26 @@ fn unique_model_count(config: &AppConfig) -> usize {
         }
     }
     models.remove("");
-    models.len()
+    let mut models = models.into_iter().collect::<Vec<_>>();
+    models.sort();
+    models
+}
+
+fn selectable_allowed_models(config: &AppConfig) -> Vec<String> {
+    let mut models = available_model_names(config)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for key in &config.auth.api_keys {
+        for model in &key.allowed_models {
+            let model = model.trim();
+            if !model.is_empty() && model != "*" {
+                models.insert(model.to_string());
+            }
+        }
+    }
+    let mut models = models.into_iter().collect::<Vec<_>>();
+    models.sort();
+    models
 }
 
 fn default_provider() -> ProviderConfig {

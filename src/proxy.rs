@@ -54,6 +54,7 @@ struct ApiKeyLimiter {
 struct AuthAccess {
     permit: OwnedSemaphorePermit,
     key_name: String,
+    allowed_models: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -623,9 +624,10 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
-    let _auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
     let data: Vec<Value> = collect_models(&cfg)
         .into_iter()
+        .filter(|model| api_key_allows_model(&auth, model))
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "route-hub"}))
         .collect();
     Ok(Json(json!({"object": "list", "data": data})))
@@ -637,8 +639,9 @@ async fn get_model(
     Path(model): Path<String>,
 ) -> Result<impl IntoResponse, ProxyError> {
     let cfg = state.snapshot();
-    let _auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
     if collect_models(&cfg).contains(&model) {
+        ensure_api_key_allows_model(&auth, &model)?;
         Ok(Json(
             json!({"id": model, "object": "model", "created": 0, "owned_by": "route-hub"}),
         ))
@@ -654,6 +657,8 @@ async fn chat_completions(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
         state,
         headers,
@@ -673,6 +678,8 @@ async fn completions(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
         state,
         headers,
@@ -692,6 +699,8 @@ async fn embeddings(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
         state,
         headers,
@@ -711,9 +720,10 @@ async fn responses(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
     let api_key_name = auth.key_name;
     let mut permit = Some(auth.permit);
-    let model = body_model(&body)?;
     let providers = provider_attempts(&cfg, &state, &model, "responses");
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
@@ -3148,6 +3158,7 @@ fn authorize_and_acquire(
         return Ok(AuthAccess {
             permit: state.acquire_api_key_permit("__auth_disabled__", 1_000_000)?,
             key_name: String::new(),
+            allowed_models: Vec::new(),
         });
     }
     let token = headers
@@ -3170,6 +3181,7 @@ fn authorize_and_acquire(
         Ok(AuthAccess {
             permit: state.acquire_api_key_permit(token, limit)?,
             key_name: key.name.clone(),
+            allowed_models: key.allowed_models.clone(),
         })
     } else {
         Err(ProxyError::new(
@@ -3177,6 +3189,24 @@ fn authorize_and_acquire(
             "无效或缺失 API Key",
         ))
     }
+}
+
+fn ensure_api_key_allows_model(auth: &AuthAccess, model: &str) -> Result<(), ProxyError> {
+    if api_key_allows_model(auth, model) {
+        return Ok(());
+    }
+    Err(ProxyError::new(
+        StatusCode::FORBIDDEN,
+        format!("API Key 不允许访问模型 '{model}'"),
+    ))
+}
+
+fn api_key_allows_model(auth: &AuthAccess, model: &str) -> bool {
+    auth.allowed_models.is_empty()
+        || auth.allowed_models.iter().any(|allowed| {
+            allowed.trim() == "*"
+                || normalize_model(allowed.trim()) == normalize_model(model.trim())
+        })
 }
 
 fn provider_attempts(
@@ -5025,6 +5055,36 @@ mod tests {
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn auth_access_with_models(state: &AppState, allowed_models: &[&str]) -> AuthAccess {
+        AuthAccess {
+            permit: state
+                .acquire_api_key_permit("allowed-models-test", 5)
+                .unwrap(),
+            key_name: "test".to_string(),
+            allowed_models: allowed_models
+                .iter()
+                .map(|model| model.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn api_key_empty_allowed_models_allows_every_model() {
+        let state = test_state();
+        let auth = auth_access_with_models(&state, &[]);
+        assert!(ensure_api_key_allows_model(&auth, "gpt-any").is_ok());
+    }
+
+    #[test]
+    fn api_key_allowed_models_restricts_requested_model() {
+        let state = test_state();
+        let auth = auth_access_with_models(&state, &["gpt-5.5", "models/gemini-2.5-pro"]);
+        assert!(ensure_api_key_allows_model(&auth, "gpt-5.5").is_ok());
+        assert!(ensure_api_key_allows_model(&auth, "gemini-2.5-pro").is_ok());
+        let err = ensure_api_key_allows_model(&auth, "gpt-4o").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
