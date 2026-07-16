@@ -11,8 +11,7 @@
 *.o
 *.so
 *.dylib
-/dist/build-*/
-/dist/recodexProxyHub-windows-*/
+/dist/
 
 # ---- 运行时日志与数据 ----
 /logs/
