@@ -147,15 +147,12 @@ pub fn logs_section(
                 log_view.page = 0;
                 refresh_logs(config, log_view, Some(message));
             }
-            if soft_button(ui, "清空").clicked() {
-                match clear_logs(config) {
-                    Ok(()) => {
-                        log_view.page = 0;
-                        refresh_logs(config, log_view, None);
-                        *message = AppMessage::new("已清空日志", MessageKind::Success);
-                    }
-                    Err(err) => *message = AppMessage::new(err, MessageKind::Error),
-                }
+            if soft_button(ui, "清空选项").clicked() {
+                log_view.range = LogRange::All;
+                log_view.api_key_id.clear();
+                log_view.page = 0;
+                refresh_logs(config, log_view, None);
+                *message = AppMessage::new("已清空筛选选项", MessageKind::Success);
             }
         });
         let totals = log_view.totals;
@@ -444,23 +441,6 @@ fn read_sqlite_log_totals(
         input_tokens,
         output_tokens,
     })
-}
-
-fn clear_logs(config: &AppConfig) -> Result<(), String> {
-    clear_sqlite_logs(config.usage_log_sqlite_path())
-}
-
-fn clear_sqlite_logs(path_buf: PathBuf) -> Result<(), String> {
-    if !path_buf.exists() {
-        return Ok(());
-    }
-    let conn = proxy::open_usage_log_connection(path_buf)
-        .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
-    proxy::ensure_usage_log_schema(&conn)
-        .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
-    conn.execute("DELETE FROM usage_logs", [])
-        .map_err(|err| format!("清空 SQLite 日志失败: {err}"))?;
-    Ok(())
 }
 
 fn read_log_page(

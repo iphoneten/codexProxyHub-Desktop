@@ -100,6 +100,7 @@ pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 const PROVIDER_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
 const PROVIDER_CIRCUIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProviderCircuitStatus {
@@ -354,6 +355,12 @@ struct AuthAccess {
 }
 
 #[derive(Clone)]
+struct SessionAffinity {
+    provider: String,
+    updated_at: Instant,
+}
+
+#[derive(Clone)]
 struct AppState {
     config: ConfigHandle,
     clients: Arc<Mutex<HashMap<u64, Client>>>,
@@ -363,6 +370,7 @@ struct AppState {
     provider_circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
     provider_loads: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     provider_statuses: ProviderCircuitStatusHandle,
+    session_affinity: Arc<Mutex<HashMap<String, SessionAffinity>>>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
@@ -421,6 +429,33 @@ impl AppState {
 
     fn cached_keepalive_headers(&self, provider: &ProviderConfig) -> Option<HeaderMap> {
         self.keepalive_headers.lock().get(&provider.name).cloned()
+    }
+
+    fn preferred_provider_for_session(&self, session_key: &str) -> Option<String> {
+        if session_key.trim().is_empty() {
+            return None;
+        }
+        let mut affinities = self.session_affinity.lock();
+        let now = Instant::now();
+        affinities.retain(|_, affinity| {
+            now.saturating_duration_since(affinity.updated_at) <= SESSION_AFFINITY_TTL
+        });
+        affinities
+            .get(session_key)
+            .map(|affinity| affinity.provider.clone())
+    }
+
+    fn remember_session_provider(&self, session_key: &str, provider: &str) {
+        if session_key.trim().is_empty() || provider.trim().is_empty() {
+            return;
+        }
+        self.session_affinity.lock().insert(
+            session_key.to_string(),
+            SessionAffinity {
+                provider: provider.to_string(),
+                updated_at: Instant::now(),
+            },
+        );
     }
 
     fn raw_sse_capture_for(&self, provider: &ProviderConfig) -> Option<RawSseCapture> {
@@ -729,6 +764,7 @@ pub async fn run_server(
         provider_circuits: Arc::new(Mutex::new(HashMap::new())),
         provider_loads: Arc::new(Mutex::new(HashMap::new())),
         provider_statuses: circuit_status,
+        session_affinity: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
     };
     let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
@@ -779,4 +815,45 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         return Err(anyhow!("没有启用的 provider"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState {
+            config: Arc::new(RwLock::new(Arc::new(
+                AppConfig::load("config.example.yaml").unwrap(),
+            ))),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            counters: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
+            api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
+            provider_circuits: Arc::new(Mutex::new(HashMap::new())),
+            provider_loads: Arc::new(Mutex::new(HashMap::new())),
+            provider_statuses: Arc::new(RwLock::new(HashMap::new())),
+            session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            usage_injection: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn session_affinity_remembers_successful_provider() {
+        let state = test_state();
+        state.remember_session_provider("responses:gpt-test:conversation-1", "muyuan");
+
+        assert_eq!(
+            state.preferred_provider_for_session("responses:gpt-test:conversation-1"),
+            Some("muyuan".to_string())
+        );
+    }
+
+    #[test]
+    fn session_affinity_ignores_empty_session_key() {
+        let state = test_state();
+        state.remember_session_provider("", "muyuan");
+
+        assert_eq!(state.preferred_provider_for_session(""), None);
+    }
 }
