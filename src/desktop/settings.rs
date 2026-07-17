@@ -1,3 +1,4 @@
+use super::assets::cached_png_texture;
 use super::common::{
     base_url, copy_icon_button, display_host, field_icon, muteds, section, switch,
 };
@@ -38,8 +39,8 @@ pub fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             switch(ui, &mut config.web.enabled);
-            ui.label("用户 Web");
-            ui.colored_label(muteds(), "与代理共用端口，挂载在 /user");
+            ui.label("Web 控制台");
+            ui.colored_label(muteds(), "与代理共用端口，挂载在 /user 和 /admin");
         });
         ui.horizontal(|ui| {
             ui.label("会话时长");
@@ -63,6 +64,76 @@ pub fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
                 );
                 copy_icon_button(ui, &web_url).on_hover_text("复制用户 Web 地址");
             }
+        });
+        if config.web.enabled {
+            let admin_url = format!(
+                "http://{}:{}/admin",
+                display_host(&config.server.host),
+                config.server.port
+            );
+            ui.horizontal(|ui| {
+                ui.label("管理地址");
+                let mut readonly_admin_url = admin_url.clone();
+                ui.add_enabled(
+                    false,
+                    egui::TextEdit::singleline(&mut readonly_admin_url).desired_width(260.0),
+                );
+                copy_icon_button(ui, &admin_url).on_hover_text("复制管理 Web 地址");
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("Admin Key");
+            let mut admin_key = config.auth.admin_key.clone().unwrap_or_default();
+            let visibility_id = egui::Id::new("admin_key_visible");
+            let mut visible = ui
+                .ctx()
+                .data_mut(|data| data.get_temp::<bool>(visibility_id).unwrap_or(false));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut admin_key)
+                    .password(!visible)
+                    .desired_width(260.0),
+            );
+            if response.changed() {
+                config.auth.admin_key = if admin_key.trim().is_empty() {
+                    None
+                } else {
+                    Some(admin_key.clone())
+                };
+            }
+
+            let (icon_name, icon_bytes, tooltip) = if visible {
+                (
+                    "admin-eye-disable",
+                    include_bytes!("../../assets/eye_disable.png").as_slice(),
+                    "隐藏 Admin Key",
+                )
+            } else {
+                (
+                    "admin-eye-able",
+                    include_bytes!("../../assets/eye_able.png").as_slice(),
+                    "显示 Admin Key",
+                )
+            };
+            let clicked = if let Some(texture) = cached_png_texture(ui.ctx(), icon_name, icon_bytes)
+            {
+                let image = egui::Image::new(&texture).fit_to_exact_size(egui::vec2(18.0, 18.0));
+                ui.add(egui::Button::image(image).min_size(egui::vec2(30.0, 30.0)))
+                    .on_hover_text(tooltip)
+                    .clicked()
+            } else {
+                ui.small_button(if visible { "隐藏" } else { "显示" })
+                    .on_hover_text(tooltip)
+                    .clicked()
+            };
+            if clicked {
+                visible = !visible;
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(visibility_id, visible));
+            }
+            if !admin_key.is_empty() {
+                copy_icon_button(ui, &admin_key).on_hover_text("复制 Admin Key");
+            }
+            ui.colored_label(muteds(), "用于 /admin 登录，留空则禁用");
         });
     });
 }

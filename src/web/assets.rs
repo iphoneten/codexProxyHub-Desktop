@@ -24,6 +24,27 @@ pub(super) async fn javascript() -> Response {
     )
 }
 
+pub(super) async fn admin_index() -> Response {
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../../web/admin/index.html"),
+    )
+}
+
+pub(super) async fn admin_css() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../../web/admin/app.css"),
+    )
+}
+
+pub(super) async fn admin_javascript() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../../web/admin/app.js"),
+    )
+}
+
 fn static_response(content_type: &'static str, body: &'static str) -> Response {
     let mut response = body.into_response();
     response

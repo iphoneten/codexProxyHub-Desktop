@@ -60,13 +60,14 @@ providers:
 
 ## web
 
-User Web 与代理共用同一个监听端口，挂载在 `/user`。用户使用已启用的 API
-Key 登录，只能查看该 Key 产生的新请求日志。原始 API Key 不会保存在浏览器中，
-登录后使用进程内会话。
+Web 控制台与代理共用同一个监听端口。用户控制台挂载在 `/user`，用户使用已启用
+的 API Key 登录，只能查看该 Key 产生的新请求日志。管理控制台挂载在 `/admin`，
+使用 `auth.admin_key` 登录，可查看网关汇总、渠道用量、API Key 用量和全量实时
+日志。当前管理控制台为只读，不修改配置。登录后均使用进程内会话。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | bool | `false` | 是否启用用户 Web 控制台。启用后访问 `http://<server.host>:<server.port>/user`。 |
+| `enabled` | bool | `false` | 是否启用 Web 控制台。用户端访问 `/user`，管理端访问 `/admin`。 |
 | `host` | string | `127.0.0.1` | 兼容旧配置保留，当前同端口模式不单独监听。 |
 | `port` | number | `8001` | 兼容旧配置保留，当前同端口模式不单独监听。 |
 | `session_ttl_hours` | number | `24` | 登录会话有效时间，支持 `1` 到 `720` 小时。 |
@@ -76,7 +77,7 @@ Key 登录，只能查看该 Key 产生的新请求日志。原始 API Key 不�
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `enabled` | bool | `false` | 是否启用本地代理 Bearer Token 鉴权。 |
-| `admin_key` | string/null | `null` | 管理端密钥，当前桌面版主要保留兼容。 |
+| `admin_key` | string/null | `null` | Admin Web 登录密钥。未配置或为空时管理端拒绝登录。 |
 | `api_keys` | array | `[]` | 允许访问本地代理的 API Key 列表。 |
 
 ### auth.api_keys[]

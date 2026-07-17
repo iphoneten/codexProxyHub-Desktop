@@ -8,6 +8,8 @@ web:
 
 auth:
   enabled: false
+  # Admin Web 使用此密钥登录；未配置时 /admin 会拒绝登录。
+  admin_key: null
   # 每个 API Key 可配置 allowed_models 与 allowed_providers。
   # 两者为空列表或包含 "*" 时表示不限制。
   api_keys: []

@@ -757,7 +757,9 @@ pub async fn run_server(
         )
         .with_state(state);
     if initial.web.enabled {
-        app = app.nest("/user", crate::web::router(config));
+        app = app
+            .nest("/user", crate::web::router(Arc::clone(&config)))
+            .nest("/admin", crate::web::admin_router(config));
     }
 
     let result = axum::serve(listener, app)

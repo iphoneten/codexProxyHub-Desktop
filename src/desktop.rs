@@ -293,11 +293,11 @@ impl HubApp {
             common::display_host(&config.server.host),
             config.server.port
         );
-        let web_endpoint = config.web.enabled.then(|| {
-            format!(
-                "http://{}:{}/user",
-                common::display_host(&config.server.host),
-                config.server.port
+        let web_endpoints = config.web.enabled.then(|| {
+            let host = common::display_host(&config.server.host);
+            (
+                format!("http://{}:{}/user", host, config.server.port),
+                format!("http://{}:{}/admin", host, config.server.port),
             )
         });
         let (tx, rx) = oneshot::channel();
@@ -326,8 +326,10 @@ impl HubApp {
                 server.last_error = Some(err.to_string());
             }
         });
-        let started_message = match web_endpoint {
-            Some(web) => format!("代理已启动: {endpoint}，用户 Web: {web}"),
+        let started_message = match web_endpoints {
+            Some((user, admin)) => {
+                format!("代理已启动: {endpoint}，用户 Web: {user}，管理 Web: {admin}")
+            }
             None => format!("代理已启动: {endpoint}"),
         };
         self.message = AppMessage::new(started_message, MessageKind::Success);
