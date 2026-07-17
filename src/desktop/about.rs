@@ -1,6 +1,6 @@
-use eframe::egui;
+use super::common::{accent, badge, muteds, section, soft_button, stat_color, text_color};
 use super::ServerHandle;
-use super::common::{accent, badge, muteds, section, soft_button, text_color, stat_color};
+use eframe::egui;
 
 pub fn about_section(ui: &mut egui::Ui, server: &ServerHandle) {
     section(ui, "关于 RouteHub", |ui| {

@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct UsageLogEvent<'a> {
     pub(super) api: &'a str,
+    pub(super) api_key_id: &'a str,
     pub(super) api_key_name: &'a str,
     pub(super) provider: &'a str,
     pub(super) model: &'a str,
@@ -24,6 +25,7 @@ pub(super) fn log_success(
     started: Instant,
     first_token_ms: Option<i64>,
     stream: bool,
+    api_key_id: &str,
     api_key_name: &str,
 ) {
     log_usage(
@@ -31,6 +33,7 @@ pub(super) fn log_success(
         started,
         UsageLogEvent {
             api,
+            api_key_id,
             api_key_name,
             provider,
             model,
@@ -52,6 +55,7 @@ pub(super) fn log_error(
     started: Instant,
     first_token_ms: Option<i64>,
     error: &str,
+    api_key_id: &str,
     api_key_name: &str,
 ) {
     log_usage(
@@ -59,6 +63,7 @@ pub(super) fn log_error(
         started,
         UsageLogEvent {
             api,
+            api_key_id,
             api_key_name,
             provider,
             model,
@@ -79,13 +84,15 @@ pub(super) fn log_stream_started(
     model: &str,
     upstream_model: &str,
     started: Instant,
+    api_key_id: &str,
     api_key_name: &str,
 ) -> Option<i64> {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    log_usage_sqlite(
+    log_usage_sqlite_for_key(
         config.usage_log_sqlite_path(),
         &ts,
         api,
+        api_key_id,
         api_key_name,
         "running",
         provider,
@@ -101,6 +108,7 @@ pub(super) fn log_stream_started(
     .ok()
 }
 
+#[cfg(test)]
 pub(super) fn start_stream_attempt_log(
     config: &AppConfig,
     stream: bool,
@@ -111,6 +119,30 @@ pub(super) fn start_stream_attempt_log(
     started: Instant,
     api_key_name: &str,
 ) -> Option<i64> {
+    start_stream_attempt_log_for_key(
+        config,
+        stream,
+        api,
+        provider,
+        model,
+        upstream_model,
+        started,
+        "",
+        api_key_name,
+    )
+}
+
+pub(super) fn start_stream_attempt_log_for_key(
+    config: &AppConfig,
+    stream: bool,
+    api: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    started: Instant,
+    api_key_id: &str,
+    api_key_name: &str,
+) -> Option<i64> {
     stream.then(|| {
         log_stream_started(
             config,
@@ -119,11 +151,13 @@ pub(super) fn start_stream_attempt_log(
             model,
             upstream_model,
             started,
+            api_key_id,
             api_key_name,
         )
     })?
 }
 
+#[cfg(test)]
 pub(super) fn finish_failed_attempt_log(
     config: &AppConfig,
     log_id: Option<i64>,
@@ -132,6 +166,30 @@ pub(super) fn finish_failed_attempt_log(
     model: &str,
     started: Instant,
     error: &str,
+    api_key_name: &str,
+) {
+    finish_failed_attempt_log_for_key(
+        config,
+        log_id,
+        api,
+        provider,
+        model,
+        started,
+        error,
+        "",
+        api_key_name,
+    );
+}
+
+pub(super) fn finish_failed_attempt_log_for_key(
+    config: &AppConfig,
+    log_id: Option<i64>,
+    api: &str,
+    provider: &str,
+    model: &str,
+    started: Instant,
+    error: &str,
+    api_key_id: &str,
     api_key_name: &str,
 ) {
     let Some(id) = log_id else {
@@ -143,6 +201,7 @@ pub(super) fn finish_failed_attempt_log(
         started,
         &UsageLogEvent {
             api,
+            api_key_id,
             api_key_name,
             provider,
             model,
@@ -164,6 +223,7 @@ pub(super) fn finish_failed_attempt_log(
             started,
             None,
             error,
+            api_key_id,
             api_key_name,
         );
     }
@@ -227,10 +287,11 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
     let error = event.error.unwrap_or("");
     let token_source = event.token_source.unwrap_or("upstream_or_unknown");
 
-    let _ = log_usage_sqlite(
+    let _ = log_usage_sqlite_for_key(
         config.usage_log_sqlite_path(),
         &ts,
         event.api,
+        event.api_key_id,
         event.api_key_name,
         event.status,
         event.provider,
@@ -246,10 +307,48 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn log_usage_sqlite(
     path: PathBuf,
     ts: &str,
     api: &str,
+    api_key_name: &str,
+    status: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    latency_ms: i64,
+    first_token_ms: Option<i64>,
+    error: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    token_source: &str,
+) -> rusqlite::Result<i64> {
+    log_usage_sqlite_for_key(
+        path,
+        ts,
+        api,
+        "",
+        api_key_name,
+        status,
+        provider,
+        model,
+        upstream_model,
+        latency_ms,
+        first_token_ms,
+        error,
+        input_tokens,
+        output_tokens,
+        token_source,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn log_usage_sqlite_for_key(
+    path: PathBuf,
+    ts: &str,
+    api: &str,
+    api_key_id: &str,
     api_key_name: &str,
     status: &str,
     provider: &str,
@@ -270,10 +369,10 @@ pub(super) fn log_usage_sqlite(
             (
                 ts, api, status, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source,
-                api_key_name
+                api_key_id, api_key_name
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
         params![
             ts,
@@ -288,6 +387,7 @@ pub(super) fn log_usage_sqlite(
             output_tokens,
             error,
             token_source,
+            api_key_id,
             api_key_name
         ],
     )?;
@@ -375,6 +475,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
             output_tokens INTEGER NOT NULL DEFAULT 0,
             error TEXT NOT NULL DEFAULT '',
             token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown',
+            api_key_id TEXT NOT NULL DEFAULT '',
             api_key_name TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts ON usage_logs(ts);
@@ -386,6 +487,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "first_token_ms", "INTEGER")?;
     ensure_column(conn, "input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "api_key_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RouteHub</title>
+  <link rel="stylesheet" href="/user/assets/app.css">
+</head>
+<body>
+  <main id="login-view" class="login-view">
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">R</div>
+        <div>
+          <h1 id="login-title">RouteHub</h1>
+          <p>用户控制台</p>
+        </div>
+      </div>
+      <form id="login-form" autocomplete="off">
+        <label for="api-key">API Key</label>
+        <div class="key-field">
+          <input
+            id="api-key"
+            name="api_key"
+            type="password"
+            placeholder="sk-proxy-..."
+            required
+            spellcheck="false"
+            autocomplete="off"
+          >
+          <button id="toggle-key" class="icon-button" type="button" title="显示 API Key" aria-label="显示 API Key">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M2.1 12s3.6-6 9.9-6 9.9 6 9.9 6-3.6 6-9.9 6-9.9-6-9.9-6Z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </button>
+        </div>
+        <p id="login-error" class="form-error" role="alert"></p>
+        <button id="login-button" class="primary-button" type="submit">登录</button>
+      </form>
+    </section>
+  </main>
+
+  <main id="dashboard-view" class="dashboard-view" hidden>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand compact">
+          <div class="brand-mark" aria-hidden="true">R</div>
+          <div>
+            <h1>RouteHub</h1>
+            <p>用户控制台</p>
+          </div>
+        </div>
+        <div class="account-actions">
+          <div class="account-copy">
+            <strong id="user-name">-</strong>
+            <span id="connection-status">实时连接</span>
+          </div>
+          <button id="logout-button" class="secondary-button" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10 17l5-5-5-5"></path>
+              <path d="M15 12H3"></path>
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
+            </svg>
+            退出
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div class="page">
+      <section class="usage-strip" aria-label="用量概览">
+        <div class="metric">
+          <span>请求</span>
+          <strong id="metric-requests">0</strong>
+        </div>
+        <div class="metric">
+          <span>成功</span>
+          <strong id="metric-success">0</strong>
+        </div>
+        <div class="metric">
+          <span>失败</span>
+          <strong id="metric-errors" class="danger">0</strong>
+        </div>
+        <div class="metric">
+          <span>输入 Token</span>
+          <strong id="metric-input">0</strong>
+        </div>
+        <div class="metric">
+          <span>输出 Token</span>
+          <strong id="metric-output">0</strong>
+        </div>
+      </section>
+
+      <section class="access-bar" aria-label="访问权限">
+        <div>
+          <span>并发上限</span>
+          <strong id="limit-concurrency">-</strong>
+        </div>
+        <div>
+          <span>允许模型</span>
+          <strong id="allowed-models">全部</strong>
+        </div>
+      </section>
+
+      <section class="logs-section" aria-labelledby="logs-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="logs-title">请求日志</h2>
+            <p id="log-count">共 0 条</p>
+          </div>
+          <button id="refresh-button" class="icon-button outlined" type="button" title="刷新日志" aria-label="刷新日志">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"></path>
+              <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"></path>
+            </svg>
+          </button>
+        </div>
+
+        <div class="table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>状态</th>
+                <th>接口</th>
+                <th>模型</th>
+                <th>Token</th>
+                <th>用时 / 首字</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="log-rows"></tbody>
+          </table>
+          <div id="empty-state" class="empty-state">暂无请求日志</div>
+        </div>
+
+        <nav class="pagination" aria-label="日志分页">
+          <button id="previous-page" class="secondary-button" type="button">上一页</button>
+          <span id="page-status">第 1 / 1 页</span>
+          <button id="next-page" class="secondary-button" type="button">下一页</button>
+        </nav>
+      </section>
+    </div>
+  </main>
+
+  <script src="/user/assets/app.js" defer></script>
+</body>
+</html>

@@ -11,19 +11,19 @@ use std::{
 };
 use tokio::{runtime::Runtime, sync::oneshot};
 
+mod about;
 mod analytics;
 mod assets;
+mod auth;
 mod common;
+mod logs;
 mod overview;
 mod providers;
-mod auth;
-mod logs;
 mod settings;
-mod about;
 
 use analytics::OverviewAnalyticsState;
 use assets::AnimatedGif;
-use logs::{LogViewState, LogTotals};
+use logs::{LogTotals, LogViewState};
 
 #[cfg(target_os = "macos")]
 use crate::macos_tray::{activate_app, app_is_active, MacosTray, TrayAction};
@@ -293,6 +293,13 @@ impl HubApp {
             common::display_host(&config.server.host),
             config.server.port
         );
+        let web_endpoint = config.web.enabled.then(|| {
+            format!(
+                "http://{}:{}/user",
+                common::display_host(&config.server.host),
+                config.server.port
+            )
+        });
         let (tx, rx) = oneshot::channel();
         {
             let mut server = self.server.lock();
@@ -319,7 +326,11 @@ impl HubApp {
                 server.last_error = Some(err.to_string());
             }
         });
-        self.message = AppMessage::new(format!("代理已启动: {}", endpoint), MessageKind::Success);
+        let started_message = match web_endpoint {
+            Some(web) => format!("代理已启动: {endpoint}，用户 Web: {web}"),
+            None => format!("代理已启动: {endpoint}"),
+        };
+        self.message = AppMessage::new(started_message, MessageKind::Success);
     }
 
     fn stop_server(&mut self) {
@@ -568,7 +579,12 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
                     };
 
                     ui.add_space(16.0);
-                    common::metric_badge(ui, "启用渠道", &enabled_providers.to_string(), common::accent());
+                    common::metric_badge(
+                        ui,
+                        "启用渠道",
+                        &enabled_providers.to_string(),
+                        common::accent(),
+                    );
                     ui.add_space(8.0);
                     common::metric_badge(
                         ui,

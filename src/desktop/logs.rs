@@ -1,14 +1,14 @@
-use crate::config::AppConfig;
-use crate::proxy;
-use eframe::egui;
-use std::path::PathBuf;
-use std::time::Instant;
 use super::assets::AnimatedGif;
 use super::common::{
     accent, border, format_compact_tokens, good, loading_icon, metric_tile, muteds, section,
     soft_button, switch, table_header,
 };
 use super::{AppMessage, MessageKind};
+use crate::config::AppConfig;
+use crate::proxy;
+use eframe::egui;
+use std::path::PathBuf;
+use std::time::Instant;
 
 pub struct LogViewState {
     pub(crate) rows: Vec<LogRow>,
@@ -177,7 +177,11 @@ pub fn logs_section(
                                 ui.label(egui::RichText::new(&err_display).color(muteds()))
                                     .on_hover_text(&row.error);
                                 if !row.error.is_empty() {
-                                    if ui.small_button("📋").on_hover_text("复制完整错误信息").clicked() {
+                                    if ui
+                                        .small_button("📋")
+                                        .on_hover_text("复制完整错误信息")
+                                        .clicked()
+                                    {
                                         ui.output_mut(|output| {
                                             output.copied_text = row.error.clone();
                                         });
@@ -191,7 +195,11 @@ pub fn logs_section(
     });
 }
 
-pub fn refresh_logs(config: &AppConfig, log_view: &mut LogViewState, message: Option<&mut AppMessage>) {
+pub fn refresh_logs(
+    config: &AppConfig,
+    log_view: &mut LogViewState,
+    message: Option<&mut AppMessage>,
+) {
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
     log_view.loaded_path = format!("sqlite:{}", path.display());

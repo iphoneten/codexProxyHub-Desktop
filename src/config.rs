@@ -12,6 +12,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub web: WebConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
@@ -38,6 +40,29 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_host")]
+    pub host: String,
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    #[serde(default = "default_web_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_web_host(),
+            port: default_web_port(),
+            session_ttl_hours: default_web_session_ttl_hours(),
         }
     }
 }
@@ -296,6 +321,15 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8000
+}
+fn default_web_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_web_port() -> u16 {
+    8001
+}
+fn default_web_session_ttl_hours() -> u64 {
+    24
 }
 fn default_true() -> bool {
     true

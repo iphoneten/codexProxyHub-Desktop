@@ -11,6 +11,7 @@ mod google_ai;
 mod macos_tray;
 mod proxy;
 mod responses_api;
+mod web;
 
 fn main() -> eframe::Result<()> {
     let window_title = format!("RouteHub v{}", app_version());

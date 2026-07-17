@@ -2,6 +2,10 @@ server:
   host: 127.0.0.1
   port: 8000
 
+web:
+  enabled: false
+  session_ttl_hours: 24
+
 auth:
   enabled: false
   # 每个 API Key 可配置 allowed_models 与 allowed_providers。

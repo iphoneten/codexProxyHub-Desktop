@@ -70,6 +70,30 @@ pub(crate) fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()>
     usage_log::ensure_usage_log_schema(conn)
 }
 
+pub(crate) fn api_key_id(api_key: &str) -> String {
+    if api_key.trim().is_empty() {
+        return String::new();
+    }
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("routehub:api-key:{}", api_key.trim()).as_bytes(),
+    )
+    .to_string()
+}
+
+fn request_api_key_id(config: &AppConfig, headers: &HeaderMap) -> String {
+    if !config.auth.enabled {
+        return String::new();
+    }
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    api_key_id(token)
+}
+
 // 配置句柄：Arc<RwLock<Arc<AppConfig>>>
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
@@ -696,7 +720,7 @@ pub async fn run_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     recover_interrupted_usage_logs(initial.usage_log_sqlite_path());
     let state = AppState {
-        config,
+        config: Arc::clone(&config),
         clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
         keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
@@ -713,7 +737,7 @@ pub async fn run_server(
         keepalive_stop_rx,
     ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(index))
         .route("/v1", get(index))
         .route("/v1/", get(index))
@@ -732,9 +756,12 @@ pub async fn run_server(
                 .allow_headers(Any),
         )
         .with_state(state);
+    if initial.web.enabled {
+        app = app.nest("/user", crate::web::router(config));
+    }
 
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = shutdown.await;
             let _ = keepalive_stop_tx.send(());
         })

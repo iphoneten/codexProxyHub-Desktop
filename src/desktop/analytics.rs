@@ -1,5 +1,7 @@
+use super::common::{
+    accent, format_compact_tokens, good, heading_color, muteds, section, stat_color,
+};
 use super::*;
-use super::common::{section, muteds, stat_color, accent, good, heading_color, format_compact_tokens};
 use std::collections::HashMap;
 
 #[derive(Default)]

@@ -1,7 +1,7 @@
-use crate::config::{AppConfig, ApiKeyConfig};
+use super::common::{section, switch};
+use crate::config::{ApiKeyConfig, AppConfig};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use super::common::{switch, section};
 
 fn mask_api_key(key: &str) -> String {
     let len = key.chars().count();
@@ -91,7 +91,11 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                     allowed_providers_selector(ui, idx, key, &selectable_providers);
                     ui.horizontal(|ui| {
                         ui.monospace(mask_api_key(&key.key));
-                        if ui.small_button("📋").on_hover_text("复制 API 秘钥").clicked() {
+                        if ui
+                            .small_button("📋")
+                            .on_hover_text("复制 API 秘钥")
+                            .clicked()
+                        {
                             ui.output_mut(|output| {
                                 output.copied_text = key.key.clone();
                             });
@@ -107,8 +111,7 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                     ui.label(date_str).on_hover_text(&key.created_at);
                     ui.horizontal(|ui| {
                         let button = egui::Button::new(
-                            egui::RichText::new("删除")
-                                .color(egui::Color32::from_rgb(239, 68, 68)),
+                            egui::RichText::new("删除").color(egui::Color32::from_rgb(239, 68, 68)),
                         );
                         if ui.add(button).clicked() {
                             remove = Some(idx);

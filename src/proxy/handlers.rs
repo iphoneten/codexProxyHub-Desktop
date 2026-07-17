@@ -62,6 +62,7 @@ pub(super) async fn chat_completions(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
@@ -71,6 +72,7 @@ pub(super) async fn chat_completions(
         "/chat/completions",
         "chat",
         Some(auth.permit),
+        api_key_id,
         auth.key_name,
         auth.allowed_providers,
     )
@@ -84,6 +86,7 @@ pub(super) async fn completions(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
@@ -93,6 +96,7 @@ pub(super) async fn completions(
         "/completions",
         "completion",
         Some(auth.permit),
+        api_key_id,
         auth.key_name,
         auth.allowed_providers,
     )
@@ -106,6 +110,7 @@ pub(super) async fn embeddings(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
     forward_openai(
@@ -115,6 +120,7 @@ pub(super) async fn embeddings(
         "/embeddings",
         "embedding",
         Some(auth.permit),
+        api_key_id,
         auth.key_name,
         auth.allowed_providers,
     )
@@ -128,6 +134,7 @@ pub(super) async fn responses(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
     let api_key_name = auth.key_name;
@@ -153,7 +160,7 @@ pub(super) async fn responses(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or(&request_model);
-        let mut early_log_id = start_stream_attempt_log(
+        let mut early_log_id = start_stream_attempt_log_for_key(
             &cfg,
             stream,
             "responses",
@@ -161,6 +168,7 @@ pub(super) async fn responses(
             &model,
             upstream_attempt_model,
             started,
+            &api_key_id,
             &api_key_name,
         );
 
@@ -198,13 +206,14 @@ pub(super) async fn responses(
                         stream,
                         early_log_id.take(),
                         permit.take(),
+                        &api_key_id,
                         &api_key_name,
                         Some(circuit_guard),
                     ));
                 }
                 Err(err) => {
                     record_attempt_failure(circuit_guard, &err);
-                    finish_failed_attempt_log(
+                    finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
                         "responses",
@@ -212,6 +221,7 @@ pub(super) async fn responses(
                         &model,
                         started,
                         &err.message,
+                        &api_key_id,
                         &api_key_name,
                     );
                     last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
@@ -242,6 +252,7 @@ pub(super) async fn responses(
                     stream,
                     early_log_id.take(),
                     permit.take(),
+                    &api_key_id,
                     &api_key_name,
                     Some(circuit_guard),
                 ));
@@ -268,13 +279,14 @@ pub(super) async fn responses(
                             stream,
                             early_log_id.take(),
                             permit.take(),
+                            &api_key_id,
                             &api_key_name,
                             Some(circuit_guard),
                         ));
                     }
                     Err(chat_err) => {
                         record_attempt_failure(circuit_guard, &chat_err);
-                        finish_failed_attempt_log(
+                        finish_failed_attempt_log_for_key(
                             &cfg,
                             early_log_id.take(),
                             "responses",
@@ -282,6 +294,7 @@ pub(super) async fn responses(
                             &model,
                             started,
                             &chat_err.message,
+                            &api_key_id,
                             &api_key_name,
                         );
                         last_error = Some(AttemptFailure::new(
@@ -298,7 +311,7 @@ pub(super) async fn responses(
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
                 if should_stop_failover(failure.status) {
-                    finish_failed_attempt_log(
+                    finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
                         "responses",
@@ -306,6 +319,7 @@ pub(super) async fn responses(
                         &model,
                         failure.started,
                         &failure.message,
+                        &api_key_id,
                         &api_key_name,
                     );
                     if !stream {
@@ -317,12 +331,13 @@ pub(super) async fn responses(
                             failure.started,
                             None,
                             &failure.message,
+                            &api_key_id,
                             &api_key_name,
                         );
                     }
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
-                finish_failed_attempt_log(
+                finish_failed_attempt_log_for_key(
                     &cfg,
                     early_log_id.take(),
                     "responses",
@@ -330,6 +345,7 @@ pub(super) async fn responses(
                     &model,
                     failure.started,
                     &failure.message,
+                    &api_key_id,
                     &api_key_name,
                 );
                 last_error = Some(failure);
@@ -347,6 +363,7 @@ pub(super) async fn responses(
                 failure.started,
                 None,
                 &failure.message,
+                &api_key_id,
                 &api_key_name,
             );
         }
@@ -386,6 +403,7 @@ pub(super) async fn forward_openai(
     path: &'static str,
     api: &'static str,
     mut permit: Option<OwnedSemaphorePermit>,
+    api_key_id: String,
     api_key_name: String,
     allowed_providers: Vec<String>,
 ) -> Result<Response, ProxyError> {
@@ -414,7 +432,7 @@ pub(super) async fn forward_openai(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or(&request_model);
-        let mut early_log_id = start_stream_attempt_log(
+        let mut early_log_id = start_stream_attempt_log_for_key(
             &cfg,
             stream,
             api,
@@ -422,6 +440,7 @@ pub(super) async fn forward_openai(
             &model,
             upstream_attempt_model,
             started,
+            &api_key_id,
             &api_key_name,
         );
         // chat/completions 路径下预留一份 body 用于 responses fallback
@@ -452,6 +471,7 @@ pub(super) async fn forward_openai(
                     stream,
                     early_log_id.take(),
                     permit.take(),
+                    &api_key_id,
                     &api_key_name,
                     Some(circuit_guard),
                 ));
@@ -477,13 +497,14 @@ pub(super) async fn forward_openai(
                                 stream,
                                 early_log_id.take(),
                                 permit.take(),
+                                &api_key_id,
                                 &api_key_name,
                                 Some(circuit_guard),
                             ));
                         }
                         Err(fb_err) => {
                             record_attempt_failure(circuit_guard, &fb_err);
-                            finish_failed_attempt_log(
+                            finish_failed_attempt_log_for_key(
                                 &cfg,
                                 early_log_id.take(),
                                 api,
@@ -491,6 +512,7 @@ pub(super) async fn forward_openai(
                                 &model,
                                 started,
                                 &fb_err.message,
+                                &api_key_id,
                                 &api_key_name,
                             );
                             last_error = Some(AttemptFailure::new(
@@ -508,7 +530,7 @@ pub(super) async fn forward_openai(
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
                 if should_stop_failover(failure.status) {
-                    finish_failed_attempt_log(
+                    finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
                         api,
@@ -516,6 +538,7 @@ pub(super) async fn forward_openai(
                         &model,
                         failure.started,
                         &failure.message,
+                        &api_key_id,
                         &api_key_name,
                     );
                     if !stream {
@@ -527,12 +550,13 @@ pub(super) async fn forward_openai(
                             failure.started,
                             None,
                             &failure.message,
+                            &api_key_id,
                             &api_key_name,
                         );
                     }
                     return Err(ProxyError::new(failure.status, failure.message));
                 }
-                finish_failed_attempt_log(
+                finish_failed_attempt_log_for_key(
                     &cfg,
                     early_log_id.take(),
                     api,
@@ -540,6 +564,7 @@ pub(super) async fn forward_openai(
                     &model,
                     failure.started,
                     &failure.message,
+                    &api_key_id,
                     &api_key_name,
                 );
                 last_error = Some(failure);
@@ -557,6 +582,7 @@ pub(super) async fn forward_openai(
                 failure.started,
                 None,
                 &failure.message,
+                &api_key_id,
                 &api_key_name,
             );
         }
@@ -582,6 +608,7 @@ pub(super) fn commit_result(
     stream: bool,
     early_log_id: Option<i64>,
     permit: Option<OwnedSemaphorePermit>,
+    api_key_id: &str,
     api_key_name: &str,
     circuit_guard: Option<ProviderCircuitGuard>,
 ) -> Response {
@@ -594,10 +621,12 @@ pub(super) fn commit_result(
                 model,
                 &result.upstream_model,
                 started,
+                api_key_id,
                 api_key_name,
             )
         });
         let api = api.to_string();
+        let api_key_id = api_key_id.to_string();
         let api_key_name = api_key_name.to_string();
         let provider = provider.to_string();
         let model = model.to_string();
@@ -619,6 +648,7 @@ pub(super) fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_id: &api_key_id,
                             api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
@@ -646,6 +676,7 @@ pub(super) fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_id: &api_key_id,
                             api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
@@ -673,6 +704,7 @@ pub(super) fn commit_result(
                         started,
                         UsageLogEvent {
                             api: &api,
+                            api_key_id: &api_key_id,
                             api_key_name: &api_key_name,
                             provider: &provider,
                             model: &model,
@@ -702,6 +734,7 @@ pub(super) fn commit_result(
             started,
             None,
             stream,
+            api_key_id,
             api_key_name,
         );
     }

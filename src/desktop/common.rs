@@ -1,7 +1,7 @@
+use super::assets::AnimatedGif;
 use crate::config::AppConfig;
 use eframe::egui;
 use std::path::PathBuf;
-use super::assets::AnimatedGif;
 
 // --- 颜色常量 ---
 pub fn accent() -> egui::Color32 {
@@ -141,7 +141,13 @@ pub fn metric_badge(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Co
         });
 }
 
-pub fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, color: egui::Color32) {
+pub fn metric_tile(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    detail: &str,
+    color: egui::Color32,
+) {
     egui::Frame::none()
         .fill(surface())
         .stroke(egui::Stroke::new(1.0, border()))

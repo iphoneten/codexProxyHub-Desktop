@@ -1,8 +1,10 @@
+use super::common::{
+    base_url, copy_icon_button, display_host, field_icon, muteds, section, switch,
+};
+use super::RoutingDraft;
 use crate::config::AppConfig;
 use eframe::egui;
 use std::collections::HashMap;
-use super::common::{base_url, copy_icon_button, field_icon, muteds, section};
-use super::RoutingDraft;
 
 pub fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
     section(ui, "服务", |ui| {
@@ -30,6 +32,37 @@ pub fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
                 egui::TextEdit::singleline(&mut readonly_url).desired_width(320.0),
             );
             copy_icon_button(ui, &url).on_hover_text("复制 Base URL");
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            switch(ui, &mut config.web.enabled);
+            ui.label("用户 Web");
+            ui.colored_label(muteds(), "与代理共用端口，挂载在 /user");
+        });
+        ui.horizontal(|ui| {
+            ui.label("会话时长");
+            ui.add(
+                egui::DragValue::new(&mut config.web.session_ttl_hours)
+                    .range(1..=24 * 30)
+                    .suffix(" 小时"),
+            );
+            if config.web.enabled {
+                let web_url = format!(
+                    "http://{}:{}/user",
+                    display_host(&config.server.host),
+                    config.server.port
+                );
+                ui.add_space(10.0);
+                ui.label("用户地址");
+                let mut readonly_url = web_url.clone();
+                ui.add_enabled(
+                    false,
+                    egui::TextEdit::singleline(&mut readonly_url).desired_width(260.0),
+                );
+                copy_icon_button(ui, &web_url).on_hover_text("复制用户 Web 地址");
+            }
         });
     });
 }

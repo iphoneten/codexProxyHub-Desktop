@@ -9,6 +9,10 @@ server:
   host: 127.0.0.1
   port: 8000
 
+web:
+  enabled: false
+  session_ttl_hours: 24
+
 auth:
   enabled: false
   api_keys: []
@@ -40,6 +44,7 @@ providers:
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `server` | object | 见下文 | 本地代理服务监听配置。 |
+| `web` | object | 见下文 | 用户 Web 控制台监听配置。 |
 | `auth` | object | 见下文 | 本地代理鉴权配置。 |
 | `routing` | object | 见下文 | 模型 fallback 和路由配置。 |
 | `usage_log` | object | 见下文 | 请求日志和用量统计配置。 |
@@ -52,6 +57,19 @@ providers:
 | --- | --- | --- | --- |
 | `host` | string | `127.0.0.1` | 本地代理监听地址。只允许本机访问用 `127.0.0.1`；局域网访问可用 `0.0.0.0`。 |
 | `port` | number | `8000` | 本地代理监听端口。运行中修改端口需要重启代理。 |
+
+## web
+
+User Web 与代理共用同一个监听端口，挂载在 `/user`。用户使用已启用的 API
+Key 登录，只能查看该 Key 产生的新请求日志。原始 API Key 不会保存在浏览器中，
+登录后使用进程内会话。
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | 是否启用用户 Web 控制台。启用后访问 `http://<server.host>:<server.port>/user`。 |
+| `host` | string | `127.0.0.1` | 兼容旧配置保留，当前同端口模式不单独监听。 |
+| `port` | number | `8001` | 兼容旧配置保留，当前同端口模式不单独监听。 |
+| `session_ttl_hours` | number | `24` | 登录会话有效时间，支持 `1` 到 `720` 小时。 |
 
 ## auth
 
