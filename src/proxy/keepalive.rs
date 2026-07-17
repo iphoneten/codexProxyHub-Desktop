@@ -201,7 +201,22 @@ pub(super) fn provider_keepalive_requires_client_headers(provider: &ProviderConf
 }
 
 pub(super) fn has_codex_session_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key("session_id") || headers.contains_key("conversation_id")
+    if headers.contains_key("session_id") || headers.contains_key("conversation_id") {
+        return true;
+    }
+    headers.iter().any(|(name, value)| {
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower.starts_with("x-codex-") || lower.starts_with("codex-") {
+            return true;
+        }
+        matches!(
+            lower.as_str(),
+            "originator" | "openai-client" | "user-agent"
+        ) && value
+            .to_str()
+            .map(|value| value.to_ascii_lowercase().contains("codex"))
+            .unwrap_or(false)
+    })
 }
 
 pub(super) fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {

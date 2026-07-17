@@ -699,6 +699,24 @@ fn keepalive_safe_headers_preserve_codex_markers_without_auth() {
 }
 
 #[test]
+fn keepalive_accepts_codex_client_markers_without_session_headers() {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "originator", "codex_cli_rs");
+    insert_header(&mut headers, "x-stainless-runtime", "rust");
+
+    assert!(has_codex_session_headers(&headers));
+}
+
+#[test]
+fn keepalive_rejects_non_codex_client_markers_without_session_headers() {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "user-agent", "opencode/1.0");
+    insert_header(&mut headers, "x-stainless-runtime", "rust");
+
+    assert!(!has_codex_session_headers(&headers));
+}
+
+#[test]
 fn upstream_headers_extra_headers_override_client_headers() {
     let mut p = provider(
         "openai",
