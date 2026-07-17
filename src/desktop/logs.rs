@@ -10,9 +10,55 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogRange {
+    Today,
+    SevenDays,
+    ThirtyDays,
+    All,
+}
+
+impl Default for LogRange {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl LogRange {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::Today, "今日"),
+        (Self::SevenDays, "7日"),
+        (Self::ThirtyDays, "30日"),
+        (Self::All, "全部"),
+    ];
+
+    fn start_timestamp(self) -> Option<String> {
+        let today = chrono::Local::now().date_naive();
+        self.start_timestamp_for(today)
+    }
+
+    fn start_timestamp_for(self, today: chrono::NaiveDate) -> Option<String> {
+        let days_back = match self {
+            Self::Today => 0,
+            Self::SevenDays => 6,
+            Self::ThirtyDays => 29,
+            Self::All => return None,
+        };
+        let start = today
+            .checked_sub_signed(chrono::Duration::days(days_back))
+            .unwrap_or(today)
+            .and_hms_opt(0, 0, 0)?;
+        Some(start.format("%Y-%m-%d %H:%M:%S").to_string())
+    }
+}
+
 pub struct LogViewState {
     pub(crate) rows: Vec<LogRow>,
     pub(crate) loaded_path: String,
+    loaded_range: LogRange,
+    loaded_api_key_id: String,
+    range: LogRange,
+    api_key_id: String,
     pub(crate) page: usize,
     pub(crate) total: usize,
     pub(crate) last_refresh: Option<Instant>,
@@ -25,6 +71,10 @@ impl Default for LogViewState {
         Self {
             rows: Vec::new(),
             loaded_path: String::new(),
+            loaded_range: LogRange::default(),
+            loaded_api_key_id: String::new(),
+            range: LogRange::default(),
+            api_key_id: String::new(),
             page: 0,
             total: 0,
             last_refresh: None,
@@ -50,7 +100,9 @@ pub fn logs_section(
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
     let source_key = format!("sqlite:{}", path.display());
-    if log_view.loaded_path != source_key {
+    let filter_changed = log_view.loaded_range != log_view.range
+        || log_view.loaded_api_key_id != log_view.api_key_id;
+    if log_view.loaded_path != source_key || filter_changed {
         log_view.page = 0;
         refresh_logs(config, log_view, Some(message));
     } else if log_view.live
@@ -72,6 +124,29 @@ pub fn logs_section(
                 egui::RichText::new(if log_view.live { "实时" } else { "已暂停" })
                     .color(if log_view.live { good() } else { muteds() }),
             );
+            ui.separator();
+            let mut changed = false;
+            for (range, label) in LogRange::OPTIONS {
+                changed |= ui
+                    .selectable_value(&mut log_view.range, range, label)
+                    .changed();
+            }
+            egui::ComboBox::from_id_source("log_api_key_filter")
+                .selected_text(selected_api_key_label(config, log_view))
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut log_view.api_key_id, String::new(), "全部 API Key")
+                        .changed();
+                    for option in api_key_filter_options(config) {
+                        changed |= ui
+                            .selectable_value(&mut log_view.api_key_id, option.id, option.label)
+                            .changed();
+                    }
+                });
+            if changed {
+                log_view.page = 0;
+                refresh_logs(config, log_view, Some(message));
+            }
             if soft_button(ui, "清空").clicked() {
                 match clear_logs(config) {
                     Ok(()) => {
@@ -195,6 +270,73 @@ pub fn logs_section(
     });
 }
 
+struct ApiKeyFilterOption {
+    id: String,
+    label: String,
+}
+
+fn api_key_filter_options(config: &AppConfig) -> Vec<ApiKeyFilterOption> {
+    config
+        .auth
+        .api_keys
+        .iter()
+        .map(|key| ApiKeyFilterOption {
+            id: proxy::api_key_id(&key.key),
+            label: if key.name.trim().is_empty() {
+                "未命名 Key".to_string()
+            } else {
+                key.name.clone()
+            },
+        })
+        .collect()
+}
+
+fn selected_api_key_label(config: &AppConfig, log_view: &LogViewState) -> String {
+    if log_view.api_key_id.trim().is_empty() {
+        return "全部 API Key".to_string();
+    }
+    api_key_filter_options(config)
+        .into_iter()
+        .find(|option| option.id == log_view.api_key_id)
+        .map(|option| option.label)
+        .unwrap_or_else(|| "已选 API Key".to_string())
+}
+
+fn api_key_name_for_id(config: &AppConfig, api_key_id: &str) -> Option<String> {
+    let target = api_key_id.trim();
+    if target.is_empty() {
+        return None;
+    }
+    config.auth.api_keys.iter().find_map(|key| {
+        (proxy::api_key_id(&key.key) == target).then(|| {
+            if key.name.trim().is_empty() {
+                "未命名 Key".to_string()
+            } else {
+                key.name.clone()
+            }
+        })
+    })
+}
+
+fn normalized_api_key_filter(api_key_id: &str) -> Option<&str> {
+    let trimmed = api_key_id.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn normalized_api_key_name_filter<'a>(
+    api_key_filter: Option<&str>,
+    api_key_name: Option<&'a str>,
+) -> Option<&'a str> {
+    api_key_filter?;
+    api_key_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "未命名 Key")
+}
+
 pub fn refresh_logs(
     config: &AppConfig,
     log_view: &mut LogViewState,
@@ -203,14 +345,27 @@ pub fn refresh_logs(
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
     log_view.loaded_path = format!("sqlite:{}", path.display());
+    log_view.loaded_range = log_view.range;
+    log_view.loaded_api_key_id = log_view.api_key_id.clone();
     log_view.last_refresh = Some(Instant::now());
-    let (final_rows, final_total, note) = match read_log_page(config, log_view.page, LOG_PAGE_SIZE)
-    {
+    let (final_rows, final_total, note) = match read_log_page(
+        config,
+        log_view.range,
+        &log_view.api_key_id,
+        log_view.page,
+        LOG_PAGE_SIZE,
+    ) {
         Ok((rows, total)) => {
             let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
             if log_view.page >= total_pages {
                 log_view.page = total_pages - 1;
-                match read_log_page(config, log_view.page, LOG_PAGE_SIZE) {
+                match read_log_page(
+                    config,
+                    log_view.range,
+                    &log_view.api_key_id,
+                    log_view.page,
+                    LOG_PAGE_SIZE,
+                ) {
                     Ok((rows2, total2)) => {
                         let count = rows2.len();
                         (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
@@ -226,7 +381,7 @@ pub fn refresh_logs(
     };
     log_view.total = final_total;
     log_view.rows = final_rows;
-    if let Ok(totals) = read_log_totals(config) {
+    if let Ok(totals) = read_filtered_log_totals(config, log_view.range, &log_view.api_key_id) {
         log_view.totals = totals;
     }
     if let Some(msg) = message {
@@ -237,11 +392,26 @@ pub fn refresh_logs(
     }
 }
 
-fn read_log_totals(config: &AppConfig) -> Result<LogTotals, String> {
-    read_sqlite_log_totals(config.usage_log_sqlite_path())
+fn read_filtered_log_totals(
+    config: &AppConfig,
+    range: LogRange,
+    api_key_id: &str,
+) -> Result<LogTotals, String> {
+    let api_key_name = api_key_name_for_id(config, api_key_id);
+    read_sqlite_log_totals(
+        config.usage_log_sqlite_path(),
+        range,
+        api_key_id,
+        api_key_name.as_deref(),
+    )
 }
 
-fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
+fn read_sqlite_log_totals(
+    path: PathBuf,
+    range: LogRange,
+    api_key_id: &str,
+    api_key_name: Option<&str>,
+) -> Result<LogTotals, String> {
     if !path.exists() {
         return Ok(LogTotals::default());
     }
@@ -249,10 +419,24 @@ fn read_sqlite_log_totals(path: PathBuf) -> Result<LogTotals, String> {
         .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
+    let range_start = range.start_timestamp();
+    let api_key_filter = normalized_api_key_filter(api_key_id);
+    let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
     let (input_tokens, output_tokens) = conn
         .query_row(
-            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM usage_logs",
-            [],
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+             FROM usage_logs
+             WHERE (?1 IS NULL OR ts >= ?1)
+               AND (
+                   ?2 IS NULL
+                   OR api_key_id = ?2
+                   OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
+               )",
+            rusqlite::params![
+                range_start.as_deref(),
+                api_key_filter.as_deref(),
+                api_key_name_filter
+            ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(|err| format!("汇总 SQLite Token 失败: {err}"))?;
@@ -281,14 +465,27 @@ fn clear_sqlite_logs(path_buf: PathBuf) -> Result<(), String> {
 
 fn read_log_page(
     config: &AppConfig,
+    range: LogRange,
+    api_key_id: &str,
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
-    read_sqlite_log_page(config.usage_log_sqlite_path(), page, page_size)
+    let api_key_name = api_key_name_for_id(config, api_key_id);
+    read_sqlite_log_page(
+        config.usage_log_sqlite_path(),
+        range,
+        api_key_id,
+        api_key_name.as_deref(),
+        page,
+        page_size,
+    )
 }
 
 fn read_sqlite_log_page(
     path: PathBuf,
+    range: LogRange,
+    api_key_id: &str,
+    api_key_name: Option<&str>,
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
@@ -299,10 +496,26 @@ fn read_sqlite_log_page(
         .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
+    let range_start = range.start_timestamp();
+    let api_key_filter = normalized_api_key_filter(api_key_id);
+    let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
     let total = conn
-        .query_row("SELECT COUNT(*) FROM usage_logs", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT COUNT(*)
+             FROM usage_logs
+             WHERE (?1 IS NULL OR ts >= ?1)
+               AND (
+                   ?2 IS NULL
+                   OR api_key_id = ?2
+                   OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
+               )",
+            rusqlite::params![
+                range_start.as_deref(),
+                api_key_filter.as_deref(),
+                api_key_name_filter
+            ],
+            |row| row.get::<_, i64>(0),
+        )
         .map_err(|err| format!("读取 SQLite 日志数量失败: {err}"))? as usize;
     let mut stmt = conn
         .prepare(
@@ -311,15 +524,27 @@ fn read_sqlite_log_page(
                 ts, status, api_key_name, api, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error
             FROM usage_logs
+            WHERE (?1 IS NULL OR ts >= ?1)
+              AND (
+                  ?2 IS NULL
+                  OR api_key_id = ?2
+                  OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
+              )
             ORDER BY id DESC
-            LIMIT ?1
-            OFFSET ?2
+            LIMIT ?4
+            OFFSET ?5
             "#,
         )
         .map_err(|err| format!("读取 SQLite 日志失败: {err}"))?;
     let rows = stmt
         .query_map(
-            [page_size as i64, page.saturating_mul(page_size) as i64],
+            rusqlite::params![
+                range_start.as_deref(),
+                api_key_filter.as_deref(),
+                api_key_name_filter,
+                page_size as i64,
+                page.saturating_mul(page_size) as i64
+            ],
             |row| {
                 let latency_ms: i64 = row.get(7)?;
                 let first_token_ms: Option<i64> = row.get(8)?;
@@ -435,5 +660,98 @@ fn log_status_cell(ui: &mut egui::Ui, status: &str, loading_gif: Option<&Animate
         });
     } else {
         ui.label(status_text(status));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insert_test_log(
+        conn: &rusqlite::Connection,
+        ts: &str,
+        api_key_id: &str,
+        api_key_name: &str,
+        input_tokens: i64,
+    ) {
+        conn.execute(
+            r#"
+            INSERT INTO usage_logs
+                (ts, api, status, channel, request_model, upstream_model,
+                 latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                 token_source, api_key_id, api_key_name)
+            VALUES
+                (?1, 'responses', 'ok', 'test-channel', 'gpt-test', 'gpt-test',
+                 100, 50, ?4, 1, '', 'upstream', ?2, ?3)
+            "#,
+            rusqlite::params![ts, api_key_id, api_key_name, input_tokens],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn log_range_starts_at_local_day_boundary() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+
+        assert_eq!(
+            LogRange::Today.start_timestamp_for(today).as_deref(),
+            Some("2026-07-17 00:00:00")
+        );
+        assert_eq!(
+            LogRange::SevenDays.start_timestamp_for(today).as_deref(),
+            Some("2026-07-11 00:00:00")
+        );
+        assert_eq!(
+            LogRange::ThirtyDays.start_timestamp_for(today).as_deref(),
+            Some("2026-06-18 00:00:00")
+        );
+        assert_eq!(LogRange::All.start_timestamp_for(today), None);
+    }
+
+    #[test]
+    fn sqlite_logs_filter_by_range_and_api_key() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-filter-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        let today = chrono::Local::now().date_naive();
+        let today_ts = today
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let old_ts = today
+            .checked_sub_signed(chrono::Duration::days(10))
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        insert_test_log(&conn, &today_ts, "key-a", "A", 10);
+        insert_test_log(&conn, &today_ts, "key-b", "B", 20);
+        insert_test_log(&conn, &today_ts, "", "A", 40);
+        insert_test_log(&conn, &old_ts, "key-a", "A", 30);
+        drop(conn);
+
+        let (rows, total) =
+            read_sqlite_log_page(path.clone(), LogRange::Today, "key-a", Some("A"), 0, 20).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].api_key_name, "A");
+        let today_totals =
+            read_sqlite_log_totals(path.clone(), LogRange::Today, "key-a", Some("A")).unwrap();
+        assert_eq!(today_totals.input_tokens, 50);
+        assert_eq!(today_totals.output_tokens, 2);
+
+        let (_, total) =
+            read_sqlite_log_page(path.clone(), LogRange::All, "key-a", Some("A"), 0, 20).unwrap();
+        assert_eq!(total, 3);
+        let all_totals = read_sqlite_log_totals(path.clone(), LogRange::All, "", None).unwrap();
+        assert_eq!(all_totals.input_tokens, 100);
+        assert_eq!(all_totals.output_tokens, 4);
+
+        let _ = std::fs::remove_file(path);
     }
 }
