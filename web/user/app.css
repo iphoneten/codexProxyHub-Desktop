@@ -324,7 +324,7 @@ button {
 
 .access-bar {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
+  grid-template-columns: 150px minmax(0, 1fr) 170px;
   gap: 20px;
   margin-top: 14px;
   padding: 13px 16px;

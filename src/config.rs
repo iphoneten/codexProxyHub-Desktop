@@ -102,6 +102,8 @@ pub struct ApiKeyConfig {
     #[serde(default)]
     pub max_concurrency: Option<usize>,
     #[serde(default)]
+    pub daily_token_limit: Option<u64>,
+    #[serde(default)]
     pub allowed_models: Vec<String>,
     #[serde(default)]
     pub allowed_providers: Vec<String>,

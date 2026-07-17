@@ -23,6 +23,7 @@ struct UserSummary {
     errors: i64,
     input_tokens: i64,
     output_tokens: i64,
+    today_tokens: i64,
 }
 
 #[derive(Serialize)]
@@ -89,11 +90,12 @@ fn read_dashboard(
                 COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0)
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(CASE WHEN ts >= ?2 THEN input_tokens + output_tokens ELSE 0 END), 0)
             FROM usage_logs
             WHERE api_key_id = ?1
             "#,
-            params![api_key_id],
+            params![api_key_id, day_start()],
             |row| {
                 Ok(UserSummary {
                     requests: row.get(0)?,
@@ -101,6 +103,7 @@ fn read_dashboard(
                     errors: row.get(2)?,
                     input_tokens: row.get(3)?,
                     output_tokens: row.get(4)?,
+                    today_tokens: row.get(5)?,
                 })
             },
         )
@@ -151,6 +154,10 @@ fn read_dashboard(
 
 fn default_page_size() -> usize {
     20
+}
+
+fn day_start() -> String {
+    chrono::Local::now().format("%Y-%m-%d 00:00:00").to_string()
 }
 
 #[cfg(test)]

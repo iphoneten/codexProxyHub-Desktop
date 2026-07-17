@@ -35,6 +35,7 @@ const elements = {
   metricOutput: document.querySelector("#metric-output"),
   limitConcurrency: document.querySelector("#limit-concurrency"),
   allowedModels: document.querySelector("#allowed-models"),
+  dailyTokens: document.querySelector("#daily-tokens"),
 };
 
 async function api(path, options = {}) {
@@ -82,7 +83,18 @@ function updateUser(user) {
   elements.userName.textContent = user.name || "未命名 Key";
   elements.limitConcurrency.textContent = String(user.max_concurrency ?? "-");
   elements.allowedModels.textContent = formatAccessList(user.allowed_models, "全部模型");
+  elements.dailyTokens.textContent = formatDailyTokens(
+    user.today_tokens,
+    user.daily_token_limit,
+  );
   elements.allowedModels.title = elements.allowedModels.textContent;
+  elements.dailyTokens.title = elements.dailyTokens.textContent;
+}
+
+function formatDailyTokens(used, limit) {
+  const displayUsed = formatNumber(used);
+  if (!limit || Number(limit) <= 0) return `${displayUsed} / 不限`;
+  return `${displayUsed} / ${formatNumber(limit)}`;
 }
 
 function formatAccessList(values, fallback) {
@@ -133,6 +145,11 @@ function renderDashboard(payload) {
   elements.metricErrors.textContent = formatNumber(summary.errors);
   elements.metricInput.textContent = formatNumber(summary.input_tokens);
   elements.metricOutput.textContent = formatNumber(summary.output_tokens);
+  elements.dailyTokens.textContent = formatDailyTokens(
+    summary.today_tokens,
+    payload.user?.daily_token_limit,
+  );
+  elements.dailyTokens.title = elements.dailyTokens.textContent;
   elements.logCount.textContent = `共 ${formatNumber(state.total)} 条`;
 
   elements.logRows.replaceChildren();

@@ -430,6 +430,24 @@ pub(super) fn update_usage_log_sqlite(
     )
 }
 
+pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusqlite::Result<i64> {
+    if api_key_id.trim().is_empty() {
+        return Ok(0);
+    }
+    let conn = open_usage_log_connection(path)?;
+    ensure_usage_log_schema(&conn)?;
+    let day_start = chrono::Local::now().format("%Y-%m-%d 00:00:00").to_string();
+    conn.query_row(
+        r#"
+        SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+        FROM usage_logs
+        WHERE api_key_id = ?1 AND ts >= ?2
+        "#,
+        params![api_key_id, day_start],
+        |row| row.get(0),
+    )
+}
+
 pub(crate) fn open_usage_log_connection(path: PathBuf) -> rusqlite::Result<Connection> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);

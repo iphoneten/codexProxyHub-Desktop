@@ -57,6 +57,7 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                     enabled: true,
                     created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     max_concurrency: Some(5),
+                    daily_token_limit: None,
                     allowed_models: Vec::new(),
                     allowed_providers: Vec::new(),
                 });
@@ -71,6 +72,7 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                 ui.label("启用");
                 ui.label("名称");
                 ui.label("并发");
+                ui.label("每日 Token");
                 ui.label("允许模型");
                 ui.label("允许渠道");
                 ui.label("API 秘钥");
@@ -87,6 +89,23 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                             .range(1..=500)
                             .speed(1),
                     );
+                    let mut daily_limit = key.daily_token_limit.unwrap_or(0);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut daily_limit)
+                                .range(0..=1_000_000_000_u64)
+                                .speed(1000)
+                                .suffix(" t"),
+                        )
+                        .on_hover_text("每日 Token 上限，0 表示不限")
+                        .changed()
+                    {
+                        key.daily_token_limit = if daily_limit == 0 {
+                            None
+                        } else {
+                            Some(daily_limit)
+                        };
+                    }
                     allowed_models_selector(ui, idx, key, &selectable_models);
                     allowed_providers_selector(ui, idx, key, &selectable_providers);
                     ui.horizontal(|ui| {

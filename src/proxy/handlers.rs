@@ -65,6 +65,7 @@ pub(super) async fn chat_completions(
     let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
+    enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
         headers,
@@ -89,6 +90,7 @@ pub(super) async fn completions(
     let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
+    enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
         headers,
@@ -113,6 +115,7 @@ pub(super) async fn embeddings(
     let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
+    enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
         headers,
@@ -137,6 +140,7 @@ pub(super) async fn responses(
     let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
     ensure_api_key_allows_model(&auth, &model)?;
+    enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     let api_key_name = auth.key_name;
     let allowed_providers = auth.allowed_providers;
     let mut permit = Some(auth.permit);

@@ -89,6 +89,7 @@ Web 控制台与代理共用同一个监听端口。用户控制台挂载在 `/u
 | `enabled` | bool | `true` | 是否启用该 Key。 |
 | `created_at` | string | `""` | 创建时间，仅用于展示。 |
 | `max_concurrency` | number | `5` | 该 API Key 允许同时处理的最大请求数，超过会返回 429。 |
+| `daily_token_limit` | number/null | `null` | 每日 Token 上限，按本地自然日累计 `input_tokens + output_tokens`。为空或 `0` 表示不限，达到上限后新请求返回 429。 |
 | `allowed_models` | array<string> | `[]` | 允许访问的模型；空列表或 `*` 表示允许全部模型。 |
 | `allowed_providers` | array<string> | `[]` | 允许使用的渠道名称；空列表或 `*` 表示允许全部渠道，路由与故障转移不会越过该列表。 |
 

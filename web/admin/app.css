@@ -510,15 +510,19 @@ tbody tr:hover td {
 }
 
 .key-table th:nth-child(6) {
-  width: 96px;
+  width: 126px;
 }
 
 .key-table th:nth-child(7) {
+  width: 96px;
+}
+
+.key-table th:nth-child(8) {
   width: 112px;
 }
 
-.key-table th:nth-child(8),
-.key-table th:nth-child(9) {
+.key-table th:nth-child(9),
+.key-table th:nth-child(10) {
   width: 148px;
 }
 

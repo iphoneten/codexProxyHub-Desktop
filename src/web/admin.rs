@@ -51,6 +51,7 @@ struct UsageBreakdown {
     input_tokens: i64,
     output_tokens: i64,
     last_seen: String,
+    today_tokens: i64,
 }
 
 #[derive(Serialize)]
@@ -67,6 +68,7 @@ struct ProviderView {
     input_tokens: i64,
     output_tokens: i64,
     last_seen: String,
+    today_tokens: i64,
 }
 
 #[derive(Serialize)]
@@ -75,6 +77,7 @@ struct ApiKeyView {
     enabled: bool,
     created_at: String,
     max_concurrency: usize,
+    daily_token_limit: Option<u64>,
     allowed_models: Vec<String>,
     requests: i64,
     success: i64,
@@ -82,6 +85,7 @@ struct ApiKeyView {
     input_tokens: i64,
     output_tokens: i64,
     last_seen: String,
+    today_tokens: i64,
 }
 
 #[derive(Serialize)]
@@ -287,6 +291,7 @@ fn read_admin_dashboard(
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 last_seen: usage.last_seen,
+                today_tokens: usage.today_tokens,
             }
         })
         .collect::<Vec<_>>();
@@ -313,6 +318,7 @@ fn read_admin_dashboard(
                     .max_concurrency
                     .or(config.auth.max_concurrency_per_key)
                     .unwrap_or(5),
+                daily_token_limit: key.daily_token_limit,
                 allowed_models: key.allowed_models.clone(),
                 requests: usage.requests,
                 success: usage.success,
@@ -320,6 +326,7 @@ fn read_admin_dashboard(
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 last_seen: usage.last_seen,
+                today_tokens: usage.today_tokens,
             }
         })
         .collect::<Vec<_>>();
@@ -377,7 +384,8 @@ fn read_usage_breakdown(
             COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'raw', '-') THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
-            COALESCE(MAX(ts), '')
+            COALESCE(MAX(ts), ''),
+            COALESCE(SUM(CASE WHEN ts >= ?1 THEN input_tokens + output_tokens ELSE 0 END), 0)
         FROM usage_logs
         WHERE {condition}
         GROUP BY {column}
@@ -387,7 +395,7 @@ fn read_usage_breakdown(
         .prepare(&sql)
         .map_err(|err| format!("准备管理统计失败: {err}"))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([today_start()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 UsageBreakdown {
@@ -397,12 +405,17 @@ fn read_usage_breakdown(
                     input_tokens: row.get(4)?,
                     output_tokens: row.get(5)?,
                     last_seen: row.get(6)?,
+                    today_tokens: row.get(7)?,
                 },
             ))
         })
         .map_err(|err| format!("查询管理统计失败: {err}"))?;
     rows.collect::<Result<HashMap<_, _>, _>>()
         .map_err(|err| format!("解析管理统计失败: {err}"))
+}
+
+fn today_start() -> String {
+    chrono::Local::now().format("%Y-%m-%d 00:00:00").to_string()
 }
 
 fn read_logs(

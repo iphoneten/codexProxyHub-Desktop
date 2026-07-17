@@ -50,6 +50,7 @@ fn auth_access_with_models(state: &AppState, allowed_models: &[&str]) -> AuthAcc
             .acquire_api_key_permit("allowed-models-test", 5)
             .unwrap(),
         key_name: "test".to_string(),
+        daily_token_limit: None,
         allowed_models: allowed_models
             .iter()
             .map(|model| model.to_string())

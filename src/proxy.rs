@@ -348,6 +348,7 @@ struct ApiKeyLimiter {
 struct AuthAccess {
     permit: OwnedSemaphorePermit,
     key_name: String,
+    daily_token_limit: Option<u64>,
     allowed_models: Vec<String>,
     allowed_providers: Vec<String>,
 }

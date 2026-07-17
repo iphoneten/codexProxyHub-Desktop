@@ -111,6 +111,12 @@ function accessList(values) {
   return values.join("、");
 }
 
+function dailyTokenText(used, limit) {
+  const displayUsed = formatNumber(used);
+  if (!limit || Number(limit) <= 0) return `${displayUsed} / 不限`;
+  return `${displayUsed} / ${formatNumber(limit)}`;
+}
+
 function statusLabel(status) {
   if (status === "ok" || status === "stream_started") return ["成功", "ok"];
   if (status === "running") return ["运行中", "running"];
@@ -187,6 +193,7 @@ function renderApiKeys(apiKeys) {
     const models = accessList(key.allowed_models);
     appendCell(row, models, models);
     appendCell(row, formatNumber(key.requests));
+    appendCell(row, dailyTokenText(key.today_tokens, key.daily_token_limit));
     appendCell(row, percentage(key.success, key.errors));
     appendCell(
       row,

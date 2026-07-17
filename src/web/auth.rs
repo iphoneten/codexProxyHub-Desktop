@@ -24,6 +24,7 @@ pub(super) struct UserProfile {
     pub(super) api_key_id: String,
     pub(super) name: String,
     pub(super) max_concurrency: usize,
+    pub(super) daily_token_limit: Option<u64>,
     pub(super) allowed_models: Vec<String>,
     pub(super) allowed_providers: Vec<String>,
 }
@@ -126,6 +127,7 @@ fn profile_for_key(config: &crate::config::AppConfig, key: &ApiKeyConfig) -> Use
             .max_concurrency
             .or(config.auth.max_concurrency_per_key)
             .unwrap_or(5),
+        daily_token_limit: key.daily_token_limit,
         allowed_models: key.allowed_models.clone(),
         allowed_providers: key.allowed_providers.clone(),
     }
