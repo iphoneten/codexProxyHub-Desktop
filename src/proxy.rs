@@ -34,6 +34,7 @@ use uuid::Uuid;
 mod auth;
 mod handlers;
 mod keepalive;
+mod oauth;
 mod routing;
 mod streaming;
 mod upstream;
@@ -42,6 +43,7 @@ mod usage_log;
 use auth::*;
 use handlers::*;
 use keepalive::*;
+use oauth::*;
 use routing::*;
 use streaming::*;
 use upstream::*;
@@ -375,6 +377,8 @@ struct AppState {
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
     usage_injection: Arc<Mutex<HashMap<String, bool>>>,
+    oauth_tokens: Arc<Mutex<HashMap<String, OAuthRuntimeToken>>>,
+    oauth_refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -766,6 +770,8 @@ pub async fn run_server(
         provider_statuses: circuit_status,
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
+        oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
+        oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
     };
     let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
     let keepalive_task = tokio::spawn(keepalive_loop(
@@ -835,6 +841,8 @@ mod state_tests {
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
+            oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
+            oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

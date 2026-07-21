@@ -15,6 +15,7 @@ mod about;
 mod analytics;
 mod assets;
 mod auth;
+mod auth_accounts;
 mod common;
 mod logs;
 mod overview;
@@ -81,6 +82,7 @@ pub struct HubApp {
     loading_gif: Option<AnimatedGif>,
     log_view: LogViewState,
     overview_analytics: OverviewAnalyticsState,
+    auth_accounts_state: auth_accounts::AuthAccountsState,
     config_handle: Option<ConfigHandle>,
     keepalive_status: Option<proxy::KeepaliveStatusHandle>,
     circuit_status: Option<proxy::ProviderCircuitStatusHandle>,
@@ -98,6 +100,7 @@ pub struct HubApp {
 pub(crate) enum AppView {
     Overview,
     Providers,
+    AuthAccounts,
     Auth,
     Logs,
     Settings,
@@ -150,6 +153,7 @@ impl HubApp {
             ),
             log_view: LogViewState::default(),
             overview_analytics: OverviewAnalyticsState::default(),
+            auth_accounts_state: auth_accounts::AuthAccountsState::default(),
             config_handle: None,
             keepalive_status: None,
             circuit_status: None,
@@ -222,13 +226,18 @@ impl HubApp {
         };
         let target_path = PathBuf::from(self.config_path.trim());
 
-        match AppConfig::load(&source_path) {
-            Ok(imported) => match imported.save(&target_path) {
+        match crate::config_import::import_file(&source_path, self.config.as_ref()) {
+            Ok(imported) => match imported.config.save(&target_path) {
                 Ok(()) => match AppConfig::load(&target_path) {
                     Ok(config) => {
                         self.replace_config(config);
+                        let detail = if imported.replaced_config {
+                            "配置已导入".to_string()
+                        } else {
+                            format!("已导入或更新 {} 个 Auth 账号", imported.imported_accounts)
+                        };
                         self.message = AppMessage::new(
-                            format!("配置已导入: {}", source_path.display()),
+                            format!("{detail}: {}", source_path.display()),
                             MessageKind::Success,
                         );
                     }
@@ -496,6 +505,18 @@ impl eframe::App for HubApp {
                                 self.circuit_status.as_ref(),
                             );
                         }
+                        AppView::AuthAccounts => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    auth_accounts::auth_accounts_section(
+                                        ui,
+                                        config,
+                                        &mut self.message,
+                                        &mut self.auth_accounts_state,
+                                    );
+                                });
+                        }
                         AppView::Auth => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
@@ -536,7 +557,9 @@ impl eframe::App for HubApp {
                 });
         });
 
-        let repaint_ms = if self.log_view.rows.iter().any(|row| row.status == "running") {
+        let repaint_ms = if self.log_view.rows.iter().any(|row| row.status == "running")
+            || self.auth_accounts_state.has_refreshing()
+        {
             100
         } else {
             500
@@ -674,6 +697,7 @@ fn side_navigation(ui: &mut egui::Ui, app: &mut HubApp) {
             ui.set_min_height(ui.available_height());
             nav_item(ui, &mut next_view, AppView::Overview, "概览");
             nav_item(ui, &mut next_view, AppView::Providers, "渠道");
+            nav_item(ui, &mut next_view, AppView::AuthAccounts, "Auth 账号");
             nav_item(ui, &mut next_view, AppView::Auth, "鉴权");
             nav_item(ui, &mut next_view, AppView::Logs, "日志");
             nav_item(ui, &mut next_view, AppView::Settings, "设置");

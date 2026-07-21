@@ -154,6 +154,13 @@ pub(super) async fn responses(
 
     for (provider, request_model) in providers {
         let started = Instant::now();
+        let provider = match state.provider_with_fresh_oauth(&provider).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
+                continue;
+            }
+        };
         let circuit_guard =
             match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
                 Ok(guard) => guard,
@@ -511,6 +518,13 @@ pub(super) async fn forward_openai(
 
     for (provider, request_model) in providers {
         let started = Instant::now();
+        let provider = match state.provider_with_fresh_oauth(&provider).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
+                continue;
+            }
+        };
         let circuit_guard =
             match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
                 Ok(guard) => guard,

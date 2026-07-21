@@ -1050,7 +1050,9 @@ pub(super) fn upstream_headers(
         ) {
             continue;
         }
-        let value = value.replace("{api_key}", &provider.api_key);
+        let value = value
+            .replace("{api_key}", &provider.api_key)
+            .replace("{access_token}", &provider.api_key);
         if let (Ok(name), Ok(value)) = (
             http::header::HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(&value),

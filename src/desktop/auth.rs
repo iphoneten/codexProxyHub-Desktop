@@ -359,6 +359,12 @@ pub fn selectable_allowed_providers(config: &AppConfig) -> Vec<(String, bool)> {
             }
         })
         .collect::<HashMap<_, _>>();
+    for account in &config.auth_accounts {
+        let name = format!("auth:{}", account.id.trim());
+        if !account.id.trim().is_empty() {
+            providers.insert(name, account.enabled);
+        }
+    }
     for key in &config.auth.api_keys {
         for provider in &key.allowed_providers {
             let provider = provider.trim();
@@ -379,6 +385,18 @@ pub fn available_model_names(config: &AppConfig) -> Vec<String> {
             models.insert(model.trim().to_string());
         }
         for model in provider.model_mapping.keys() {
+            models.insert(model.trim().to_string());
+        }
+    }
+    for account in config
+        .auth_accounts
+        .iter()
+        .filter(|account| account.enabled)
+    {
+        for model in &account.models {
+            models.insert(model.trim().to_string());
+        }
+        for model in account.model_mapping.keys() {
             models.insert(model.trim().to_string());
         }
     }

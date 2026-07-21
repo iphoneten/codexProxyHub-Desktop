@@ -340,6 +340,38 @@ extra_headers:
 | 未知顶层字段 | 保留 | 例如旧版 OAuth/Antigravity 字段会被读取和保存，但核心代理不消费。 |
 | 未知 provider 字段 | 保留 | 用于兼容旧配置或未来扩展。 |
 
+## Auth 账号
+
+OpenAI OAuth 账号独立保存在顶层 `auth_accounts`，不属于普通 `providers` 渠道。代理运行时会把启用账号适配为 Codex Responses 上游，并在 JWT 临近过期时通过 `refresh_token` 刷新：
+
+```yaml
+auth_accounts:
+  - id: acct-local-1
+    name: user@example.com
+    enabled: true
+    email: user@example.com
+    access_token: eyJ...
+    refresh_token: rt_...
+    account_id: acct_...
+    client_id: app_EMoamEEZ73f0CkXaXp7hrann
+    token_url: https://auth.openai.com/oauth/token
+    models:
+      - gpt-5.4
+    priority: 1
+    weight: 1
+```
+
+桌面端“导入配置”支持：
+
+- CPA 单账号 Token JSON。
+- CPA 导出的账号 JSON 数组。
+- sub2api 的 `accounts` 或 `data.accounts` JSON。
+- `token`/`refreshToken` 驼峰账号格式。
+
+OAuth JSON 导入采用追加或更新 Auth 账号，不覆盖现有服务、渠道、鉴权和路由配置；YAML 配置导入仍保持完整替换行为。
+
+Auth 账号页的“导出账号”生成 RouteHub 专用 JSON，包含 `auth_accounts` 数组，可直接再次导入；导入 CPA/sub2api JSON 时会自动识别其账号数组和 `credentials` 嵌套结构。
+
 ### antigravity_auth
 
 `antigravity_auth` 是旧版兼容扩展字段，当前 Rust 核心代理不会使用，但导入、编辑和保存配置时会保留。

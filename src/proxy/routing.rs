@@ -29,6 +29,17 @@ pub(super) fn provider_attempts(
             })
             .cloned()
             .collect();
+        providers.extend(
+            cfg.auth_accounts
+                .iter()
+                .filter(|account| account.enabled)
+                .map(auth_account_as_provider)
+                .filter(|p| {
+                    api_key_allows_provider(allowed_providers, &p.name)
+                        && provider_supports_model(p, &request_model)
+                        && provider_supports_api(p, api)
+                }),
+        );
         providers.sort_by_key(|p| (p.priority, p.name.clone()));
         let mut by_priority: HashMap<i32, Vec<ProviderConfig>> = HashMap::new();
         for provider in providers {
@@ -174,11 +185,20 @@ pub(super) fn provider_supports_api(provider: &ProviderConfig, api: &str) -> boo
 
 pub(super) fn collect_models(config: &AppConfig, allowed_providers: &[String]) -> Vec<String> {
     let mut models = Vec::new();
-    for provider in config
+    let providers = config
         .providers
         .iter()
         .filter(|p| p.enabled && api_key_allows_provider(allowed_providers, &p.name))
-    {
+        .cloned()
+        .chain(
+            config
+                .auth_accounts
+                .iter()
+                .filter(|account| account.enabled)
+                .map(auth_account_as_provider)
+                .filter(|p| api_key_allows_provider(allowed_providers, &p.name)),
+        );
+    for provider in providers {
         for model in &provider.models {
             if !models.contains(model) {
                 models.push(model.clone());

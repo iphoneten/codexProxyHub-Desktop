@@ -409,7 +409,10 @@ pub fn display_host(host: &str) -> &str {
 
 pub fn config_file_dialog(config_path: &str) -> rfd::FileDialog {
     let path = PathBuf::from(config_path.trim());
-    let mut dialog = rfd::FileDialog::new().add_filter("YAML 配置", &["yaml", "yml"]);
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("配置与账号", &["yaml", "yml", "json"])
+        .add_filter("YAML 配置", &["yaml", "yml"])
+        .add_filter("CPA / sub2api JSON", &["json"]);
     if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
         dialog = dialog.set_directory(parent);
     }

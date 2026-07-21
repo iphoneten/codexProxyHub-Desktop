@@ -785,5 +785,6 @@ pub fn default_provider() -> ProviderConfig {
         persist_keepalive_model: None,
         persist_keepalive_prompt: "Hi".to_string(),
         extra: Default::default(),
+        auth_account_id: None,
     }
 }

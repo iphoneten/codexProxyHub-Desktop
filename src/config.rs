@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub usage_log: UsageLogConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub auth_accounts: Vec<AuthAccountConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
     #[serde(skip)]
@@ -201,6 +203,41 @@ pub struct ProviderConfig {
     pub persist_keepalive_prompt: String,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub auth_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthAccountConfig {
+    pub id: String,
+    #[serde(default = "default_auth_account_name")]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default = "default_openai_oauth_client_id")]
+    pub client_id: String,
+    #[serde(default = "default_openai_oauth_token_url")]
+    pub token_url: String,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default = "default_auth_account_models")]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub model_mapping: HashMap<String, String>,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl AppConfig {
@@ -341,6 +378,18 @@ fn default_key_name() -> String {
 }
 fn default_provider_type() -> String {
     "openai".to_string()
+}
+fn default_auth_account_name() -> String {
+    "OpenAI Auth".to_string()
+}
+fn default_openai_oauth_client_id() -> String {
+    "app_EMoamEEZ73f0CkXaXp7hrann".to_string()
+}
+fn default_openai_oauth_token_url() -> String {
+    "https://auth.openai.com/oauth/token".to_string()
+}
+fn default_auth_account_models() -> Vec<String> {
+    vec!["gpt-5.4".to_string()]
 }
 fn default_health_check_mode() -> String {
     "models".to_string()

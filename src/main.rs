@@ -4,7 +4,9 @@
 )]
 
 mod anthropic;
+mod auth_quota;
 mod config;
+mod config_import;
 mod desktop;
 mod google_ai;
 #[cfg(target_os = "macos")]

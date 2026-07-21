@@ -62,6 +62,7 @@ pub(super) async fn send_provider_keepalive(
     state: &AppState,
     provider: &ProviderConfig,
 ) -> Result<(), ProxyError> {
+    let provider = state.provider_with_fresh_oauth(provider).await?;
     let model = provider
         .persist_keepalive_model
         .as_deref()
@@ -74,12 +75,12 @@ pub(super) async fn send_provider_keepalive(
     } else {
         provider.persist_keepalive_prompt.trim()
     };
-    let (path, body) = build_keepalive_request(provider, &model, prompt)?;
+    let (path, body) = build_keepalive_request(&provider, &model, prompt)?;
     let request_headers = state
-        .cached_keepalive_headers(provider)
+        .cached_keepalive_headers(&provider)
         .filter(has_codex_session_headers)
         .or_else(|| {
-            if provider_keepalive_requires_client_headers(provider) {
+            if provider_keepalive_requires_client_headers(&provider) {
                 None
             } else {
                 Some(keepalive_request_headers())
@@ -92,18 +93,18 @@ pub(super) async fn send_provider_keepalive(
             )
         })?;
 
-    let client = state.client_for_provider(provider);
-    let _ = if is_google_native_provider(provider) {
+    let client = state.client_for_provider(&provider);
+    let _ = if is_google_native_provider(&provider) {
         send_json_to_provider_with_headers(
             &client,
-            provider,
+            &provider,
             &path,
-            google_ai_headers(provider, &request_headers, false),
+            google_ai_headers(&provider, &request_headers, false),
             body,
         )
         .await?
     } else {
-        send_json_to_provider(&client, provider, &path, &request_headers, body).await?
+        send_json_to_provider(&client, &provider, &path, &request_headers, body).await?
     };
     Ok(())
 }

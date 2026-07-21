@@ -42,6 +42,8 @@ fn test_state() -> AppState {
         provider_statuses: Arc::new(RwLock::new(HashMap::new())),
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
+        oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
+        oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
