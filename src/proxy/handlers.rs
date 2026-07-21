@@ -427,8 +427,14 @@ pub(super) fn prefer_provider(providers: &mut Vec<(ProviderConfig, String)>, pre
     else {
         return;
     };
+    // 会话亲和只在同来源组内提前，避免破坏「账号优先 / 渠道优先」的组顺序。
+    let is_auth = providers[index].0.auth_account_id.is_some();
     let item = providers.remove(index);
-    providers.insert(0, item);
+    let insert_at = providers
+        .iter()
+        .position(|(provider, _)| provider.auth_account_id.is_some() == is_auth)
+        .unwrap_or(providers.len());
+    providers.insert(insert_at, item);
 }
 
 pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
@@ -482,6 +488,23 @@ mod tests {
 
         assert_eq!(providers[0].0.name, "muyuan");
         assert_eq!(providers[1].0.name, "anyrouter");
+    }
+
+    #[test]
+    fn prefer_provider_keeps_auth_accounts_ahead_when_affinity_is_channel() {
+        let mut auth = provider_with_name("auth:acct");
+        auth.auth_account_id = Some("acct".to_string());
+        let channel = provider_with_name("channel-a");
+        let mut providers = vec![
+            (auth, "gpt-test".to_string()),
+            (channel, "gpt-test".to_string()),
+        ];
+
+        prefer_provider(&mut providers, "channel-a");
+
+        assert_eq!(providers[0].0.name, "auth:acct");
+        assert_eq!(providers[1].0.name, "channel-a");
+        assert!(providers[0].0.auth_account_id.is_some());
     }
 
     #[test]

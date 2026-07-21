@@ -111,10 +111,25 @@ pub struct ApiKeyConfig {
     pub allowed_providers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub model_fallbacks: HashMap<String, Vec<String>>,
+    #[serde(default = "default_routing_auth_preference")]
+    pub auth_preference: String,
+    /// Auth 账号专用代理。用于 OAuth 换 token、额度刷新、运行时刷新与 Auth 上游请求。
+    #[serde(default)]
+    pub auth_proxy: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            model_fallbacks: HashMap::new(),
+            auth_preference: default_routing_auth_preference(),
+            auth_proxy: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +448,9 @@ fn default_usage_backend() -> String {
 fn default_sqlite_path() -> String {
     "logs/proxy_usage.sqlite3".to_string()
 }
+fn default_routing_auth_preference() -> String {
+    "provider_first".to_string()
+}
 fn default_debug_sse_path() -> String {
     "logs/raw_sse".to_string()
 }
@@ -452,6 +470,8 @@ mod tests {
         assert_eq!(cfg.server.port, 8000);
         assert_eq!(cfg.auth.max_concurrency_per_key, None);
         assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.routing.auth_preference, "provider_first");
+        assert!(cfg.routing.auth_proxy.is_empty());
     }
 
     #[test]
@@ -536,6 +556,32 @@ usage_log:
             cfg.usage_log_sqlite_path(),
             PathBuf::from("/tmp/RouteHub/logs/proxy_usage.sqlite3")
         );
+    }
+
+    #[test]
+    fn auth_proxy_roundtrips_in_yaml() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+server:
+  host: 127.0.0.1
+  port: 8000
+routing:
+  auth_preference: auth_first
+  auth_proxy: "http://127.0.0.1:7890"
+providers: []
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.routing.auth_preference, "auth_first");
+        assert_eq!(cfg.routing.auth_proxy, "http://127.0.0.1:7890");
+
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains("auth_proxy:"));
+        assert!(yaml.contains("http://127.0.0.1:7890"));
+
+        let reloaded: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.routing.auth_proxy, "http://127.0.0.1:7890");
+        assert_eq!(reloaded.routing.auth_preference, "auth_first");
     }
 
     #[test]

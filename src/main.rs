@@ -11,6 +11,7 @@ mod desktop;
 mod google_ai;
 #[cfg(target_os = "macos")]
 mod macos_tray;
+mod oauth_login;
 mod proxy;
 mod responses_api;
 mod web;

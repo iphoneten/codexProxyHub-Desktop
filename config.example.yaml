@@ -17,6 +17,11 @@ auth:
 
 routing:
   model_fallbacks: {}
+  # provider_first: 先渠道后 Auth 账号；auth_first: 先 Auth 账号后渠道
+  auth_preference: provider_first
+  # Auth 账号专用代理（OAuth/额度/运行时刷新/Auth 上游）。留空表示不强制代理。
+  # 示例: http://127.0.0.1:7890 或 socks5h://127.0.0.1:7890
+  auth_proxy: ""
 
 usage_log:
   backend: sqlite

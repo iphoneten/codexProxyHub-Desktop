@@ -185,6 +185,7 @@ pub fn merge_accounts(
     imported: Vec<AuthAccountConfig>,
 ) -> usize {
     let mut changed = 0;
+    let mut insert_at = 0;
     for account in imported {
         let duplicate = existing.iter_mut().find(|current| {
             current.id == account.id
@@ -206,7 +207,9 @@ pub fn merge_accounts(
             current.model_mapping = account.model_mapping;
             changed += 1;
         } else {
-            existing.push(account);
+            // 新账号插到列表前面，并保持本次导入的相对顺序
+            existing.insert(insert_at, account);
+            insert_at += 1;
             changed += 1;
         }
     }

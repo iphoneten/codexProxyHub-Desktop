@@ -18,7 +18,10 @@ auth:
   api_keys: []
 
 routing:
+  auth_preference: provider_first
+  auth_proxy: ""
   model_fallbacks: {}
+  auth_preference: provider_first
 
 usage_log:
   backend: sqlite
@@ -104,6 +107,8 @@ Authorization: Bearer sk-proxy-xxx
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `model_fallbacks` | map<string,array<string>> | `{}` | 模型 fallback 列表。请求模型不可用或对应渠道失败时，会按列表尝试替代模型。 |
+| `auth_preference` | string | `provider_first` | 请求来源优先级。`provider_first` 先普通渠道后 Auth 账号；`auth_first` 先 Auth 账号后普通渠道。各自内部仍按 `priority`/`weight` 排序。 |
+| `auth_proxy` | string | `""` | Auth 账号专用代理。用于 OAuth 换 token、额度刷新、运行时 token 刷新，以及 Auth 账号上游请求。普通渠道不受影响。支持 `http://`/`https://`/`socks5h://`。留空不强制代理。 |
 
 示例：
 
@@ -113,6 +118,8 @@ routing:
     gpt-5.5:
       - gpt-5.6-sol
       - claude-opus-4-7
+  auth_preference: provider_first
+  auth_proxy: ""
 ```
 
 对于请求 `gpt-5.5`，候选模型顺序是：`gpt-5.5`、`gpt-5.6-sol`、`claude-opus-4-7`。
@@ -266,8 +273,8 @@ debug_sse_max_events: 120
 
 1. 根据请求模型生成候选模型列表：原模型优先，然后追加 `routing.model_fallbacks`。
 2. 对每个候选模型过滤 provider：必须 `enabled: true`，且 `models` 或 `model_mapping` 能匹配模型。
-3. 按 `priority` 从小到大尝试。
-4. 同一 `priority` 内按 `weight` 做轮询排序。
+3. 按 `routing.auth_preference` 决定先尝试 Auth 账号还是普通渠道。账号优先时 Auth 账号会先被尝试，并使用 `routing.auth_proxy`。
+4. 在同一来源内按 `priority` 从小到大尝试，同一 `priority` 内按 `weight` 做轮询排序。
 5. 单个 provider 失败后，先按 `max_retries` 在该 provider 内重试。
 6. 重试耗尽后继续尝试下一个 provider。
 7. 流式请求只有拿到首个有效文本或工具调用事件后才判定 provider 成功；在此之前超时、报错或断流会继续故障转移。

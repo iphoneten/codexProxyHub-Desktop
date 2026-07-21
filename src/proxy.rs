@@ -365,7 +365,7 @@ struct SessionAffinity {
 #[derive(Clone)]
 struct AppState {
     config: ConfigHandle,
-    clients: Arc<Mutex<HashMap<u64, Client>>>,
+    clients: Arc<Mutex<HashMap<(u64, String), Client>>>,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     keepalive_headers: Arc<Mutex<HashMap<String, HeaderMap>>>,
     api_key_limiters: Arc<Mutex<HashMap<String, ApiKeyLimiter>>>,
@@ -396,10 +396,26 @@ impl AppState {
 
     fn client_for_provider(&self, provider: &ProviderConfig) -> Client {
         let connect_timeout = provider.connect_timeout.max(1);
+        // Auth 账号请求使用 routing.auth_proxy；普通渠道保持直连/系统代理行为。
+        let proxy_url = if provider.auth_account_id.is_some() {
+            self.snapshot().routing.auth_proxy.trim().to_string()
+        } else {
+            String::new()
+        };
+        let cache_key = (connect_timeout, proxy_url.clone());
         let mut clients = self.clients.lock();
         clients
-            .entry(connect_timeout)
-            .or_insert_with(|| build_http_client(connect_timeout))
+            .entry(cache_key)
+            .or_insert_with(|| {
+                build_http_client(
+                    connect_timeout,
+                    if proxy_url.is_empty() {
+                        None
+                    } else {
+                        Some(proxy_url.as_str())
+                    },
+                )
+            })
             .clone()
     }
 
@@ -569,13 +585,23 @@ impl AppState {
     }
 }
 
-fn build_http_client(connect_timeout: u64) -> Client {
-    Client::builder()
+fn build_http_client(connect_timeout: u64, proxy_url: Option<&str>) -> Client {
+    let mut builder = Client::builder()
         .pool_max_idle_per_host(20)
         .connect_timeout(Duration::from_secs(connect_timeout.max(1)))
-        .danger_accept_invalid_certs(false)
-        .build()
-        .expect("failed to build reqwest client")
+        .danger_accept_invalid_certs(false);
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => {
+                // 显式 Auth 代理时禁用系统代理，避免叠加
+                builder = builder.no_proxy().proxy(proxy);
+            }
+            Err(err) => {
+                eprintln!("invalid routing.auth_proxy `{proxy_url}`: {err}");
+            }
+        }
+    }
+    builder.build().expect("failed to build reqwest client")
 }
 
 #[derive(Clone, Copy, Default)]

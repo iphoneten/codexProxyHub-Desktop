@@ -40,26 +40,42 @@ pub(super) fn provider_attempts(
                         && provider_supports_api(p, api)
                 }),
         );
-        providers.sort_by_key(|p| (p.priority, p.name.clone()));
-        let mut by_priority: HashMap<i32, Vec<ProviderConfig>> = HashMap::new();
-        for provider in providers {
-            by_priority
-                .entry(provider.priority)
-                .or_default()
-                .push(provider);
-        }
-        let mut priorities: Vec<_> = by_priority.keys().copied().collect();
-        priorities.sort();
-        for priority in priorities {
-            let weighted = weighted_order(
-                state,
-                &request_model,
-                by_priority.remove(&priority).unwrap_or_default(),
-            );
-            out.extend(weighted.into_iter().map(|p| (p, request_model.clone())));
+        let auth_first = cfg.routing.auth_preference == "auth_first";
+        let (preferred, secondary): (Vec<_>, Vec<_>) = providers
+            .into_iter()
+            .partition(|provider| provider.auth_account_id.is_some() == auth_first);
+        for group in [preferred, secondary] {
+            let ordered = order_by_priority(state, &request_model, group);
+            out.extend(ordered.into_iter().map(|p| (p, request_model.clone())));
         }
     }
     out
+}
+
+fn order_by_priority(
+    state: &AppState,
+    model: &str,
+    mut providers: Vec<ProviderConfig>,
+) -> Vec<ProviderConfig> {
+    providers.sort_by_key(|provider| (provider.priority, provider.name.clone()));
+    let mut by_priority: HashMap<i32, Vec<ProviderConfig>> = HashMap::new();
+    for provider in providers {
+        by_priority
+            .entry(provider.priority)
+            .or_default()
+            .push(provider);
+    }
+    let mut priorities: Vec<_> = by_priority.keys().copied().collect();
+    priorities.sort();
+    let mut ordered = Vec::new();
+    for priority in priorities {
+        ordered.extend(weighted_order(
+            state,
+            model,
+            by_priority.remove(&priority).unwrap_or_default(),
+        ));
+    }
+    ordered
 }
 
 pub(super) fn weighted_order(
@@ -577,5 +593,137 @@ pub(super) fn responses_tool_choice_to_chat(tool_choice: Option<&Value>) -> Opti
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    use crate::config::{AuthAccountConfig, RoutingConfig};
+    use parking_lot::{Mutex, RwLock};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_state() -> AppState {
+        AppState {
+            config: Arc::new(RwLock::new(Arc::new(
+                AppConfig::load("config.example.yaml").unwrap(),
+            ))),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            counters: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
+            api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
+            provider_circuits: Arc::new(Mutex::new(HashMap::new())),
+            provider_loads: Arc::new(Mutex::new(HashMap::new())),
+            provider_statuses: Arc::new(RwLock::new(HashMap::new())),
+            session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            usage_injection: Arc::new(Mutex::new(HashMap::new())),
+            oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
+            oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn sample_provider(name: &str, priority: i32) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            enabled: true,
+            provider_type: "openai".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            website: None,
+            api_key: "sk".to_string(),
+            models: vec!["gpt-test".to_string()],
+            model_mapping: HashMap::new(),
+            extra_headers: HashMap::new(),
+            capabilities: HashMap::from([
+                ("supports_chat".to_string(), true),
+                ("supports_responses".to_string(), true),
+            ]),
+            health_check_mode: "none".to_string(),
+            model_sync_filter: "all".to_string(),
+            responses_mode: "auto".to_string(),
+            client_mode: "normal".to_string(),
+            connect_timeout: 10,
+            request_timeout: 30,
+            stream_idle_timeout: 0,
+            stream_max_duration: 0,
+            debug_capture_sse: false,
+            debug_sse_path: "logs/raw_sse".to_string(),
+            debug_sse_max_events: 80,
+            max_retries: 1,
+            weight: 1,
+            priority,
+            description: None,
+            system_prompt_override: None,
+            strip_thought: false,
+            persistent_session: false,
+            persist_interval: 3.0,
+            persist_max_wait: 0,
+            persist_keepalive: false,
+            persist_keepalive_interval: 30,
+            persist_keepalive_model: None,
+            persist_keepalive_prompt: "Hi".to_string(),
+            extra: Default::default(),
+            auth_account_id: None,
+        }
+    }
+
+    fn sample_account(id: &str, priority: i32) -> AuthAccountConfig {
+        AuthAccountConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            email: None,
+            access_token: "access".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            account_id: Some(format!("chatgpt-{id}")),
+            client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+            token_url: "https://auth.openai.com/oauth/token".to_string(),
+            expires_at: None,
+            models: vec!["gpt-test".to_string()],
+            model_mapping: HashMap::new(),
+            weight: 1,
+            priority,
+            description: None,
+        }
+    }
+
+    fn sample_config(preference: &str) -> AppConfig {
+        let mut cfg = AppConfig::load("config.example.yaml").unwrap();
+        cfg.routing = RoutingConfig {
+            model_fallbacks: HashMap::new(),
+            auth_preference: preference.to_string(),
+            auth_proxy: String::new(),
+        };
+        cfg.providers = vec![sample_provider("channel-a", 1)];
+        cfg.auth_accounts = vec![sample_account("acct-b", 5)];
+        cfg
+    }
+
+    #[test]
+    fn auth_preference_orders_accounts_before_providers() {
+        let state = test_state();
+        let cfg = sample_config("auth_first");
+        let names: Vec<_> = provider_attempts(&cfg, &state, "gpt-test", "responses", &[])
+            .into_iter()
+            .map(|(p, _)| p.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["auth:acct-b".to_string(), "channel-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_preference_orders_providers_before_accounts() {
+        let state = test_state();
+        let cfg = sample_config("provider_first");
+        let names: Vec<_> = provider_attempts(&cfg, &state, "gpt-test", "responses", &[])
+            .into_iter()
+            .map(|(p, _)| p.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["channel-a".to_string(), "auth:acct-b".to_string()]
+        );
     }
 }

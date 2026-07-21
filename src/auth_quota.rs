@@ -66,6 +66,7 @@ struct RefreshResponse {
 
 pub fn refresh_auth_account_quota(
     account: &AuthAccountConfig,
+    proxy_url: Option<&str>,
 ) -> Result<AuthQuotaRefreshResult, String> {
     let mut access_token = account.access_token.clone();
     let mut refresh_token = account.refresh_token.clone();
@@ -86,7 +87,7 @@ pub fn refresh_auth_account_quota(
                 return Err("账号缺少 access_token 和 refresh_token".to_string());
             }
             // keep current token
-            let snapshot = fetch_usage(&access_token, account.account_id.as_deref())?;
+            let snapshot = fetch_usage(&access_token, account.account_id.as_deref(), proxy_url)?;
             return Ok(AuthQuotaRefreshResult {
                 snapshot,
                 access_token,
@@ -94,7 +95,7 @@ pub fn refresh_auth_account_quota(
                 expires_at,
             });
         };
-        let refreshed = refresh_access_token(account, &current_refresh)?;
+        let refreshed = refresh_access_token(account, &current_refresh, proxy_url)?;
         access_token = refreshed.access_token;
         refresh_token = refreshed.refresh_token.or(Some(current_refresh));
         expires_at = refreshed
@@ -107,7 +108,7 @@ pub fn refresh_auth_account_quota(
         return Err("账号缺少可用 access_token".to_string());
     }
 
-    let snapshot = fetch_usage(&access_token, account.account_id.as_deref())?;
+    let snapshot = fetch_usage(&access_token, account.account_id.as_deref(), proxy_url)?;
     Ok(AuthQuotaRefreshResult {
         snapshot,
         access_token,
@@ -116,11 +117,26 @@ pub fn refresh_auth_account_quota(
     })
 }
 
-fn fetch_usage(access_token: &str, account_id: Option<&str>) -> Result<AuthQuotaSnapshot, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|err| err.to_string())?;
+fn build_blocking_client(
+    proxy_url: Option<&str>,
+    timeout_secs: u64,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs));
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        let proxy =
+            reqwest::Proxy::all(proxy_url).map_err(|err| format!("Auth 代理地址无效: {err}"))?;
+        builder = builder.no_proxy().proxy(proxy);
+    }
+    builder.build().map_err(|err| err.to_string())
+}
+
+fn fetch_usage(
+    access_token: &str,
+    account_id: Option<&str>,
+    proxy_url: Option<&str>,
+) -> Result<AuthQuotaSnapshot, String> {
+    let client = build_blocking_client(proxy_url, 20)?;
 
     let urls = [
         format!("{CODEX_USAGE_BASE}/wham/usage"),
@@ -166,11 +182,9 @@ fn fetch_usage(access_token: &str, account_id: Option<&str>) -> Result<AuthQuota
 fn refresh_access_token(
     account: &AuthAccountConfig,
     refresh_token: &str,
+    proxy_url: Option<&str>,
 ) -> Result<RefreshResponse, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|err| err.to_string())?;
+    let client = build_blocking_client(proxy_url, 20)?;
     let client_id = if account.client_id.trim().is_empty() {
         OPENAI_OAUTH_CLIENT_ID
     } else {

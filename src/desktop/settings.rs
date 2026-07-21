@@ -146,6 +146,25 @@ pub fn routing_section(
 ) {
     section(ui, "模型映射", |ui| {
         ui.set_max_width(640.0);
+        ui.horizontal(|ui| {
+            ui.label("请求优先级");
+            ui.radio_value(
+                &mut config.routing.auth_preference,
+                "provider_first".to_string(),
+                "渠道优先",
+            );
+            ui.radio_value(
+                &mut config.routing.auth_preference,
+                "auth_first".to_string(),
+                "账号优先",
+            );
+        });
+        ui.colored_label(
+            muteds(),
+            "账号优先：先走 Auth 账号（使用 Auth 代理）；渠道优先：先普通渠道。各组内部仍按 priority/weight 排序。",
+        );
+        ui.add_space(10.0);
+
         let source = routing_source_signature(&config.routing.model_fallbacks);
         if drafts.is_empty() && !config.routing.model_fallbacks.is_empty()
             || *drafts_source != source
