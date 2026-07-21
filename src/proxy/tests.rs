@@ -1125,6 +1125,40 @@ async fn chat_stream_to_responses_reports_error_outcome() {
 }
 
 #[tokio::test]
+async fn chat_stream_to_responses_stops_when_client_disconnects() {
+    // 客户端断开后,spawned 任务应立即结束并汇报 disconnected,
+    // 避免持续消费上游 token 与占用熔断 inflight 计数。
+    let mut payload = String::new();
+    for i in 0..64 {
+        let chunk = json!({"choices":[{"delta":{"content": format!("t{i}")}}]});
+        payload.push_str(&format!("data: {chunk}\n\n"));
+    }
+    let bytes = Bytes::from(payload);
+    let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+    let result = chat_sse_stream_to_responses(
+        stream,
+        "gpt-test".to_string(),
+        HashSet::new(),
+        Instant::now(),
+    )
+    .unwrap();
+    let rx = result.usage_rx.unwrap();
+    // 立即丢弃 response body → 释放底层 mpsc receiver,后续 send 全部失败
+    drop(result.response);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("usage_rx should resolve quickly after client disconnect")
+        .expect("usage_rx not closed");
+    assert!(outcome
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("client disconnected"));
+}
+
+#[tokio::test]
 async fn sse_probe_preserves_chat_prefix_after_first_delta() {
     let first = json!({"choices":[{"delta":{"role":"assistant"}}]});
     let second = json!({"choices":[{"delta":{"content":"hi"}}]});
