@@ -400,13 +400,16 @@ where
         let item_id = format!("msg-{}", Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().timestamp();
         let model = stream_model;
-        // 客户端断连后立即置位,后续 send/上游消费全部短路,避免浪费上游 token 与熔断 inflight 计数
-        #[allow(unused_assignments)]
-        let mut disconnected = false;
+        let mut first_token_ms = None;
         macro_rules! push_evt {
             ($ev:expr, $data:expr) => {{
-                if !disconnected && send_response_sse(&tx, $ev, $data).await.is_err() {
-                    disconnected = true;
+                if send_response_sse(&tx, $ev, $data).await.is_err() {
+                    let _ = u_tx.send(StreamOutcome::failed(
+                        usage,
+                        first_token_ms,
+                        "client disconnected",
+                    ));
+                    return;
                 }
             }};
         }
@@ -467,17 +470,21 @@ where
         let mut buffer = String::new();
         let mut full_text = String::new();
         let mut tool_calls: Vec<ChatToolCallState> = Vec::new();
-        let mut first_token_ms = None;
-        while let Some(chunk) = stream.next().await {
-            // 客户端已断开:不再消费上游、不再解析 SSE,直接结束以避免浪费 token 与占用熔断 inflight
-            if disconnected {
-                let _ = u_tx.send(StreamOutcome::failed(
-                    usage,
-                    first_token_ms,
-                    "client disconnected",
-                ));
-                return;
-            }
+        loop {
+            let chunk = tokio::select! {
+                _ = tx.closed() => {
+                    let _ = u_tx.send(StreamOutcome::failed(
+                        usage,
+                        first_token_ms,
+                        "client disconnected",
+                    ));
+                    return;
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -487,7 +494,7 @@ where
                             continue;
                         };
                         if data.trim() == "[DONE]" {
-                            send_response_stream_done(
+                            if send_response_stream_done(
                                 &tx,
                                 &response_id,
                                 &item_id,
@@ -496,7 +503,16 @@ where
                                 &full_text,
                                 &tool_calls,
                             )
-                            .await;
+                            .await
+                            .is_err()
+                            {
+                                let _ = u_tx.send(StreamOutcome::failed(
+                                    usage,
+                                    first_token_ms,
+                                    "client disconnected",
+                                ));
+                                return;
+                            }
                             let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
                             return;
                         }
@@ -515,9 +531,7 @@ where
                                     }
                                 })
                             );
-                            if !disconnected {
-                                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                            }
+                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
                             let _ =
                                 u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
                             return;
@@ -603,7 +617,7 @@ where
                             }
                         }
                         if chat_stream_completed(&data) {
-                            send_response_stream_done(
+                            if send_response_stream_done(
                                 &tx,
                                 &response_id,
                                 &item_id,
@@ -612,46 +626,44 @@ where
                                 &full_text,
                                 &tool_calls,
                             )
-                            .await;
+                            .await
+                            .is_err()
+                            {
+                                let _ = u_tx.send(StreamOutcome::failed(
+                                    usage,
+                                    first_token_ms,
+                                    "client disconnected",
+                                ));
+                                return;
+                            }
                             let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
-                            return;
-                        }
-                        if disconnected {
-                            // 客户端在处理当前 chunk 期间断开,后续 SSE 事件继续解析已无意义
-                            let _ = u_tx.send(StreamOutcome::failed(
-                                usage,
-                                first_token_ms,
-                                "client disconnected",
-                            ));
                             return;
                         }
                     }
                 }
                 Err(err) => {
                     let message = err.to_string();
-                    if !disconnected {
-                        let _ = send_response_sse(
-                            &tx,
-                            "response.failed",
-                            json!({
-                                "type": "response.failed",
-                                "response": {
-                                    "id": response_id,
-                                    "status": "failed",
-                                    "model": model,
-                                    "error": {"message": message}
-                                }
-                            }),
-                        )
-                        .await;
-                    }
+                    let _ = send_response_sse(
+                        &tx,
+                        "response.failed",
+                        json!({
+                            "type": "response.failed",
+                            "response": {
+                                "id": response_id,
+                                "status": "failed",
+                                "model": model,
+                                "error": {"message": message}
+                            }
+                        }),
+                    )
+                    .await;
                     let _ = u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
                     return;
                 }
             }
         }
 
-        send_response_stream_done(
+        if send_response_stream_done(
             &tx,
             &response_id,
             &item_id,
@@ -660,8 +672,17 @@ where
             &full_text,
             &tool_calls,
         )
-        .await;
-        let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
+        .await
+        .is_err()
+        {
+            let _ = u_tx.send(StreamOutcome::failed(
+                usage,
+                first_token_ms,
+                "client disconnected",
+            ));
+        } else {
+            let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
+        }
     });
 
     let response = Response::builder()
@@ -686,8 +707,8 @@ pub(super) async fn send_response_stream_done(
     created_at: i64,
     full_text: &str,
     tool_calls: &[ChatToolCallState],
-) {
-    let _ = send_response_sse(
+) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    send_response_sse(
         tx,
         "response.output_text.done",
         json!({
@@ -698,8 +719,8 @@ pub(super) async fn send_response_stream_done(
             "text": full_text
         }),
     )
-    .await;
-    let _ = send_response_sse(
+    .await?;
+    send_response_sse(
         tx,
         "response.content_part.done",
         json!({
@@ -710,8 +731,8 @@ pub(super) async fn send_response_stream_done(
             "part": {"type": "output_text", "text": full_text}
         }),
     )
-    .await;
-    let _ = send_response_sse(
+    .await?;
+    send_response_sse(
         tx,
         "response.output_item.done",
         json!({
@@ -726,7 +747,7 @@ pub(super) async fn send_response_stream_done(
             }
         }),
     )
-    .await;
+    .await?;
     let mut output = vec![json!({
         "id": item_id,
         "type": "message",
@@ -750,7 +771,7 @@ pub(super) async fn send_response_stream_done(
         let output_index = idx + 1;
         let item = if call.is_custom {
             let input = custom_tool_input(&call.arguments);
-            let _ = send_response_sse(
+            send_response_sse(
                 tx,
                 "response.custom_tool_call_input.done",
                 json!({
@@ -759,7 +780,7 @@ pub(super) async fn send_response_stream_done(
                     "input": input
                 }),
             )
-            .await;
+            .await?;
             json!({
                 "id": call_id,
                 "type": "custom_tool_call",
@@ -769,7 +790,7 @@ pub(super) async fn send_response_stream_done(
                 "input": input
             })
         } else {
-            let _ = send_response_sse(
+            send_response_sse(
                 tx,
                 "response.function_call_arguments.done",
                 json!({
@@ -778,7 +799,7 @@ pub(super) async fn send_response_stream_done(
                     "arguments": call.arguments
                 }),
             )
-            .await;
+            .await?;
             json!({
                 "id": call_id,
                 "type": "function_call",
@@ -788,7 +809,7 @@ pub(super) async fn send_response_stream_done(
                 "arguments": call.arguments
             })
         };
-        let _ = send_response_sse(
+        send_response_sse(
             tx,
             "response.output_item.done",
             json!({
@@ -797,10 +818,10 @@ pub(super) async fn send_response_stream_done(
                 "item": item
             }),
         )
-        .await;
+        .await?;
         output.push(item);
     }
-    let _ = send_response_sse(
+    send_response_sse(
         tx,
         "response.completed",
         json!({
@@ -816,8 +837,8 @@ pub(super) async fn send_response_stream_done(
             }
         }),
     )
-    .await;
-    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+    .await?;
+    tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await
 }
 
 #[derive(Default)]

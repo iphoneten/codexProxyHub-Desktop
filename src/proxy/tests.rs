@@ -1159,6 +1159,31 @@ async fn chat_stream_to_responses_stops_when_client_disconnects() {
 }
 
 #[tokio::test]
+async fn chat_stream_to_responses_stops_when_client_disconnects_before_upstream_chunk() {
+    let stream = futures_util::stream::pending::<Result<Bytes, io::Error>>();
+
+    let result = chat_sse_stream_to_responses(
+        stream,
+        "gpt-test".to_string(),
+        HashSet::new(),
+        Instant::now(),
+    )
+    .unwrap();
+    let rx = result.usage_rx.unwrap();
+    drop(result.response);
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+        .await
+        .expect("usage_rx should resolve without waiting for another upstream chunk")
+        .expect("usage_rx not closed");
+    assert!(outcome
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("client disconnected"));
+}
+
+#[tokio::test]
 async fn sse_probe_preserves_chat_prefix_after_first_delta() {
     let first = json!({"choices":[{"delta":{"role":"assistant"}}]});
     let second = json!({"choices":[{"delta":{"content":"hi"}}]});

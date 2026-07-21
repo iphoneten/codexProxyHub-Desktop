@@ -34,7 +34,7 @@ providers:
       - gpt-5.5
     connect_timeout: 10
     request_timeout: 60
-    max_retries: 1
+    max_retries: 3
     priority: 1
     weight: 1
 ```
@@ -188,7 +188,7 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | --- | --- | --- | --- |
 | `priority` | number | `1` | 优先级，数字越小越优先。只有低数字优先级全部失败后，才会尝试更大数字优先级。 |
 | `weight` | number | `1` | 同一优先级内的轮询权重。当前同一次请求内每个 provider 只尝试一次，权重只影响不同请求的起始顺序。 |
-| `max_retries` | number | `0` | 单个渠道内部最大重试次数。重试耗尽后才切换下一个渠道。 |
+| `max_retries` | number | `3` | 单个渠道内部最大重试次数。重试耗尽后才切换下一个渠道。 |
 | `responses_mode` | string | `auto` | Responses API 路由模式：`auto`、`native`、`chat`。 |
 
 `responses_mode` 说明：
@@ -216,7 +216,7 @@ connect_timeout: 10
 request_timeout: 60
 stream_idle_timeout: 60
 stream_max_duration: 300
-max_retries: 0
+max_retries: 3
 ```
 
 如果希望坏渠道尽快切换，可以降低 `request_timeout`，但不要设得太小，否则首包慢的上游会被误判失败。

@@ -22,7 +22,7 @@ usage_log:
   backend: sqlite
   sqlite_path: logs/proxy_usage.sqlite3
 
-# provider 默认超时字段：connect_timeout: 10, request_timeout: 60
+# provider 默认超时/重试字段：connect_timeout: 10, request_timeout: 60, max_retries: 3
 # 流式保护默认关闭：stream_idle_timeout: 0, stream_max_duration: 0
 # 原始 SSE 抓取默认关闭。排查渠道流式收尾问题时可在单个 provider 上开启：
 # debug_capture_sse: true

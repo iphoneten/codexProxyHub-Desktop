@@ -173,7 +173,7 @@ pub struct ProviderConfig {
     pub debug_sse_path: String,
     #[serde(default = "default_debug_sse_max_events")]
     pub debug_sse_max_events: usize,
-    #[serde(default)]
+    #[serde(default = "default_max_retries")]
     pub max_retries: usize,
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -360,6 +360,9 @@ fn default_connect_timeout() -> u64 {
 fn default_request_timeout() -> u64 {
     60
 }
+fn default_max_retries() -> usize {
+    3
+}
 fn default_weight() -> u32 {
     1
 }
@@ -451,6 +454,21 @@ providers:
         let provider = &cfg.providers[0];
         assert_eq!(provider.connect_timeout, 10);
         assert_eq!(provider.request_timeout, 120);
+    }
+
+    #[test]
+    fn provider_default_retries_is_three() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+providers:
+  - name: retry-default
+    base_url: https://example.test/v1
+    api_key: sk-test
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.providers[0].max_retries, 3);
     }
 
     #[test]
