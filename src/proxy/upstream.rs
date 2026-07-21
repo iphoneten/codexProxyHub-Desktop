@@ -171,8 +171,8 @@ pub(super) async fn send_chat_stream_as_responses(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                // 首次注入即 4xx：回退到不注入立即重试一次，永久标记该 provider
-                if probing && status.is_client_error() {
+                // 只在上游明确拒绝 include_usage/stream_options 时关闭探测，避免鉴权/模型错误污染 provider 状态。
+                if probing && usage_injection_rejected(status, &text) {
                     state.mark_usage_injection_unsupported(provider);
                     probing = false;
                     send_body = body.clone();
@@ -403,9 +403,9 @@ pub(super) async fn send_to_provider(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     let retry_after = parse_retry_after(resp.headers());
                     let text = resp.text().await.unwrap_or_default();
-                    // 首次注入即遇 4xx：极大概率是上游拒绝 include_usage 字段
+                    // 首次注入即遇兼容错误：回退到不注入版本重试一次
                     // 立即回退到"不注入"版本重试一次，不消耗 max_retries 名额，永久标记该 provider
-                    if probing && status.is_client_error() {
+                    if probing && usage_injection_rejected(status, &text) {
                         state.mark_usage_injection_unsupported(provider);
                         probing = false;
                         send_body = body.clone();
@@ -1273,6 +1273,14 @@ pub(crate) fn compute_retry_delay(attempt: usize, retry_after: Option<Duration>)
         return hint + Duration::from_millis(extra);
     }
     retry_delay(attempt)
+}
+
+pub(super) fn usage_injection_rejected(status: StatusCode, body: &str) -> bool {
+    if !status.is_client_error() {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("include_usage") || lower.contains("stream_options")
 }
 
 pub(super) fn normalize_model(model: &str) -> &str {

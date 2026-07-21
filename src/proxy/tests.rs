@@ -631,6 +631,30 @@ fn include_usage_injection_is_limited_to_chat_completions() {
 }
 
 #[test]
+fn usage_injection_probe_only_disables_on_explicit_field_rejection() {
+    assert!(usage_injection_rejected(
+        StatusCode::BAD_REQUEST,
+        "unknown field stream_options.include_usage"
+    ));
+    assert!(usage_injection_rejected(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "include_usage is not supported"
+    ));
+    assert!(!usage_injection_rejected(
+        StatusCode::UNAUTHORIZED,
+        "invalid api key"
+    ));
+    assert!(!usage_injection_rejected(
+        StatusCode::NOT_FOUND,
+        "model not found"
+    ));
+    assert!(!usage_injection_rejected(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "stream_options rejected"
+    ));
+}
+
+#[test]
 fn keepalive_applies_model_mapping_and_uses_responses_when_chat_is_unsupported() {
     let mut p = provider(
         "openai",

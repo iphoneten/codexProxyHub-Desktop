@@ -181,12 +181,19 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
         if rf.get("type").and_then(Value::as_str) == Some("json_object") {
             out.insert("text".into(), json!({"format": {"type": "json_object"}}));
         } else if rf.get("type").and_then(Value::as_str) == Some("json_schema") {
-            // 尽量转 json_schema：Responses 用 text.format
-            if let Some(schema) = rf.get("json_schema") {
-                out.insert(
-                    "text".into(),
-                    json!({"format": {"type": "json_schema", "schema": schema}}),
-                );
+            if let Some(schema_obj) = rf.get("json_schema").and_then(Value::as_object) {
+                let mut format = Map::new();
+                format.insert("type".into(), Value::String("json_schema".into()));
+                if let Some(name) = schema_obj.get("name") {
+                    format.insert("name".into(), name.clone());
+                }
+                if let Some(schema) = schema_obj.get("schema") {
+                    format.insert("schema".into(), schema.clone());
+                }
+                if let Some(strict) = schema_obj.get("strict") {
+                    format.insert("strict".into(), strict.clone());
+                }
+                out.insert("text".into(), json!({"format": Value::Object(format)}));
             }
         }
     }
@@ -926,7 +933,6 @@ impl StreamState {
                         "type": error_type
                     }
                 }));
-                self.finished = true;
             }
             _ => {}
         }
@@ -1033,6 +1039,35 @@ mod tests {
         let out = chat_to_responses_request(&body).unwrap();
         assert_eq!(out["max_output_tokens"], 128);
         assert!(out.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn request_expands_json_schema_response_format() {
+        let body = json!({
+            "model": "gpt-5",
+            "messages": [],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"]
+                    },
+                    "strict": true
+                }
+            }
+        });
+
+        let out = chat_to_responses_request(&body).unwrap();
+        let format = &out["text"]["format"];
+
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "answer");
+        assert_eq!(format["schema"]["type"], "object");
+        assert_eq!(format["strict"], true);
+        assert!(format["schema"].get("name").is_none());
     }
 
     #[test]
@@ -1223,7 +1258,36 @@ mod tests {
             "Concurrency limit exceeded for account, please retry later"
         );
         assert!(out[0]["choices"].is_null());
-        assert!(state.finished);
+        assert!(!state.finished);
+    }
+
+    #[tokio::test]
+    async fn stream_translator_reports_error_event_as_error_outcome() {
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": "Concurrency limit exceeded for account"
+            }
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
+
+        let (rx, body_stream) = spawn_responses_stream_translator_from_stream(
+            stream,
+            "gpt-test".to_string(),
+            Instant::now(),
+        );
+        let body = axum::body::Body::from_stream(body_stream);
+        let text = String::from_utf8(to_bytes(body, 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        let outcome = rx.await.unwrap();
+
+        assert!(text.contains("\"type\":\"rate_limit_error\""));
+        assert!(outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Concurrency limit exceeded"));
     }
 
     #[tokio::test]

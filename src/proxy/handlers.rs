@@ -162,8 +162,7 @@ pub(super) async fn responses(
                     continue;
                 }
             };
-        let mut upstream_body = with_model(body.clone(), &request_model);
-        apply_model_mapping(&provider, &mut upstream_body);
+        let upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
         let upstream_attempt_model = upstream_body
             .get("model")
             .and_then(Value::as_str)
@@ -244,7 +243,7 @@ pub(super) async fn responses(
             &provider,
             "/responses",
             &headers,
-            upstream_body,
+            upstream_body.clone(),
             stream,
             started,
         )
@@ -272,7 +271,7 @@ pub(super) async fn responses(
                     && (err.status == StatusCode::NOT_FOUND
                         || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
             {
-                let chat_body = with_model(body.clone(), &request_model);
+                let chat_body = upstream_body;
                 match forward_responses_as_chat(
                     &state, &provider, &headers, chat_body, stream, started,
                 )
@@ -477,6 +476,20 @@ mod tests {
         assert_eq!(providers[0].0.name, "muyuan");
         assert_eq!(providers[1].0.name, "anyrouter");
     }
+
+    #[test]
+    fn upstream_body_for_provider_applies_model_mapping() {
+        let mut provider = provider_with_name("mapped");
+        provider
+            .model_mapping
+            .insert("gpt-test".to_string(), "upstream-gpt-test".to_string());
+        let body = json!({"model": "original", "input": "hi"});
+
+        let out = upstream_body_for_provider(&provider, &body, "gpt-test");
+
+        assert_eq!(out["model"], "upstream-gpt-test");
+        assert_eq!(out["input"], "hi");
+    }
 }
 
 pub(super) async fn forward_openai(
@@ -506,8 +519,7 @@ pub(super) async fn forward_openai(
                     continue;
                 }
             };
-        let mut upstream_body = with_model(body.clone(), &request_model);
-        apply_model_mapping(&provider, &mut upstream_body);
+        let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
         if path == "/chat/completions" {
             apply_system_prompt_override(&provider, &mut upstream_body);
         }
@@ -840,4 +852,14 @@ pub(super) fn hold_permit_until_body_done(
         item
     });
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn upstream_body_for_provider(
+    provider: &ProviderConfig,
+    body: &Value,
+    request_model: &str,
+) -> Value {
+    let mut upstream_body = with_model(body.clone(), request_model);
+    apply_model_mapping(provider, &mut upstream_body);
+    upstream_body
 }
