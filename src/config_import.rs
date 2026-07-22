@@ -3,7 +3,12 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDateTime};
 use flate2::read::DeflateDecoder;
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, io::Read, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -82,6 +87,32 @@ pub fn import_auth_accounts_file_for_type(
         }
     }
     Ok(merge_accounts(&mut config.auth_accounts, imported))
+}
+
+pub fn import_auth_accounts_paths_for_type(
+    config: &mut AppConfig,
+    sources: &[PathBuf],
+    account_type: Option<&str>,
+) -> Result<(usize, Vec<String>)> {
+    let mut total = 0usize;
+    let mut errors = Vec::new();
+    for source in sources {
+        match import_auth_accounts_file_for_type(config, source, account_type) {
+            Ok(count) => total += count,
+            Err(err) => errors.push(format!("{}: {err}", source.display())),
+        }
+    }
+    if total == 0 {
+        return Err(anyhow!(
+            "导入 Auth 账号失败: {}",
+            if errors.is_empty() {
+                "未选择有效文件".to_string()
+            } else {
+                errors.join("；")
+            }
+        ));
+    }
+    Ok((total, errors))
 }
 
 fn import_auth_accounts_zip_for_type(

@@ -18,7 +18,7 @@ use std::{
     time::Instant,
 };
 use uuid::Uuid;
-const BACKGROUND_GROK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+mod grok;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthAvailability {
     Unknown,
@@ -56,7 +56,7 @@ impl Default for AuthAvailability {
 pub struct AuthAccountsState {
     views: HashMap<String, AccountQuotaView>,
     pending: Arc<Mutex<Vec<QuotaJobResult>>>,
-    grok_check_pending: Arc<Mutex<Vec<GrokCheckJobResult>>>,
+    grok: grok::GrokCheckState,
     oauth_pending: Arc<Mutex<Vec<crate::oauth_login::OAuthLoginOutcome>>>,
     oauth_cancelled: Option<Arc<AtomicBool>>,
     oauth_waiting: bool,
@@ -66,13 +66,12 @@ pub struct AuthAccountsState {
     proxy_check_error: Option<String>,
     proxy_checked_via: Option<String>,
     active_account_type: String,
-    last_background_grok_check: Option<Instant>,
 }
 impl AuthAccountsState {
     pub fn has_refreshing(&self) -> bool {
         self.views.values().any(|view| view.refreshing)
             || !self.pending.lock().is_empty()
-            || !self.grok_check_pending.lock().is_empty()
+            || self.grok.has_pending()
             || self.oauth_waiting
             || !self.oauth_pending.lock().is_empty()
             || self.proxy_check_running
@@ -89,23 +88,8 @@ struct TokenUpdate {
     refresh_token: Option<String>,
     expires_at: Option<i64>,
 }
-struct GrokCheckJobResult {
-    account_id: String,
-    result: auth_quota::GrokCheckResult,
-    silent: bool,
-}
 pub fn tick_background_grok_check(config: &mut AppConfig, state: &mut AuthAccountsState) {
-    apply_grok_check_pending(config, state, None, true);
-    let now = Instant::now();
-    let Some(last_check) = state.last_background_grok_check else {
-        state.last_background_grok_check = Some(now);
-        return;
-    };
-    if now.duration_since(last_check) < BACKGROUND_GROK_CHECK_INTERVAL {
-        return;
-    }
-    state.last_background_grok_check = Some(now);
-    queue_grok_checks(config, state, true);
+    grok::tick_background(config, state);
 }
 pub fn auth_accounts_section(
     ui: &mut egui::Ui,
@@ -114,7 +98,7 @@ pub fn auth_accounts_section(
     state: &mut AuthAccountsState,
 ) {
     apply_pending(config, state, message);
-    apply_grok_check_pending(config, state, Some(message), false);
+    grok::apply_pending(config, state, Some(message), false);
     apply_oauth_pending(config, state, message);
     apply_proxy_check_pending(state, message);
     if state.active_account_type.trim().is_empty() {
@@ -161,7 +145,7 @@ pub fn auth_accounts_section(
                         }
                         if active_type == "grok" && soft_button(ui, "全部检查授权").clicked()
                         {
-                            check_all_grok_accounts(config, state, message);
+                            grok::check_all(config, state, message);
                         }
                         if soft_button(ui, "导入账号").clicked() {
                             import_auth_accounts(config, message, &active_type);
@@ -514,7 +498,7 @@ fn account_card(
                     "检查授权"
                 };
                 if is_grok && soft_button(ui, check_label).clicked() && !view.refreshing {
-                    queue_grok_check(account, state, proxy_url.clone());
+                    grok::queue_single(account, state, proxy_url.clone());
                     *message = AppMessage::new(
                         format!("正在检查 Grok 授权: {}", account.name),
                         MessageKind::Info,
@@ -710,151 +694,6 @@ fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState, message:
     let _ = message;
 }
 
-fn apply_grok_check_pending(
-    config: &mut AppConfig,
-    state: &mut AuthAccountsState,
-    message: Option<&mut AppMessage>,
-    silent_only: bool,
-) {
-    let jobs = {
-        let mut pending = state.grok_check_pending.lock();
-        let all = std::mem::take(&mut *pending);
-        if !silent_only {
-            all
-        } else {
-            let (jobs, remain): (Vec<_>, Vec<_>) = all.into_iter().partition(|job| job.silent);
-            pending.extend(remain);
-            jobs
-        }
-    };
-    if jobs.is_empty() {
-        return;
-    }
-    let mut available = 0;
-    let mut exhausted = 0;
-    let mut disabled = 0;
-    let mut silent = true;
-    for job in jobs {
-        silent &= job.silent;
-        let view = state.views.entry(job.account_id.clone()).or_default();
-        view.refreshing = false;
-        view.checked_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        match job.result {
-            auth_quota::GrokCheckResult::Available => {
-                view.availability = AuthAvailability::Available;
-                view.error = None;
-                available += 1;
-            }
-            auth_quota::GrokCheckResult::QuotaExhausted(err) => {
-                view.availability = AuthAvailability::QuotaExhausted;
-                view.error = Some(err);
-                exhausted += 1;
-            }
-            auth_quota::GrokCheckResult::InvalidAuth(err) => {
-                if let Some(account) = config
-                    .auth_accounts
-                    .iter_mut()
-                    .find(|account| account.id == job.account_id)
-                {
-                    account.enabled = false;
-                }
-                view.availability = AuthAvailability::Unavailable;
-                view.error = Some(err);
-                disabled += 1;
-            }
-            auth_quota::GrokCheckResult::Unavailable(err) => {
-                view.availability = AuthAvailability::Unavailable;
-                view.error = Some(err);
-            }
-        }
-    }
-    if !silent && message.is_some() {
-        let kind = if disabled == 0 {
-            MessageKind::Success
-        } else {
-            MessageKind::Error
-        };
-        let text = if disabled == 0 {
-            format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽")
-        } else {
-            format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽，已停用 {disabled} 个授权失效账号")
-        };
-        *message.unwrap() = AppMessage::new(text, kind);
-    }
-}
-fn check_all_grok_accounts(
-    config: &AppConfig,
-    state: &mut AuthAccountsState,
-    message: &mut AppMessage,
-) {
-    let count = queue_grok_checks(config, state, false);
-    if count == 0 {
-        *message = AppMessage::new("没有已启用的 Grok 账号可检查", MessageKind::Error);
-        return;
-    }
-    *message = AppMessage::new(
-        format!("正在并发检查 {count} 个 Grok 账号授权"),
-        MessageKind::Info,
-    );
-}
-
-fn queue_grok_checks(config: &AppConfig, state: &mut AuthAccountsState, silent: bool) -> usize {
-    let accounts = config
-        .auth_accounts
-        .iter()
-        .filter(|account| account.enabled && account_type_matches(account, "grok"))
-        .cloned()
-        .collect::<Vec<_>>();
-    for account in &accounts {
-        let view = state.views.entry(account.id.clone()).or_default();
-        view.refreshing = true;
-        view.availability = AuthAvailability::Checking;
-        view.error = None;
-    }
-    let count = accounts.len();
-    if count == 0 {
-        return 0;
-    }
-    let pending = Arc::clone(&state.grok_check_pending);
-    let proxy_url = auth_proxy_url(config);
-    thread::spawn(move || {
-        let results = auth_quota::check_grok_accounts(accounts, proxy_url);
-        pending
-            .lock()
-            .extend(results.into_iter().map(|result| GrokCheckJobResult {
-                account_id: result.0,
-                result: result.1,
-                silent,
-            }));
-    });
-    count
-}
-
-fn queue_grok_check(
-    account: &AuthAccountConfig,
-    state: &mut AuthAccountsState,
-    proxy_url: Option<String>,
-) {
-    let view = state.views.entry(account.id.clone()).or_default();
-    if view.refreshing {
-        return;
-    }
-    view.refreshing = true;
-    view.availability = AuthAvailability::Checking;
-    view.error = None;
-
-    let account = account.clone();
-    let pending = Arc::clone(&state.grok_check_pending);
-    thread::spawn(move || {
-        let result = auth_quota::check_grok_account(&account, proxy_url.as_deref());
-        pending.lock().push(GrokCheckJobResult {
-            account_id: account.id,
-            result,
-            silent: false,
-        });
-    });
-}
-
 fn refresh_all_accounts(
     config: &AppConfig,
     state: &mut AuthAccountsState,
@@ -1045,32 +884,41 @@ fn cancel_oauth_login(state: &mut AuthAccountsState, message: &mut AppMessage) {
 }
 
 fn import_auth_accounts(config: &mut AppConfig, message: &mut AppMessage, account_type: &str) {
-    let Some(source_path) = rfd::FileDialog::new()
+    let Some(paths) = rfd::FileDialog::new()
         .add_filter("Auth 账号", &["json", "zip"])
-        .pick_file()
+        .pick_files()
     else {
         return;
     };
-    match crate::config_import::import_auth_accounts_file_for_type(
+    if paths.is_empty() {
+        return;
+    }
+    match crate::config_import::import_auth_accounts_paths_for_type(
         config,
-        &source_path,
+        &paths,
         Some(account_type),
     ) {
-        Ok(count) => {
+        Ok((total, errors)) if errors.is_empty() => {
             *message = AppMessage::new(
                 format!(
-                    "已导入或更新 {count} 个 Auth 账号: {}",
-                    source_path.display()
+                    "已导入或更新 {total} 个 Auth 账号（{} 个文件）",
+                    paths.len()
                 ),
                 MessageKind::Success,
             );
         }
-        Err(err) => {
-            *message = AppMessage::new(format!("导入 Auth 账号失败: {err}"), MessageKind::Error);
+        Ok((total, errors)) => {
+            *message = AppMessage::new(
+                format!(
+                    "已导入或更新 {total} 个 Auth 账号，部分失败: {}",
+                    errors.join("；")
+                ),
+                MessageKind::Error,
+            );
         }
+        Err(err) => *message = AppMessage::new(err.to_string(), MessageKind::Error),
     }
 }
-
 fn export_auth_accounts(config: &AppConfig, message: &mut AppMessage, account_type: &str) {
     if account_count(config, account_type) == 0 {
         *message = AppMessage::new("没有可导出的 Auth 账号", MessageKind::Error);
@@ -1100,7 +948,6 @@ fn export_auth_accounts(config: &AppConfig, message: &mut AppMessage, account_ty
         }
     }
 }
-
 fn ensure_json_extension(path: PathBuf) -> PathBuf {
     if path
         .extension()
@@ -1112,7 +959,6 @@ fn ensure_json_extension(path: PathBuf) -> PathBuf {
         path.with_extension("json")
     }
 }
-
 fn model_mapping_editor(ui: &mut egui::Ui, account: &mut AuthAccountConfig) {
     let draft_id = egui::Id::new(("auth_account_model_mapping_draft", account.id.as_str()));
     let source = serialize_model_mapping(account);
