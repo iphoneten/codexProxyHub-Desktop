@@ -520,6 +520,28 @@ mod tests {
         assert_eq!(out["model"], "upstream-gpt-test");
         assert_eq!(out["input"], "hi");
     }
+
+    #[test]
+    fn upstream_body_for_provider_moves_chat_tool_id_out_of_responses_id() {
+        let provider = provider_with_name("codex");
+        let body = json!({
+            "model": "original",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "call_VgHo3IaCCEbCjzv9f2eUluB9",
+                    "name": "shell",
+                    "arguments": "{}"
+                }
+            ]
+        });
+
+        let out = upstream_body_for_provider(&provider, &body, "gpt-test");
+        let item = &out["input"][0];
+
+        assert!(item.get("id").is_none());
+        assert_eq!(item["call_id"], "call_VgHo3IaCCEbCjzv9f2eUluB9");
+    }
 }
 
 pub(super) async fn forward_openai(
@@ -898,5 +920,30 @@ fn upstream_body_for_provider(
 ) -> Value {
     let mut upstream_body = with_model(body.clone(), request_model);
     apply_model_mapping(provider, &mut upstream_body);
+    normalize_responses_function_call_ids(&mut upstream_body);
     upstream_body
+}
+
+fn normalize_responses_function_call_ids(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let Some(id) = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("call_"))
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        obj.entry("call_id".to_string()).or_insert(Value::String(id));
+        obj.remove("id");
+    }
 }
