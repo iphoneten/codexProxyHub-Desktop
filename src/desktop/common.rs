@@ -72,6 +72,53 @@ pub fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
+/// 两步删除控件：首次点击进入确认态，确认后返回 true；取消则回到初始态。
+/// `id_salt` 用于区分同一帧内的多个删除入口。
+pub fn confirm_delete_button(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    delete_label: &str,
+) -> bool {
+    let id = ui.make_persistent_id(("confirm_delete", id_salt));
+    let mut pending = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<bool>(id).unwrap_or(false));
+    let mut confirmed = false;
+
+    ui.horizontal(|ui| {
+        if pending {
+            let confirm = ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("确认删除").color(egui::Color32::from_rgb(239, 68, 68)),
+                    )
+                    .fill(egui::Color32::from_rgb(254, 242, 242)),
+                )
+                .on_hover_text("此操作不可撤销");
+            if confirm.clicked() {
+                confirmed = true;
+                pending = false;
+            }
+            if ui.small_button("取消").clicked() {
+                pending = false;
+            }
+        } else {
+            let button = ui.add(
+                egui::Button::new(
+                    egui::RichText::new(delete_label).color(egui::Color32::from_rgb(239, 68, 68)),
+                )
+                .fill(egui::Color32::from_rgb(254, 242, 242)),
+            );
+            if button.clicked() {
+                pending = true;
+            }
+        }
+    });
+
+    ui.ctx().data_mut(|data| data.insert_temp(id, pending));
+    confirmed
+}
+
 // --- 常用 Widget & 装饰器 ---
 pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
     let desired_size = egui::vec2(40.0, 22.0);

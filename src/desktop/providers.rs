@@ -58,12 +58,13 @@ pub fn provider_section(
                     return;
                 }
                 *selected = Some(idx);
+                let mut delete_provider = false;
                 let provider = &mut config.providers[idx];
                 egui::ScrollArea::vertical()
                     .id_source("provider_detail_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        provider_detail_panel(
+                        delete_provider = provider_detail_panel(
                             ui,
                             provider,
                             message,
@@ -73,6 +74,23 @@ pub fn provider_section(
                             circuit_status,
                         );
                     });
+                if delete_provider {
+                    let removed_name = config.providers[idx].name.clone();
+                    config.providers.remove(idx);
+                    if idx < mapping_drafts.len() {
+                        mapping_drafts.remove(idx);
+                    }
+                    if idx < header_drafts.len() {
+                        header_drafts.remove(idx);
+                    }
+                    *selected = if config.providers.is_empty() {
+                        None
+                    } else {
+                        Some(idx.min(config.providers.len() - 1))
+                    };
+                    *message =
+                        AppMessage::new(format!("已删除渠道: {removed_name}"), MessageKind::Info);
+                }
             },
         );
     });
@@ -168,7 +186,8 @@ fn provider_detail_panel(
     header_draft: &mut TextDraft,
     keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
-) {
+) -> bool {
+    let mut delete_requested = false;
     section(ui, "渠道详情", |ui| {
         ui.horizontal_wrapped(|ui| {
             switch(ui, &mut provider.enabled);
@@ -185,6 +204,19 @@ fn provider_detail_panel(
                 egui::Color32::from_rgb(248, 250, 252),
                 text_color(),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if super::common::confirm_delete_button(
+                    ui,
+                    (
+                        "provider_delete",
+                        provider.name.as_str(),
+                        provider.base_url.as_str(),
+                    ),
+                    "删除渠道",
+                ) {
+                    delete_requested = true;
+                }
+            });
         });
         ui.add_space(10.0);
 
@@ -518,6 +550,7 @@ fn provider_detail_panel(
             }
         });
     });
+    delete_requested
 }
 
 fn soft_button(ui: &mut egui::Ui, text: &str) -> egui::Response {

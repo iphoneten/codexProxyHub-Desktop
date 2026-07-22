@@ -1,4 +1,4 @@
-use super::common::{section, switch};
+use super::common::{confirm_delete_button, section, switch};
 use crate::config::{ApiKeyConfig, AppConfig};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -129,10 +129,11 @@ pub fn auth_section(ui: &mut egui::Ui, config: &mut AppConfig, new_key_name: &mu
                     };
                     ui.label(date_str).on_hover_text(&key.created_at);
                     ui.horizontal(|ui| {
-                        let button = egui::Button::new(
-                            egui::RichText::new("删除").color(egui::Color32::from_rgb(239, 68, 68)),
-                        );
-                        if ui.add(button).clicked() {
+                        if confirm_delete_button(
+                            ui,
+                            ("api_key_delete", idx, key.key.as_str()),
+                            "删除",
+                        ) {
                             remove = Some(idx);
                         }
                     });

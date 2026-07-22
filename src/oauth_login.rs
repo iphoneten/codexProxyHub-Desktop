@@ -403,7 +403,7 @@ pub fn tokens_to_account(tokens: OAuthAccountTokens) -> AuthAccountConfig {
         client_id: OPENAI_OAUTH_CLIENT_ID.to_string(),
         token_url: OPENAI_OAUTH_TOKEN_URL.to_string(),
         expires_at: tokens.expires_at,
-        models: vec!["gpt-5.4".to_string()],
+        models: crate::config::default_auth_account_models(),
         model_mapping: Default::default(),
         weight: 1,
         priority: 1,

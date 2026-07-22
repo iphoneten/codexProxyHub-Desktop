@@ -88,6 +88,7 @@ pub(super) fn log_stream_started(
     api_key_name: &str,
 ) -> Option<i64> {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let log_provider = log_provider_name(config, provider);
     log_usage_sqlite_for_key(
         config.usage_log_sqlite_path(),
         &ts,
@@ -95,7 +96,7 @@ pub(super) fn log_stream_started(
         api_key_id,
         api_key_name,
         "running",
-        provider,
+        &log_provider,
         model,
         upstream_model,
         started.elapsed().as_millis() as i64,
@@ -286,6 +287,7 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
     let latency_ms = started.elapsed().as_millis() as i64;
     let error = event.error.unwrap_or("");
     let token_source = event.token_source.unwrap_or("upstream_or_unknown");
+    let log_provider = log_provider_name(config, event.provider);
 
     let _ = log_usage_sqlite_for_key(
         config.usage_log_sqlite_path(),
@@ -294,7 +296,7 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
         event.api_key_id,
         event.api_key_name,
         event.status,
-        event.provider,
+        &log_provider,
         event.model,
         event.upstream_model,
         latency_ms,
@@ -304,6 +306,25 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
         event.usage.output,
         token_source,
     );
+}
+
+fn log_provider_name(config: &AppConfig, provider: &str) -> String {
+    let Some(account_id) = provider.strip_prefix("auth:") else {
+        return provider.to_string();
+    };
+    let Some(account) = config
+        .auth_accounts
+        .iter()
+        .find(|account| account.id == account_id)
+    else {
+        return provider.to_string();
+    };
+    let name = account.name.trim();
+    if name.is_empty() {
+        provider.to_string()
+    } else {
+        format!("auth:{name}")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -527,4 +548,32 @@ pub(super) fn ensure_column(
         [],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_provider_name;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn auth_provider_logs_account_name_instead_of_id() {
+        let config: AppConfig = serde_yaml::from_str(
+            r#"
+auth_accounts:
+  - id: account-id
+    name: codex-main
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            log_provider_name(&config, "auth:account-id"),
+            "auth:codex-main"
+        );
+        assert_eq!(log_provider_name(&config, "provider-a"), "provider-a");
+        assert_eq!(
+            log_provider_name(&config, "auth:missing-account"),
+            "auth:missing-account"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 use super::assets::cached_png_texture;
 use super::common::{
-    base_url, copy_icon_button, display_host, field_icon, muteds, section, switch,
+    base_url, confirm_delete_button, copy_icon_button, display_host, field_icon, muteds, section,
+    switch,
 };
 use super::RoutingDraft;
 use crate::config::AppConfig;
@@ -208,7 +209,8 @@ pub fn routing_section(
                 ui.add(egui::TextEdit::singleline(&mut draft.key).desired_width(180.0));
                 ui.label("→");
                 ui.add(egui::TextEdit::singleline(&mut draft.value).desired_width(260.0));
-                if ui.button("删除").clicked() {
+                if confirm_delete_button(ui, ("routing_delete", idx, draft.key.as_str()), "删除")
+                {
                     to_remove = Some(idx);
                 }
             });

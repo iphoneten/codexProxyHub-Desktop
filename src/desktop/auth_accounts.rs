@@ -1,6 +1,6 @@
 use super::common::{
-    accent, badge, border, good, heading_color, muteds, primary_button, soft_button, surface,
-    switch, text_color,
+    accent, badge, border, confirm_delete_button, good, heading_color, muteds, primary_button,
+    soft_button, surface, switch, text_color,
 };
 use super::{AppMessage, MessageKind};
 use crate::auth_quota::{self, AuthQuotaSnapshot};
@@ -220,8 +220,7 @@ pub fn auth_accounts_section(
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(card_width);
-                        if account_card(ui, account, &view, state, message, proxy_url.clone())
-                        {
+                        if account_card(ui, account, &view, state, message, proxy_url.clone()) {
                             remove = Some(account_idx);
                         }
                     },
@@ -387,14 +386,7 @@ fn account_card(
                         MessageKind::Info,
                     );
                 }
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("删除").color(egui::Color32::from_rgb(239, 68, 68)),
-                        )
-                        .fill(egui::Color32::from_rgb(254, 242, 242)),
-                    )
-                    .clicked()
+                if confirm_delete_button(ui, ("auth_account_delete", account.id.as_str()), "删除")
                 {
                     delete = true;
                 }
@@ -844,7 +836,8 @@ fn models_editor(ui: &mut egui::Ui, account: &mut AuthAccountConfig) {
 
     let resp = ui.add_sized(
         [220.0, 24.0],
-        egui::TextEdit::singleline(&mut text).hint_text("gpt-5.4,gpt-5.4-codex"),
+        egui::TextEdit::singleline(&mut text)
+            .hint_text("gpt-5.4,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra"),
     );
 
     if resp.changed() {
@@ -875,7 +868,7 @@ fn default_auth_account() -> AuthAccountConfig {
         client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
         token_url: "https://auth.openai.com/oauth/token".to_string(),
         expires_at: None,
-        models: vec!["gpt-5.4".to_string()],
+        models: crate::config::default_auth_account_models(),
         model_mapping: Default::default(),
         weight: 1,
         priority: 1,

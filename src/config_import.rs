@@ -177,7 +177,7 @@ fn credential_models(credentials: &Value) -> Vec<String> {
             return models;
         }
     }
-    vec!["gpt-5.4".to_string()]
+    crate::config::default_auth_account_models()
 }
 
 pub fn merge_accounts(

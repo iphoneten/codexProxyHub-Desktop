@@ -403,8 +403,14 @@ fn default_openai_oauth_client_id() -> String {
 fn default_openai_oauth_token_url() -> String {
     "https://auth.openai.com/oauth/token".to_string()
 }
-fn default_auth_account_models() -> Vec<String> {
-    vec!["gpt-5.4".to_string()]
+pub fn default_auth_account_models() -> Vec<String> {
+    vec![
+        "gpt-5.4".to_string(),
+        "gpt-5.5".to_string(),
+        "gpt-5.6-luna".to_string(),
+        "gpt-5.6-sol".to_string(),
+        "gpt-5.6-terra".to_string(),
+    ]
 }
 fn default_health_check_mode() -> String {
     "models".to_string()
