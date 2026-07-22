@@ -144,7 +144,7 @@ pub(super) async fn responses(
     let api_key_name = auth.key_name;
     let allowed_providers = auth.allowed_providers;
     let mut permit = Some(auth.permit);
-    let session_key = codex_session_key(&headers, &model);
+    let session_key = auth_session_key(&headers, &model, &api_key_id);
     let mut providers = provider_attempts(&cfg, &state, &model, "responses", &allowed_providers);
     if let Some(preferred) = state.preferred_provider_for_session(&session_key) {
         prefer_provider(&mut providers, &preferred);
@@ -210,7 +210,7 @@ pub(super) async fn responses(
             .await
             {
                 Ok(result) => {
-                    state.remember_session_provider(&session_key, &provider.name);
+                    remember_auth_session_provider(&state, &session_key, &provider);
                     return Ok(commit_result(
                         state.snapshot(),
                         "responses",
@@ -257,7 +257,7 @@ pub(super) async fn responses(
         .await
         {
             Ok(result) => {
-                state.remember_session_provider(&session_key, &provider.name);
+                remember_auth_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
                     "responses",
@@ -285,7 +285,7 @@ pub(super) async fn responses(
                 .await
                 {
                     Ok(result) => {
-                        state.remember_session_provider(&session_key, &provider.name);
+                        remember_auth_session_provider(&state, &session_key, &provider);
                         return Ok(commit_result(
                             state.snapshot(),
                             "responses",
@@ -403,8 +403,8 @@ pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool
         || is_google_openai_endpoint(&provider.base_url)
 }
 
-pub(super) fn codex_session_key(headers: &HeaderMap, model: &str) -> String {
-    for name in ["conversation_id", "session_id", "x-request-id"] {
+pub(super) fn auth_session_key(headers: &HeaderMap, model: &str, api_key_id: &str) -> String {
+    for name in ["conversation_id", "session_id"] {
         if let Some(value) = headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -412,12 +412,35 @@ pub(super) fn codex_session_key(headers: &HeaderMap, model: &str) -> String {
             .filter(|value| !value.is_empty())
         {
             return format!(
-                "responses:{}:{value}",
+                "auth:{}:{value}",
                 normalize_model(model).to_ascii_lowercase()
             );
         }
     }
+    if !api_key_id.trim().is_empty() {
+        return format!(
+            "auth:{}:key:{api_key_id}",
+            normalize_model(model).to_ascii_lowercase()
+        );
+    }
+    if let Some(value) = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!(
+            "auth:{}:request:{value}",
+            normalize_model(model).to_ascii_lowercase()
+        );
+    }
     String::new()
+}
+
+fn remember_auth_session_provider(state: &AppState, session_key: &str, provider: &ProviderConfig) {
+    if provider.auth_account_id.is_some() {
+        state.remember_session_provider(session_key, &provider.name);
+    }
 }
 
 pub(super) fn prefer_provider(providers: &mut Vec<(ProviderConfig, String)>, preferred: &str) {
@@ -465,14 +488,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_session_key_uses_conversation_before_session() {
+    fn auth_session_key_uses_conversation_before_session() {
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, "session_id", "session-1");
         insert_header(&mut headers, "conversation_id", "conversation-1");
 
         assert_eq!(
-            codex_session_key(&headers, "GPT-TEST"),
-            "responses:gpt-test:conversation-1"
+            auth_session_key(&headers, "GPT-TEST", "key-1"),
+            "auth:gpt-test:conversation-1"
+        );
+    }
+
+    #[test]
+    fn auth_session_key_falls_back_to_api_key_identity() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, "x-request-id", "request-changes-each-call");
+
+        assert_eq!(
+            auth_session_key(&headers, "GPT-TEST", "key-1"),
+            "auth:gpt-test:key:key-1"
         );
     }
 
@@ -505,6 +539,26 @@ mod tests {
         assert_eq!(providers[0].0.name, "auth:acct");
         assert_eq!(providers[1].0.name, "channel-a");
         assert!(providers[0].0.auth_account_id.is_some());
+    }
+
+    #[test]
+    fn prefer_provider_keeps_sticky_auth_account_first_in_auth_group() {
+        let mut first = provider_with_name("auth:acct-a");
+        first.auth_account_id = Some("acct-a".to_string());
+        let mut sticky = provider_with_name("auth:acct-b");
+        sticky.auth_account_id = Some("acct-b".to_string());
+        let channel = provider_with_name("channel-a");
+        let mut providers = vec![
+            (first, "gpt-test".to_string()),
+            (sticky, "gpt-test".to_string()),
+            (channel, "gpt-test".to_string()),
+        ];
+
+        prefer_provider(&mut providers, "auth:acct-b");
+
+        assert_eq!(providers[0].0.name, "auth:acct-b");
+        assert_eq!(providers[1].0.name, "auth:acct-a");
+        assert_eq!(providers[2].0.name, "channel-a");
     }
 
     #[test]
@@ -557,7 +611,11 @@ pub(super) async fn forward_openai(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let model = body_model(&body)?;
-    let providers = provider_attempts(&cfg, &state, &model, api, &allowed_providers);
+    let session_key = auth_session_key(&headers, &model, &api_key_id);
+    let mut providers = provider_attempts(&cfg, &state, &model, api, &allowed_providers);
+    if let Some(preferred) = state.preferred_provider_for_session(&session_key) {
+        prefer_provider(&mut providers, &preferred);
+    }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
 
@@ -615,6 +673,7 @@ pub(super) async fn forward_openai(
         .await
         {
             Ok(result) => {
+                remember_auth_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
                     api,
@@ -641,6 +700,7 @@ pub(super) async fn forward_openai(
                         .await
                     {
                         Ok(result) => {
+                            remember_auth_session_provider(&state, &session_key, &provider);
                             return Ok(commit_result(
                                 state.snapshot(),
                                 api,
@@ -943,7 +1003,8 @@ fn normalize_responses_function_call_ids(body: &mut Value) {
         else {
             continue;
         };
-        obj.entry("call_id".to_string()).or_insert(Value::String(id));
+        obj.entry("call_id".to_string())
+            .or_insert(Value::String(id));
         obj.remove("id");
     }
 }

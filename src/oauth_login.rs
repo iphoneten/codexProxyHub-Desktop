@@ -394,6 +394,7 @@ fn looks_like_ipv6(value: &str) -> bool {
 pub fn tokens_to_account(tokens: OAuthAccountTokens) -> AuthAccountConfig {
     AuthAccountConfig {
         id: Uuid::new_v4().simple().to_string(),
+        account_type: "openai".to_string(),
         name: tokens.name,
         enabled: true,
         email: tokens.email,
@@ -402,6 +403,7 @@ pub fn tokens_to_account(tokens: OAuthAccountTokens) -> AuthAccountConfig {
         account_id: tokens.account_id,
         client_id: OPENAI_OAUTH_CLIENT_ID.to_string(),
         token_url: OPENAI_OAUTH_TOKEN_URL.to_string(),
+        base_url: String::new(),
         expires_at: tokens.expires_at,
         models: crate::config::default_auth_account_models(),
         model_mapping: Default::default(),

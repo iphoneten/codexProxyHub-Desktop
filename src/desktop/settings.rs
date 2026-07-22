@@ -8,6 +8,41 @@ use crate::config::AppConfig;
 use eframe::egui;
 use std::collections::HashMap;
 
+pub fn auth_models_section(ui: &mut egui::Ui, config: &mut AppConfig) {
+    section(ui, "Auth 模型", |ui| {
+        auth_models_editor(
+            ui,
+            "OpenAI",
+            &mut config.auth.openai_models,
+            "gpt-5.4,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra",
+        );
+        ui.add_space(10.0);
+        auth_models_editor(ui, "Grok", &mut config.auth.grok_models, "grok-4.5");
+    });
+}
+
+fn auth_models_editor(ui: &mut egui::Ui, label: &str, models: &mut Vec<String>, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut text = models.join(",");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(440.0)
+                    .hint_text(hint),
+            )
+            .changed()
+        {
+            *models = text
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    });
+}
+
 pub fn server_section(ui: &mut egui::Ui, config: &mut AppConfig) {
     section(ui, "服务", |ui| {
         ui.horizontal(|ui| {

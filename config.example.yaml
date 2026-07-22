@@ -14,6 +14,15 @@ auth:
   # daily_token_limit 为空或 0 表示不限，按本地自然日累计 input+output token。
   # 两者为空列表或包含 "*" 时表示不限制。
   api_keys: []
+  # Auth 账号统一使用的模型列表，账号详情无需单独填写。
+  openai_models:
+    - gpt-5.4
+    - gpt-5.5
+    - gpt-5.6-luna
+    - gpt-5.6-sol
+    - gpt-5.6-terra
+  grok_models:
+    - grok-4.5
 
 routing:
   model_fallbacks: {}

@@ -18,7 +18,7 @@ use std::{
     time::Instant,
 };
 use uuid::Uuid;
-
+const BACKGROUND_GROK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthAvailability {
     Unknown,
@@ -46,7 +46,6 @@ struct AccountQuotaView {
     error: Option<String>,
     refreshing: bool,
 }
-
 impl Default for AuthAvailability {
     fn default() -> Self {
         Self::Unknown
@@ -57,6 +56,7 @@ impl Default for AuthAvailability {
 pub struct AuthAccountsState {
     views: HashMap<String, AccountQuotaView>,
     pending: Arc<Mutex<Vec<QuotaJobResult>>>,
+    grok_check_pending: Arc<Mutex<Vec<GrokCheckJobResult>>>,
     oauth_pending: Arc<Mutex<Vec<crate::oauth_login::OAuthLoginOutcome>>>,
     oauth_cancelled: Option<Arc<AtomicBool>>,
     oauth_waiting: bool,
@@ -65,12 +65,14 @@ pub struct AuthAccountsState {
     proxy_exit_ip: Option<String>,
     proxy_check_error: Option<String>,
     proxy_checked_via: Option<String>,
+    active_account_type: String,
+    last_background_grok_check: Option<Instant>,
 }
-
 impl AuthAccountsState {
     pub fn has_refreshing(&self) -> bool {
         self.views.values().any(|view| view.refreshing)
             || !self.pending.lock().is_empty()
+            || !self.grok_check_pending.lock().is_empty()
             || self.oauth_waiting
             || !self.oauth_pending.lock().is_empty()
             || self.proxy_check_running
@@ -82,13 +84,29 @@ struct QuotaJobResult {
     account_id: String,
     result: Result<(AuthQuotaSnapshot, TokenUpdate), String>,
 }
-
 struct TokenUpdate {
     access_token: String,
     refresh_token: Option<String>,
     expires_at: Option<i64>,
 }
-
+struct GrokCheckJobResult {
+    account_id: String,
+    result: auth_quota::GrokCheckResult,
+    silent: bool,
+}
+pub fn tick_background_grok_check(config: &mut AppConfig, state: &mut AuthAccountsState) {
+    apply_grok_check_pending(config, state, None, true);
+    let now = Instant::now();
+    let Some(last_check) = state.last_background_grok_check else {
+        state.last_background_grok_check = Some(now);
+        return;
+    };
+    if now.duration_since(last_check) < BACKGROUND_GROK_CHECK_INTERVAL {
+        return;
+    }
+    state.last_background_grok_check = Some(now);
+    queue_grok_checks(config, state, true);
+}
 pub fn auth_accounts_section(
     ui: &mut egui::Ui,
     config: &mut AppConfig,
@@ -96,8 +114,14 @@ pub fn auth_accounts_section(
     state: &mut AuthAccountsState,
 ) {
     apply_pending(config, state, message);
+    apply_grok_check_pending(config, state, Some(message), false);
     apply_oauth_pending(config, state, message);
     apply_proxy_check_pending(state, message);
+    if state.active_account_type.trim().is_empty() {
+        state.active_account_type = "openai".to_string();
+    }
+    let active_type = state.active_account_type.clone();
+    let active_count = account_count(config, &active_type);
 
     egui::Frame::none()
         .fill(surface())
@@ -113,30 +137,46 @@ pub fn auth_accounts_section(
                             .strong()
                             .color(heading_color()),
                     );
-                    ui.label(
-                        egui::RichText::new(format!("共 {} 个", config.auth_accounts.len()))
-                            .color(muteds()),
-                    );
+                    ui.label(egui::RichText::new(format!("共 {active_count} 个")).color(muteds()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if state.oauth_waiting && soft_button(ui, "取消授权").clicked() {
+                        if active_type == "openai"
+                            && state.oauth_waiting
+                            && soft_button(ui, "取消授权").clicked()
+                        {
                             cancel_oauth_login(state, message);
                         }
-                        if primary_button(ui, "新增账号").clicked() && !state.oauth_waiting {
+                        if active_type == "openai"
+                            && primary_button(ui, "新增账号").clicked()
+                            && !state.oauth_waiting
+                        {
                             start_oauth_login(config, state, message);
                         }
-                        if soft_button(ui, "全部刷新额度").clicked() {
-                            refresh_all_accounts(config, state, message);
+                        if active_type == "grok" && primary_button(ui, "新增 Grok 授权").clicked()
+                        {
+                            config.auth_accounts.insert(0, default_grok_account());
+                        }
+                        if active_type == "openai" && soft_button(ui, "全部刷新额度").clicked()
+                        {
+                            refresh_all_accounts(config, state, message, &active_type);
+                        }
+                        if active_type == "grok" && soft_button(ui, "全部检查授权").clicked()
+                        {
+                            check_all_grok_accounts(config, state, message);
                         }
                         if soft_button(ui, "导入账号").clicked() {
-                            import_auth_accounts(config, message);
+                            import_auth_accounts(config, message, &active_type);
                         }
                         if soft_button(ui, "导出账号").clicked() {
-                            export_auth_accounts(config, message);
+                            export_auth_accounts(config, message, &active_type);
                         }
-                        if soft_button(ui, "手动新增").clicked() {
+                        if active_type == "openai" && soft_button(ui, "手动新增").clicked() {
                             config.auth_accounts.insert(0, default_auth_account());
                         }
                     });
+                });
+                ui.horizontal(|ui| {
+                    account_type_tab(ui, &mut state.active_account_type, "openai", "OpenAI");
+                    account_type_tab(ui, &mut state.active_account_type, "grok", "Grok");
                 });
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Auth 代理").size(12.0).color(muteds()));
@@ -182,13 +222,15 @@ pub fn auth_accounts_section(
         });
     ui.add_space(12.0);
 
-    if config.auth_accounts.is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "暂无 Auth 账号，可点击「新增账号」浏览器授权，或导入 CPA/sub2api JSON。",
-            )
-            .color(muteds()),
-        );
+    let account_indexes = config
+        .auth_accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, account)| account_type_matches(account, &active_type).then_some(idx))
+        .collect::<Vec<_>>();
+
+    if account_indexes.is_empty() {
+        ui.label(egui::RichText::new(empty_account_text(&active_type)).color(muteds()));
         return;
     }
 
@@ -206,23 +248,25 @@ pub fn auth_accounts_section(
     let proxy_url = auth_proxy_url(config);
 
     let mut idx = 0;
-    while idx < config.auth_accounts.len() {
+    while idx < account_indexes.len() {
         ui.horizontal_top(|ui| {
             for column in 0..columns {
-                let account_idx = idx + column;
-                if account_idx >= config.auth_accounts.len() {
+                let Some(account_idx) = account_indexes.get(idx + column).copied() else {
                     break;
-                }
+                };
                 let account = &mut config.auth_accounts[account_idx];
                 let view = state.views.entry(account.id.clone()).or_default().clone();
+                let card_id = account.id.clone();
                 ui.allocate_ui_with_layout(
                     egui::vec2(card_width, 0.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(card_width);
-                        if account_card(ui, account, &view, state, message, proxy_url.clone()) {
-                            remove = Some(account_idx);
-                        }
+                        ui.push_id(("auth_account_card", account_idx, card_id.as_str()), |ui| {
+                            if account_card(ui, account, &view, state, message, proxy_url.clone()) {
+                                remove = Some(account_idx);
+                            }
+                        });
                     },
                 );
                 if column + 1 < columns {
@@ -231,7 +275,7 @@ pub fn auth_accounts_section(
             }
         });
         idx += columns;
-        if idx < config.auth_accounts.len() {
+        if idx < account_indexes.len() {
             ui.add_space(gap);
         }
     }
@@ -246,6 +290,50 @@ pub fn auth_accounts_section(
     }
 }
 
+fn account_type_tab(ui: &mut egui::Ui, active: &mut String, value: &str, label: &str) {
+    let selected = active == value;
+    let fill = if selected {
+        egui::Color32::from_rgb(239, 246, 255)
+    } else {
+        egui::Color32::from_rgb(244, 247, 251)
+    };
+    let color = if selected { accent() } else { text_color() };
+    if ui
+        .add(
+            egui::Button::new(egui::RichText::new(label).color(color))
+                .fill(fill)
+                .rounding(6.0)
+                .min_size(egui::vec2(86.0, 30.0)),
+        )
+        .clicked()
+    {
+        *active = value.to_string();
+    }
+}
+
+fn account_type_matches(account: &AuthAccountConfig, account_type: &str) -> bool {
+    let current = account.account_type.trim();
+    let expected = account_type.trim();
+    current.eq_ignore_ascii_case(expected)
+        || (expected.eq_ignore_ascii_case("grok") && current.eq_ignore_ascii_case("gork"))
+}
+
+fn account_count(config: &AppConfig, account_type: &str) -> usize {
+    config
+        .auth_accounts
+        .iter()
+        .filter(|account| account_type_matches(account, account_type))
+        .count()
+}
+
+fn empty_account_text(account_type: &str) -> &'static str {
+    if account_type == "grok" {
+        "暂无 Grok 授权，可点击「新增 Grok 授权」填写 API Key，或导入 Grok 账号 JSON。"
+    } else {
+        "暂无 OpenAI Auth 账号，可点击「新增账号」浏览器授权，或导入 CPA/sub2api JSON。"
+    }
+}
+
 fn account_card(
     ui: &mut egui::Ui,
     account: &mut AuthAccountConfig,
@@ -255,6 +343,8 @@ fn account_card(
     proxy_url: Option<String>,
 ) -> bool {
     let mut delete = false;
+    let is_grok = account_type_matches(account, "grok");
+    let is_openai = account_type_matches(account, "openai");
     let availability = effective_availability(account, view);
     let (status_label, status_fill, status_color) = availability_style(availability);
 
@@ -290,27 +380,35 @@ fn account_card(
             });
 
             ui.add_space(10.0);
-            usage_row(
-                ui,
-                "主额度",
-                view.primary_used,
-                view.primary_reset.as_deref(),
-                view.primary_window.as_deref(),
-            );
-            usage_row(
-                ui,
-                "次额度",
-                view.secondary_used,
-                view.secondary_reset.as_deref(),
-                view.secondary_window.as_deref(),
-            );
-            usage_row(
-                ui,
-                "代码审查",
-                view.code_review_used,
-                view.code_review_reset.as_deref(),
-                view.code_review_window.as_deref(),
-            );
+            if is_openai {
+                usage_row(
+                    ui,
+                    "主额度",
+                    view.primary_used,
+                    view.primary_reset.as_deref(),
+                    view.primary_window.as_deref(),
+                );
+                usage_row(
+                    ui,
+                    "次额度",
+                    view.secondary_used,
+                    view.secondary_reset.as_deref(),
+                    view.secondary_window.as_deref(),
+                );
+                usage_row(
+                    ui,
+                    "代码审查",
+                    view.code_review_used,
+                    view.code_review_reset.as_deref(),
+                    view.code_review_window.as_deref(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("OpenAI-compatible API Key 授权")
+                        .size(12.0)
+                        .color(muteds()),
+                );
+            }
 
             if let Some(error) = view.error.as_deref() {
                 ui.add_space(6.0);
@@ -330,40 +428,64 @@ fn account_card(
 
             ui.add_space(10.0);
             ui.collapsing("账号详情", |ui| {
+                if is_grok {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Base URL").size(12.0).color(muteds()));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut account.base_url)
+                                .desired_width(260.0)
+                                .hint_text("https://api.x.ai/v1"),
+                        );
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("账号 ID").size(12.0).color(muteds()));
+                    let hint = if is_grok {
+                        "Grok Account ID"
+                    } else {
+                        "ChatGPT Account ID"
+                    };
                     ui.add(
                         egui::TextEdit::singleline(
                             account.account_id.get_or_insert_with(String::new),
                         )
                         .desired_width(220.0)
-                        .hint_text("ChatGPT Account ID"),
+                        .hint_text(hint),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Access").size(12.0).color(muteds()));
+                    let access_label = if is_grok { "API Key" } else { "Access" };
+                    ui.label(egui::RichText::new(access_label).size(12.0).color(muteds()));
                     ui.add(
                         egui::TextEdit::singleline(&mut account.access_token)
                             .password(true)
                             .desired_width(240.0)
-                            .hint_text("access_token"),
+                            .hint_text(if is_grok {
+                                "xAI API Key"
+                            } else {
+                                "access_token"
+                            }),
                     );
                 });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Refresh").size(12.0).color(muteds()));
-                    ui.add(
-                        egui::TextEdit::singleline(
-                            account.refresh_token.get_or_insert_with(String::new),
-                        )
-                        .password(true)
-                        .desired_width(240.0)
-                        .hint_text("refresh_token"),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("模型").size(12.0).color(muteds()));
-                    models_editor(ui, account);
-                });
+                if is_openai {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Refresh").size(12.0).color(muteds()));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                account.refresh_token.get_or_insert_with(String::new),
+                            )
+                            .password(true)
+                            .desired_width(240.0)
+                            .hint_text("refresh_token"),
+                        );
+                    });
+                }
+                if is_grok {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("模型映射").size(12.0).color(muteds()));
+                        model_mapping_editor(ui, account);
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("优先级").size(12.0).color(muteds()));
                     ui.add(egui::DragValue::new(&mut account.priority).speed(1));
@@ -379,10 +501,22 @@ fn account_card(
                 } else {
                     "刷新额度"
                 };
-                if soft_button(ui, refresh_label).clicked() && !view.refreshing {
+                if is_openai && soft_button(ui, refresh_label).clicked() && !view.refreshing {
                     queue_refresh(account, state, proxy_url.clone());
                     *message = AppMessage::new(
                         format!("正在刷新额度: {}", account.name),
+                        MessageKind::Info,
+                    );
+                }
+                let check_label = if view.refreshing {
+                    "检查中..."
+                } else {
+                    "检查授权"
+                };
+                if is_grok && soft_button(ui, check_label).clicked() && !view.refreshing {
+                    queue_grok_check(account, state, proxy_url.clone());
+                    *message = AppMessage::new(
+                        format!("正在检查 Grok 授权: {}", account.name),
                         MessageKind::Info,
                     );
                 }
@@ -576,18 +710,164 @@ fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState, message:
     let _ = message;
 }
 
-fn refresh_all_accounts(
+fn apply_grok_check_pending(
+    config: &mut AppConfig,
+    state: &mut AuthAccountsState,
+    message: Option<&mut AppMessage>,
+    silent_only: bool,
+) {
+    let jobs = {
+        let mut pending = state.grok_check_pending.lock();
+        let all = std::mem::take(&mut *pending);
+        if !silent_only {
+            all
+        } else {
+            let (jobs, remain): (Vec<_>, Vec<_>) = all.into_iter().partition(|job| job.silent);
+            pending.extend(remain);
+            jobs
+        }
+    };
+    if jobs.is_empty() {
+        return;
+    }
+    let mut available = 0;
+    let mut exhausted = 0;
+    let mut disabled = 0;
+    let mut silent = true;
+    for job in jobs {
+        silent &= job.silent;
+        let view = state.views.entry(job.account_id.clone()).or_default();
+        view.refreshing = false;
+        view.checked_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        match job.result {
+            auth_quota::GrokCheckResult::Available => {
+                view.availability = AuthAvailability::Available;
+                view.error = None;
+                available += 1;
+            }
+            auth_quota::GrokCheckResult::QuotaExhausted(err) => {
+                view.availability = AuthAvailability::QuotaExhausted;
+                view.error = Some(err);
+                exhausted += 1;
+            }
+            auth_quota::GrokCheckResult::InvalidAuth(err) => {
+                if let Some(account) = config
+                    .auth_accounts
+                    .iter_mut()
+                    .find(|account| account.id == job.account_id)
+                {
+                    account.enabled = false;
+                }
+                view.availability = AuthAvailability::Unavailable;
+                view.error = Some(err);
+                disabled += 1;
+            }
+            auth_quota::GrokCheckResult::Unavailable(err) => {
+                view.availability = AuthAvailability::Unavailable;
+                view.error = Some(err);
+            }
+        }
+    }
+    if !silent && message.is_some() {
+        let kind = if disabled == 0 {
+            MessageKind::Success
+        } else {
+            MessageKind::Error
+        };
+        let text = if disabled == 0 {
+            format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽")
+        } else {
+            format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽，已停用 {disabled} 个授权失效账号")
+        };
+        *message.unwrap() = AppMessage::new(text, kind);
+    }
+}
+fn check_all_grok_accounts(
     config: &AppConfig,
     state: &mut AuthAccountsState,
     message: &mut AppMessage,
 ) {
-    if config.auth_accounts.is_empty() {
+    let count = queue_grok_checks(config, state, false);
+    if count == 0 {
+        *message = AppMessage::new("没有已启用的 Grok 账号可检查", MessageKind::Error);
+        return;
+    }
+    *message = AppMessage::new(
+        format!("正在并发检查 {count} 个 Grok 账号授权"),
+        MessageKind::Info,
+    );
+}
+
+fn queue_grok_checks(config: &AppConfig, state: &mut AuthAccountsState, silent: bool) -> usize {
+    let accounts = config
+        .auth_accounts
+        .iter()
+        .filter(|account| account.enabled && account_type_matches(account, "grok"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for account in &accounts {
+        let view = state.views.entry(account.id.clone()).or_default();
+        view.refreshing = true;
+        view.availability = AuthAvailability::Checking;
+        view.error = None;
+    }
+    let count = accounts.len();
+    if count == 0 {
+        return 0;
+    }
+    let pending = Arc::clone(&state.grok_check_pending);
+    let proxy_url = auth_proxy_url(config);
+    thread::spawn(move || {
+        let results = auth_quota::check_grok_accounts(accounts, proxy_url);
+        pending
+            .lock()
+            .extend(results.into_iter().map(|result| GrokCheckJobResult {
+                account_id: result.0,
+                result: result.1,
+                silent,
+            }));
+    });
+    count
+}
+
+fn queue_grok_check(
+    account: &AuthAccountConfig,
+    state: &mut AuthAccountsState,
+    proxy_url: Option<String>,
+) {
+    let view = state.views.entry(account.id.clone()).or_default();
+    if view.refreshing {
+        return;
+    }
+    view.refreshing = true;
+    view.availability = AuthAvailability::Checking;
+    view.error = None;
+
+    let account = account.clone();
+    let pending = Arc::clone(&state.grok_check_pending);
+    thread::spawn(move || {
+        let result = auth_quota::check_grok_account(&account, proxy_url.as_deref());
+        pending.lock().push(GrokCheckJobResult {
+            account_id: account.id,
+            result,
+            silent: false,
+        });
+    });
+}
+
+fn refresh_all_accounts(
+    config: &AppConfig,
+    state: &mut AuthAccountsState,
+    message: &mut AppMessage,
+    account_type: &str,
+) {
+    if account_count(config, account_type) == 0 {
         *message = AppMessage::new("没有可刷新的 Auth 账号", MessageKind::Error);
         return;
     }
     let mut count = 0;
     for account in &config.auth_accounts {
-        if account.enabled {
+        if account.enabled && account_type_matches(account, account_type) {
             queue_refresh(account, state, auth_proxy_url(config));
             count += 1;
         }
@@ -764,14 +1044,18 @@ fn cancel_oauth_login(state: &mut AuthAccountsState, message: &mut AppMessage) {
     *message = AppMessage::new("已取消 OAuth 授权", MessageKind::Info);
 }
 
-fn import_auth_accounts(config: &mut AppConfig, message: &mut AppMessage) {
+fn import_auth_accounts(config: &mut AppConfig, message: &mut AppMessage, account_type: &str) {
     let Some(source_path) = rfd::FileDialog::new()
-        .add_filter("Auth 账号 JSON", &["json"])
+        .add_filter("Auth 账号", &["json", "zip"])
         .pick_file()
     else {
         return;
     };
-    match crate::config_import::import_auth_accounts_file(config, &source_path) {
+    match crate::config_import::import_auth_accounts_file_for_type(
+        config,
+        &source_path,
+        Some(account_type),
+    ) {
         Ok(count) => {
             *message = AppMessage::new(
                 format!(
@@ -787,20 +1071,24 @@ fn import_auth_accounts(config: &mut AppConfig, message: &mut AppMessage) {
     }
 }
 
-fn export_auth_accounts(config: &AppConfig, message: &mut AppMessage) {
-    if config.auth_accounts.is_empty() {
+fn export_auth_accounts(config: &AppConfig, message: &mut AppMessage, account_type: &str) {
+    if account_count(config, account_type) == 0 {
         *message = AppMessage::new("没有可导出的 Auth 账号", MessageKind::Error);
         return;
     }
     let Some(target_path) = rfd::FileDialog::new()
         .add_filter("Auth 账号 JSON", &["json"])
-        .set_file_name("auth_accounts.json")
+        .set_file_name(format!("auth_accounts_{account_type}.json"))
         .save_file()
     else {
         return;
     };
     let target_path = ensure_json_extension(target_path);
-    match crate::config_import::export_auth_accounts_file(config, &target_path) {
+    match crate::config_import::export_auth_accounts_file_for_type(
+        config,
+        &target_path,
+        Some(account_type),
+    ) {
         Ok(()) => {
             *message = AppMessage::new(
                 format!("Auth 账号已导出: {}", target_path.display()),
@@ -825,40 +1113,51 @@ fn ensure_json_extension(path: PathBuf) -> PathBuf {
     }
 }
 
-fn models_editor(ui: &mut egui::Ui, account: &mut AuthAccountConfig) {
-    // 用 egui 临时状态保存编辑中的原文，避免每帧从 account.models.join(",")
-    // 反向重建时把用户刚敲的逗号/空段过滤掉（导致光标跳位、无法输入第二个模型）。
-    let draft_id = egui::Id::new(("auth_account_models_draft", account.id.as_str()));
+fn model_mapping_editor(ui: &mut egui::Ui, account: &mut AuthAccountConfig) {
+    let draft_id = egui::Id::new(("auth_account_model_mapping_draft", account.id.as_str()));
+    let source = serialize_model_mapping(account);
     let mut text = ui
         .ctx()
         .data(|d| d.get_temp::<String>(draft_id))
-        .unwrap_or_else(|| account.models.join(","));
-
+        .unwrap_or(source);
     let resp = ui.add_sized(
-        [220.0, 24.0],
-        egui::TextEdit::singleline(&mut text)
-            .hint_text("gpt-5.4,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra"),
+        [300.0, 84.0],
+        egui::TextEdit::multiline(&mut text)
+            .desired_rows(4)
+            .hint_text("本地模型=上游模型"),
     );
-
     if resp.changed() {
         ui.ctx().data_mut(|d| d.insert_temp(draft_id, text.clone()));
     }
-
-    // 失焦时才把逗号分隔的文本解析为 Vec，避免中间态被吞。
     if resp.lost_focus() {
-        account.models = text
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
+        account.model_mapping.clear();
+        for line in text.lines() {
+            if let Some((local, upstream)) = line.split_once('=') {
+                let local = local.trim();
+                let upstream = upstream.trim();
+                if !local.is_empty() && !upstream.is_empty() {
+                    account
+                        .model_mapping
+                        .insert(local.to_string(), upstream.to_string());
+                }
+            }
+        }
         ui.ctx().data_mut(|d| d.remove::<String>(draft_id));
     }
 }
-
+fn serialize_model_mapping(account: &AuthAccountConfig) -> String {
+    let mut entries = account.model_mapping.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 fn default_auth_account() -> AuthAccountConfig {
     AuthAccountConfig {
         id: Uuid::new_v4().simple().to_string(),
+        account_type: "openai".to_string(),
         name: "OpenAI Auth".to_string(),
         enabled: false,
         email: None,
@@ -867,11 +1166,33 @@ fn default_auth_account() -> AuthAccountConfig {
         account_id: None,
         client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
         token_url: "https://auth.openai.com/oauth/token".to_string(),
+        base_url: String::new(),
         expires_at: None,
         models: crate::config::default_auth_account_models(),
         model_mapping: Default::default(),
         weight: 1,
         priority: 1,
         description: None,
+    }
+}
+fn default_grok_account() -> AuthAccountConfig {
+    AuthAccountConfig {
+        id: Uuid::new_v4().simple().to_string(),
+        account_type: "grok".to_string(),
+        name: "Grok Auth".to_string(),
+        enabled: false,
+        email: None,
+        access_token: String::new(),
+        refresh_token: None,
+        account_id: None,
+        client_id: String::new(),
+        token_url: String::new(),
+        base_url: "https://api.x.ai/v1".to_string(),
+        expires_at: None,
+        models: vec!["grok-4.5".to_string()],
+        model_mapping: Default::default(),
+        weight: 1,
+        priority: 1,
+        description: Some("Grok OpenAI-compatible API Key 账号".to_string()),
     }
 }

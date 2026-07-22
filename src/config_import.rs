@@ -1,8 +1,9 @@
 use crate::config::{AppConfig, AuthAccountConfig};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDateTime};
+use flate2::read::DeflateDecoder;
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, io::Read, path::Path};
 
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -53,26 +54,167 @@ pub fn import_file(source: &Path, current: Option<&AppConfig>) -> Result<ImportR
     })
 }
 
+#[allow(dead_code)]
 pub fn import_auth_accounts_file(config: &mut AppConfig, source: &Path) -> Result<usize> {
+    import_auth_accounts_file_for_type(config, source, None)
+}
+
+pub fn import_auth_accounts_file_for_type(
+    config: &mut AppConfig,
+    source: &Path,
+    account_type: Option<&str>,
+) -> Result<usize> {
+    if source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
+    {
+        return import_auth_accounts_zip_for_type(config, source, account_type);
+    }
     let content = fs::read_to_string(source)
         .with_context(|| format!("读取 Auth 账号文件失败: {}", source.display()))?;
     let value: Value = serde_json::from_str(&content)
         .with_context(|| format!("解析 Auth 账号 JSON 失败: {}", source.display()))?;
-    let imported = parse_auth_accounts(&value)?;
+    let mut imported = parse_auth_accounts(&value)?;
+    if let Some(account_type) = account_type {
+        for account in &mut imported {
+            account.account_type = account_type.to_string();
+        }
+    }
     Ok(merge_accounts(&mut config.auth_accounts, imported))
 }
 
+fn import_auth_accounts_zip_for_type(
+    config: &mut AppConfig,
+    source: &Path,
+    account_type: Option<&str>,
+) -> Result<usize> {
+    let entries = read_zip_json_entries(source)?;
+    if entries.is_empty() {
+        return Err(anyhow!("ZIP 中未找到 JSON 文件: {}", source.display()));
+    }
+
+    let mut imported = Vec::new();
+    let mut errors = Vec::new();
+    for (name, content) in entries {
+        match serde_json::from_slice::<Value>(&content)
+            .with_context(|| format!("解析 ZIP 内 JSON 失败: {name}"))
+            .and_then(|value| parse_auth_accounts(&value))
+        {
+            Ok(mut accounts) => {
+                if let Some(account_type) = account_type {
+                    for account in &mut accounts {
+                        account.account_type = account_type.to_string();
+                    }
+                }
+                imported.extend(accounts);
+            }
+            Err(err) => errors.push(format!("{name}: {err}")),
+        }
+    }
+
+    if imported.is_empty() {
+        let detail = errors.join("；");
+        return Err(anyhow!("ZIP 中未导入任何 Auth 账号: {detail}"));
+    }
+
+    Ok(merge_accounts(&mut config.auth_accounts, imported))
+}
+
+fn read_zip_json_entries(source: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let data =
+        fs::read(source).with_context(|| format!("读取 ZIP 文件失败: {}", source.display()))?;
+    let mut offset = 0usize;
+    let mut entries = Vec::new();
+
+    while offset + 30 <= data.len() {
+        let signature = read_u32_le(&data, offset)?;
+        if signature == 0x0201_4b50 || signature == 0x0605_4b50 {
+            break;
+        }
+        if signature != 0x0403_4b50 {
+            return Err(anyhow!("ZIP 本地文件头无效: {}", source.display()));
+        }
+
+        let flags = read_u16_le(&data, offset + 6)?;
+        if flags & 0x0008 != 0 {
+            return Err(anyhow!(
+                "暂不支持带 data descriptor 的 ZIP 文件: {}",
+                source.display()
+            ));
+        }
+        let method = read_u16_le(&data, offset + 8)?;
+        let compressed_size = read_u32_le(&data, offset + 18)? as usize;
+        let file_name_len = read_u16_le(&data, offset + 26)? as usize;
+        let extra_len = read_u16_le(&data, offset + 28)? as usize;
+        let name_start = offset + 30;
+        let name_end = name_start + file_name_len;
+        let data_start = name_end + extra_len;
+        let data_end = data_start + compressed_size;
+        if data_end > data.len() {
+            return Err(anyhow!("ZIP 文件条目长度越界: {}", source.display()));
+        }
+        let name = String::from_utf8_lossy(&data[name_start..name_end]).to_string();
+        if name.to_ascii_lowercase().ends_with(".json") && !name.ends_with('/') {
+            let content = match method {
+                0 => data[data_start..data_end].to_vec(),
+                8 => {
+                    let mut decoder = DeflateDecoder::new(&data[data_start..data_end]);
+                    let mut out = Vec::new();
+                    decoder.read_to_end(&mut out)?;
+                    out
+                }
+                other => return Err(anyhow!("ZIP 条目 {name} 使用了不支持的压缩方法: {other}")),
+            };
+            entries.push((name, content));
+        }
+        offset = data_end;
+    }
+
+    Ok(entries)
+}
+
+fn read_u16_le(data: &[u8], offset: usize) -> Result<u16> {
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or_else(|| anyhow!("ZIP 文件截断"))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("ZIP 文件截断"))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+#[allow(dead_code)]
 pub fn export_auth_accounts_file(config: &AppConfig, target: &Path) -> Result<()> {
+    export_auth_accounts_file_for_type(config, target, None)
+}
+
+pub fn export_auth_accounts_file_for_type(
+    config: &AppConfig,
+    target: &Path,
+    account_type: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         fs::create_dir_all(parent)?;
     }
+    let auth_accounts = config
+        .auth_accounts
+        .iter()
+        .filter(|account| {
+            account_type.is_none_or(|ty| account.account_type.trim().eq_ignore_ascii_case(ty))
+        })
+        .collect::<Vec<_>>();
     let payload = json!({
         "type": "routehub-auth-accounts",
         "version": 1,
-        "auth_accounts": config.auth_accounts,
+        "auth_accounts": auth_accounts,
     });
     let content = serde_json::to_string_pretty(&payload)?;
     fs::write(target, content)
@@ -131,7 +273,6 @@ fn account_from_entry(entry: &Value, index: usize) -> Option<AuthAccountConfig> 
     let id = string_field(entry, &["id"])
         .or_else(|| account_id.clone())
         .unwrap_or_else(|| stable_account_id(&label, index));
-    let models = credential_models(credentials);
     let model_mapping = credentials
         .get("model_mapping")
         .and_then(Value::as_object)
@@ -152,6 +293,8 @@ fn account_from_entry(entry: &Value, index: usize) -> Option<AuthAccountConfig> 
 
     serde_json::from_value(json!({
         "id": id,
+        "account_type": string_field(entry, &["account_type", "type", "provider"])
+            .unwrap_or_else(|| "openai".to_string()),
         "name": label,
         "enabled": true,
         "email": email,
@@ -160,24 +303,16 @@ fn account_from_entry(entry: &Value, index: usize) -> Option<AuthAccountConfig> 
         "client_id": string_field(credentials, &["client_id", "clientId"])
             .unwrap_or_else(|| OPENAI_OAUTH_CLIENT_ID.to_string()),
         "token_url": OPENAI_OAUTH_TOKEN_URL,
+        "base_url": string_field(credentials, &["base_url", "baseUrl"])
+            .or_else(|| string_field(entry, &["base_url", "baseUrl"]))
+            .unwrap_or_default(),
         "expires_at": expires_at,
         "account_id": account_id,
-        "models": models,
+        "models": Vec::<String>::new(),
         "model_mapping": model_mapping,
         "description": "从 CPA/sub2api JSON 导入的 OpenAI OAuth 账号"
     }))
     .ok()
-}
-
-fn credential_models(credentials: &Value) -> Vec<String> {
-    if let Some(mapping) = credentials.get("model_mapping").and_then(Value::as_object) {
-        let mut models = mapping.keys().cloned().collect::<Vec<_>>();
-        models.sort();
-        if !models.is_empty() {
-            return models;
-        }
-    }
-    crate::config::default_auth_account_models()
 }
 
 pub fn merge_accounts(
@@ -300,7 +435,7 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(accounts[0].models, vec!["gpt-5.4"]);
+        assert!(accounts[0].models.is_empty());
         assert_eq!(accounts[0].account_id.as_deref(), Some("acct_456"));
     }
 
@@ -322,5 +457,98 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, "auth-1");
         assert_eq!(accounts[0].refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn imports_auth_accounts_from_zip_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "routehub-auth-zip-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("accounts.zip");
+        write_stored_zip(
+            &zip_path,
+            &[
+                (
+                    "one.json",
+                    br#"{"name":"one","access_token":"access-1","refresh_token":"refresh-1"}"#
+                        .as_slice(),
+                ),
+                (
+                    "nested/two.json",
+                    br#"{"name":"two","access_token":"access-2","refresh_token":"refresh-2"}"#
+                        .as_slice(),
+                ),
+            ],
+        );
+
+        let mut config = AppConfig::load("config.example.yaml").unwrap();
+        let count =
+            import_auth_accounts_file_for_type(&mut config, &zip_path, Some("grok")).unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(config.auth_accounts.len(), 2);
+        assert!(config
+            .auth_accounts
+            .iter()
+            .all(|account| account.account_type == "grok"));
+
+        let _ = std::fs::remove_file(zip_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut data = Vec::new();
+        let mut central = Vec::new();
+        for (name, content) in entries {
+            let local_offset = data.len() as u32;
+            let size = content.len() as u32;
+            let name_len = name.len() as u16;
+            data.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            data.extend_from_slice(&20u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&name_len.to_le_bytes());
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(name.as_bytes());
+            data.extend_from_slice(content);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&name_len.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = data.len() as u32;
+        let central_size = central.len() as u32;
+        data.extend_from_slice(&central);
+        data.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        data.extend_from_slice(&central_size.to_le_bytes());
+        data.extend_from_slice(&central_offset.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        std::fs::write(path, data).unwrap();
     }
 }

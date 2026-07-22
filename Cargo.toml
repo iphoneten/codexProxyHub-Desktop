@@ -10,6 +10,7 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.28"
 egui = "0.28"
+flate2 = "1.1.9"
 futures-util = "0.3"
 http = "1"
 image = { version = "0.25.10", default-features = false, features = ["gif", "png"] }

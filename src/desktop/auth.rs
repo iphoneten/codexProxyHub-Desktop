@@ -380,7 +380,14 @@ pub fn selectable_allowed_providers(config: &AppConfig) -> Vec<(String, bool)> {
 }
 
 pub fn available_model_names(config: &AppConfig) -> Vec<String> {
-    let mut models = HashSet::new();
+    let mut models = config
+        .auth
+        .openai_models
+        .iter()
+        .chain(config.auth.grok_models.iter())
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .collect::<HashSet<_>>();
     for provider in config.providers.iter().filter(|provider| provider.enabled) {
         for model in &provider.models {
             models.insert(model.trim().to_string());
@@ -394,9 +401,6 @@ pub fn available_model_names(config: &AppConfig) -> Vec<String> {
         .iter()
         .filter(|account| account.enabled)
     {
-        for model in &account.models {
-            models.insert(model.trim().to_string());
-        }
         for model in account.model_mapping.keys() {
             models.insert(model.trim().to_string());
         }

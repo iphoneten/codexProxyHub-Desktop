@@ -429,6 +429,9 @@ impl eframe::App for HubApp {
             self.message = AppMessage::new("窗口已最小化，代理继续运行", MessageKind::Info);
         }
 
+        if let Some(config) = self.config.as_mut() {
+            auth_accounts::tick_background_grok_check(config, &mut self.auth_accounts_state);
+        }
         self.sync_config_to_runtime();
 
         egui::TopBottomPanel::top("top")
@@ -543,6 +546,8 @@ impl eframe::App for HubApp {
                                 .show(ui, |ui| {
                                     ui.set_max_width(640.0);
                                     settings::server_section(ui, config);
+                                    ui.add_space(14.0);
+                                    settings::auth_models_section(ui, config);
                                     ui.add_space(14.0);
                                     settings::routing_section(
                                         ui,

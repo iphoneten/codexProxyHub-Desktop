@@ -34,6 +34,14 @@ pub struct AuthQuotaRefreshResult {
     pub expires_at: Option<i64>,
 }
 
+#[derive(Debug)]
+pub enum GrokCheckResult {
+    Available,
+    QuotaExhausted(String),
+    InvalidAuth(String),
+    Unavailable(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct UsageResponse {
     plan_type: Option<String>,
@@ -115,6 +123,105 @@ pub fn refresh_auth_account_quota(
         refresh_token,
         expires_at,
     })
+}
+
+pub fn check_grok_account(account: &AuthAccountConfig, proxy_url: Option<&str>) -> GrokCheckResult {
+    if account.access_token.trim().is_empty() {
+        return GrokCheckResult::InvalidAuth("账号缺少 API Key".to_string());
+    }
+    let base_url = if account.base_url.trim().is_empty() {
+        "https://api.x.ai/v1"
+    } else {
+        account.base_url.trim_end_matches('/')
+    };
+    let mut builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        let Ok(proxy) = reqwest::Proxy::all(proxy_url) else {
+            return GrokCheckResult::Unavailable("Auth 代理地址无效".to_string());
+        };
+        builder = builder.no_proxy().proxy(proxy);
+    }
+    let Ok(client) = builder.build() else {
+        return GrokCheckResult::Unavailable("创建 Grok 检查客户端失败".to_string());
+    };
+    let mut request = client
+        .post(format!("{base_url}/chat/completions"))
+        .bearer_auth(&account.access_token)
+        .header("x-grok-client-version", "0.2.109")
+        .header("x-grok-client-identifier", "grok-shell")
+        .header("User-Agent", "xai-grok-build/0.2.109")
+        .json(&serde_json::json!({
+            "model": account.models.first().map(String::as_str).unwrap_or("grok-4.5"),
+            "messages": [{"role": "user", "content": "Reply with exactly: hi"}],
+            "stream": false,
+            "max_tokens": 8
+        }));
+    if base_url
+        .to_ascii_lowercase()
+        .contains("cli-chat-proxy.grok.com")
+    {
+        request = request.header("X-XAI-Token-Auth", "xai-grok-cli");
+    }
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(err) => {
+            return GrokCheckResult::Unavailable(format!("Grok 授权检查请求失败: {err}"));
+        }
+    };
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if status.is_success() {
+        return GrokCheckResult::Available;
+    }
+    let detail: String = text.chars().take(180).collect();
+    let error = format!("Grok 上游返回 {status}: {detail}");
+    let normalized = text.to_ascii_lowercase();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || normalized.contains("insufficient_quota")
+        || normalized.contains("quota exceeded")
+        || normalized.contains("quota_exceeded")
+        || normalized.contains("limit_reached")
+        || normalized.contains("rate limit")
+    {
+        GrokCheckResult::QuotaExhausted(error)
+    } else if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        GrokCheckResult::InvalidAuth(error)
+    } else {
+        GrokCheckResult::Unavailable(error)
+    }
+}
+
+pub fn check_grok_accounts(
+    accounts: Vec<AuthAccountConfig>,
+    proxy_url: Option<String>,
+) -> Vec<(String, GrokCheckResult)> {
+    let handles = accounts
+        .into_iter()
+        .map(|account| {
+            let account_id = account.id.clone();
+            let proxy_url = proxy_url.clone();
+            let handle = std::thread::spawn(move || {
+                let result = check_grok_account(&account, proxy_url.as_deref());
+                (account.id, result)
+            });
+            (account_id, handle)
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .map(|(account_id, handle)| {
+            handle.join().unwrap_or_else(|_| {
+                (
+                    account_id,
+                    GrokCheckResult::Unavailable("Grok 授权检查线程异常".to_string()),
+                )
+            })
+        })
+        .collect()
 }
 
 fn build_blocking_client(

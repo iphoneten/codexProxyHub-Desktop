@@ -102,7 +102,6 @@ pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 const PROVIDER_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
 const PROVIDER_CIRCUIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
-const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProviderCircuitStatus {
@@ -201,7 +200,8 @@ impl ProviderCircuitGuard {
     }
 
     fn mark_failure(mut self, status: StatusCode, message: &str, retry_after: Option<Duration>) {
-        if !circuit_breaker_failure(status) {
+        let quota_exhausted = quota_exhausted_error(message);
+        if !circuit_breaker_failure(status, message) {
             self.mark_success();
             return;
         }
@@ -215,7 +215,7 @@ impl ProviderCircuitGuard {
             match circuit.phase.clone() {
                 ProviderCircuitPhase::Open { until } => {
                     circuit.consecutive_failures += 1;
-                    let until = if status == StatusCode::TOO_MANY_REQUESTS {
+                    let until = if status == StatusCode::TOO_MANY_REQUESTS || quota_exhausted {
                         until.max(
                             Instant::now()
                                 + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN),
@@ -252,7 +252,7 @@ impl ProviderCircuitGuard {
             }
         }
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
+        if status == StatusCode::TOO_MANY_REQUESTS || quota_exhausted {
             circuit.consecutive_failures += 1;
             let until = Instant::now() + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN);
             circuit.phase = ProviderCircuitPhase::Open { until };
@@ -332,13 +332,24 @@ impl Drop for ProviderCircuitGuard {
     }
 }
 
-fn circuit_breaker_failure(status: StatusCode) -> bool {
+fn circuit_breaker_failure(status: StatusCode, message: &str) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::UNAUTHORIZED
         || status == StatusCode::FORBIDDEN
         || status == StatusCode::PROXY_AUTHENTICATION_REQUIRED
         || status.is_server_error()
+        || quota_exhausted_error(message)
+}
+
+fn quota_exhausted_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("insufficient_quota")
+        || normalized.contains("quota exceeded")
+        || normalized.contains("quota_exceeded")
+        || normalized.contains("limit_reached")
+        || message.contains("额度耗尽")
+        || message.contains("额度用尽")
 }
 
 #[derive(Clone)]
@@ -359,7 +370,6 @@ struct AuthAccess {
 #[derive(Clone)]
 struct SessionAffinity {
     provider: String,
-    updated_at: Instant,
 }
 
 #[derive(Clone)]
@@ -455,12 +465,8 @@ impl AppState {
         if session_key.trim().is_empty() {
             return None;
         }
-        let mut affinities = self.session_affinity.lock();
-        let now = Instant::now();
-        affinities.retain(|_, affinity| {
-            now.saturating_duration_since(affinity.updated_at) <= SESSION_AFFINITY_TTL
-        });
-        affinities
+        self.session_affinity
+            .lock()
             .get(session_key)
             .map(|affinity| affinity.provider.clone())
     }
@@ -473,7 +479,6 @@ impl AppState {
             session_key.to_string(),
             SessionAffinity {
                 provider: provider.to_string(),
-                updated_at: Instant::now(),
             },
         );
     }
@@ -889,5 +894,24 @@ mod state_tests {
         state.remember_session_provider("", "muyuan");
 
         assert_eq!(state.preferred_provider_for_session(""), None);
+    }
+
+    #[test]
+    fn provider_circuit_quota_error_text_opens_immediately() {
+        let state = test_state();
+        state
+            .begin_provider_attempt("quota-text-limited")
+            .unwrap()
+            .mark_failure(
+                StatusCode::BAD_REQUEST,
+                "insufficient_quota: account quota exceeded",
+                None,
+            );
+
+        let err = state
+            .begin_provider_attempt("quota-text-limited")
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("熔断冷却中"));
     }
 }

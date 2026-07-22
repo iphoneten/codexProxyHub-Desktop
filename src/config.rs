@@ -79,6 +79,10 @@ pub struct AuthConfig {
     pub max_concurrency_per_key: Option<usize>,
     #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
+    #[serde(default = "default_auth_account_models")]
+    pub openai_models: Vec<String>,
+    #[serde(default = "default_grok_models")]
+    pub grok_models: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -88,6 +92,8 @@ impl Default for AuthConfig {
             admin_key: None,
             max_concurrency_per_key: None,
             api_keys: Vec::new(),
+            openai_models: default_auth_account_models(),
+            grok_models: default_grok_models(),
         }
     }
 }
@@ -225,6 +231,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAccountConfig {
     pub id: String,
+    #[serde(default = "default_auth_account_type")]
+    pub account_type: String,
     #[serde(default = "default_auth_account_name")]
     pub name: String,
     #[serde(default = "default_true")]
@@ -241,6 +249,8 @@ pub struct AuthAccountConfig {
     pub client_id: String,
     #[serde(default = "default_openai_oauth_token_url")]
     pub token_url: String,
+    #[serde(default)]
+    pub base_url: String,
     #[serde(default)]
     pub expires_at: Option<i64>,
     #[serde(default = "default_auth_account_models")]
@@ -396,6 +406,12 @@ fn default_provider_type() -> String {
 }
 fn default_auth_account_name() -> String {
     "OpenAI Auth".to_string()
+}
+fn default_auth_account_type() -> String {
+    "openai".to_string()
+}
+fn default_grok_models() -> Vec<String> {
+    vec!["grok-4.5".to_string()]
 }
 fn default_openai_oauth_client_id() -> String {
     "app_EMoamEEZ73f0CkXaXp7hrann".to_string()

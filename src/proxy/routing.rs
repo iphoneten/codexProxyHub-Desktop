@@ -33,7 +33,7 @@ pub(super) fn provider_attempts(
             cfg.auth_accounts
                 .iter()
                 .filter(|account| account.enabled)
-                .map(auth_account_as_provider)
+                .map(|account| auth_account_as_provider(account, &cfg.auth))
                 .filter(|p| {
                     api_key_allows_provider(allowed_providers, &p.name)
                         && provider_supports_model(p, &request_model)
@@ -211,7 +211,7 @@ pub(super) fn collect_models(config: &AppConfig, allowed_providers: &[String]) -
                 .auth_accounts
                 .iter()
                 .filter(|account| account.enabled)
-                .map(auth_account_as_provider)
+                .map(|account| auth_account_as_provider(account, &config.auth))
                 .filter(|p| api_key_allows_provider(allowed_providers, &p.name)),
         );
     for provider in providers {
@@ -670,6 +670,7 @@ mod preference_tests {
     fn sample_account(id: &str, priority: i32) -> AuthAccountConfig {
         AuthAccountConfig {
             id: id.to_string(),
+            account_type: "openai".to_string(),
             name: id.to_string(),
             enabled: true,
             email: None,
@@ -678,6 +679,7 @@ mod preference_tests {
             account_id: Some(format!("chatgpt-{id}")),
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
             token_url: "https://auth.openai.com/oauth/token".to_string(),
+            base_url: String::new(),
             expires_at: None,
             models: vec!["gpt-test".to_string()],
             model_mapping: HashMap::new(),
@@ -694,6 +696,7 @@ mod preference_tests {
             auth_preference: preference.to_string(),
             auth_proxy: String::new(),
         };
+        cfg.auth.openai_models = vec!["gpt-test".to_string()];
         cfg.providers = vec![sample_provider("channel-a", 1)];
         cfg.auth_accounts = vec![sample_account("acct-b", 5)];
         cfg
