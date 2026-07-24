@@ -208,20 +208,6 @@ pub struct ProviderConfig {
     pub system_prompt_override: Option<String>,
     #[serde(default)]
     pub strip_thought: bool,
-    #[serde(default)]
-    pub persistent_session: bool,
-    #[serde(default = "default_persist_interval")]
-    pub persist_interval: f64,
-    #[serde(default)]
-    pub persist_max_wait: u64,
-    #[serde(default)]
-    pub persist_keepalive: bool,
-    #[serde(default = "default_keepalive_interval")]
-    pub persist_keepalive_interval: u64,
-    #[serde(default)]
-    pub persist_keepalive_model: Option<String>,
-    #[serde(default = "default_keepalive_prompt")]
-    pub persist_keepalive_prompt: String,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
     #[serde(skip)]
@@ -454,15 +440,6 @@ fn default_weight() -> u32 {
 }
 fn default_priority() -> i32 {
     1
-}
-fn default_persist_interval() -> f64 {
-    3.0
-}
-fn default_keepalive_interval() -> u64 {
-    30
-}
-fn default_keepalive_prompt() -> String {
-    "Hi".to_string()
 }
 fn default_usage_backend() -> String {
     "sqlite".to_string()

@@ -8,7 +8,6 @@ pub(super) async fn forward_responses_as_chat(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
-    state.remember_keepalive_headers(provider, headers);
     let chat_body = responses_to_chat_body(&body)?;
     let custom_tool_names = responses_custom_tool_names(body.get("tools"));
     if stream {
@@ -290,7 +289,6 @@ pub(super) async fn send_to_provider(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
-    state.remember_keepalive_headers(provider, request_headers);
     let client = state.client_for_provider(provider);
     // Google AI Studio 原生渠道：OpenAI chat 请求翻译到 GenerateContent。
     // 如果 base_url 已经是 Google 的 /openai 兼容端点，则仍走普通 OpenAI 兼容路径。
@@ -728,7 +726,6 @@ pub(super) async fn send_responses_stream_as_chat(
     responses_body: Value,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
-    state.remember_keepalive_headers(provider, request_headers);
     let request_model = responses_body
         .get("model")
         .and_then(Value::as_str)
@@ -824,7 +821,6 @@ pub(super) async fn send_chat_via_responses(
     stream: bool,
     started: Instant,
 ) -> Result<ProviderResult, ProxyError> {
-    state.remember_keepalive_headers(provider, request_headers);
     let client = state.client_for_provider(provider);
     let request_model = body
         .get("model")
@@ -988,7 +984,7 @@ pub(super) fn google_ai_headers(
     request_headers: &HeaderMap,
     stream: bool,
 ) -> HeaderMap {
-    let mut headers = keepalive_safe_headers(request_headers);
+    let mut headers = upstream_safe_headers(request_headers);
     if let Ok(value) = HeaderValue::from_str(&provider.api_key) {
         headers.insert("x-goog-api-key", value);
     }
@@ -1096,7 +1092,7 @@ pub(super) fn upstream_headers(
         );
     }
 
-    // 客户端头透传（与 codeProxyHub 的 _keepalive_safe_headers 对齐）：
+    // 客户端安全头透传：
     //
     // 部分上游（rawchat / anyrouter 等 codex 兼容中转）会**校验 codex CLI 签名头**——
     // 完整的一整套 `x-stainless-*`、`x-codex-*`、`openai-client`、`x-request-id` 等
@@ -1170,7 +1166,7 @@ pub(super) fn upstream_headers(
     headers
 }
 
-pub(super) fn keepalive_safe_headers(request_headers: &HeaderMap) -> HeaderMap {
+pub(super) fn upstream_safe_headers(request_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in request_headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();

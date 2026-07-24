@@ -35,7 +35,6 @@ fn test_state() -> AppState {
         ))),
         clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
-        keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
         api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
         provider_circuits: Arc::new(Mutex::new(HashMap::new())),
         provider_loads: Arc::new(Mutex::new(HashMap::new())),
@@ -657,61 +656,14 @@ fn usage_injection_probe_only_disables_on_explicit_field_rejection() {
 }
 
 #[test]
-fn keepalive_applies_model_mapping_and_uses_responses_when_chat_is_unsupported() {
-    let mut p = provider(
-        "openai",
-        "auto",
-        json!({"supports_chat": false, "supports_responses": true}),
-    );
-    p.model_mapping
-        .insert("gpt-5.5".to_string(), "gpt-5.6-sol".to_string());
-
-    let (path, body) = build_keepalive_request(&p, "gpt-5.5", "Hi").unwrap();
-
-    assert_eq!(path, "/responses");
-    assert_eq!(
-        body.get("model").and_then(Value::as_str),
-        Some("gpt-5.6-sol")
-    );
-    assert_eq!(
-        body.pointer("/input/0/content/0/text")
-            .and_then(Value::as_str),
-        Some("Hi")
-    );
-}
-
-#[test]
-fn keepalive_auto_uses_chat_when_provider_supports_both_apis() {
-    let p = provider(
-        "openai",
-        "auto",
-        json!({"supports_chat": true, "supports_responses": true}),
-    );
-
-    let (path, _) = build_keepalive_request(&p, "gpt-test", "Hi").unwrap();
-
-    assert_eq!(path, "/chat/completions");
-}
-
-#[test]
-fn keepalive_headers_include_codex_session_markers() {
-    let headers = keepalive_request_headers();
-
-    assert!(headers.contains_key("x-request-id"));
-    assert!(headers.contains_key("session_id"));
-    assert!(headers.contains_key("conversation_id"));
-    assert!(headers.contains_key("openai-client"));
-}
-
-#[test]
-fn keepalive_safe_headers_preserve_codex_markers_without_auth() {
+fn upstream_safe_headers_preserve_codex_markers_without_auth() {
     let mut input = HeaderMap::new();
     insert_header(&mut input, "authorization", "Bearer local");
     insert_header(&mut input, "session_id", "session-1");
     insert_header(&mut input, "conversation_id", "conversation-1");
     insert_header(&mut input, "x-stainless-runtime", "rust");
 
-    let headers = keepalive_safe_headers(&input);
+    let headers = upstream_safe_headers(&input);
 
     assert!(!headers.contains_key("authorization"));
     assert_eq!(
@@ -722,25 +674,6 @@ fn keepalive_safe_headers_preserve_codex_markers_without_auth() {
     );
     assert!(headers.contains_key("conversation_id"));
     assert!(headers.contains_key("x-stainless-runtime"));
-    assert!(has_codex_session_headers(&headers));
-}
-
-#[test]
-fn keepalive_accepts_codex_client_markers_without_session_headers() {
-    let mut headers = HeaderMap::new();
-    insert_header(&mut headers, "originator", "codex_cli_rs");
-    insert_header(&mut headers, "x-stainless-runtime", "rust");
-
-    assert!(has_codex_session_headers(&headers));
-}
-
-#[test]
-fn keepalive_rejects_non_codex_client_markers_without_session_headers() {
-    let mut headers = HeaderMap::new();
-    insert_header(&mut headers, "user-agent", "opencode/1.0");
-    insert_header(&mut headers, "x-stainless-runtime", "rust");
-
-    assert!(!has_codex_session_headers(&headers));
 }
 
 #[test]
@@ -833,20 +766,6 @@ fn anthropic_defaults_to_x_api_key_authentication() {
         Some("sk-test")
     );
     assert!(!headers.contains_key(header::AUTHORIZATION));
-}
-
-#[test]
-fn codex_responses_keepalive_waits_for_real_client_headers() {
-    let mut p = provider(
-        "openai",
-        "auto",
-        json!({"supports_chat": false, "supports_responses": true}),
-    );
-    p.models.push("gpt-5-codex".to_string());
-    p.extra_headers
-        .insert("originator".to_string(), "codex_cli_rs".to_string());
-
-    assert!(provider_keepalive_requires_client_headers(&p));
 }
 
 #[test]

@@ -84,7 +84,6 @@ pub struct HubApp {
     overview_analytics: OverviewAnalyticsState,
     auth_accounts_state: auth_accounts::AuthAccountsState,
     config_handle: Option<ConfigHandle>,
-    keepalive_status: Option<proxy::KeepaliveStatusHandle>,
     circuit_status: Option<proxy::ProviderCircuitStatusHandle>,
     #[cfg(target_os = "macos")]
     tray: Option<MacosTray>,
@@ -155,7 +154,6 @@ impl HubApp {
             overview_analytics: OverviewAnalyticsState::default(),
             auth_accounts_state: auth_accounts::AuthAccountsState::default(),
             config_handle: None,
-            keepalive_status: None,
             circuit_status: None,
             #[cfg(target_os = "macos")]
             tray: None,
@@ -320,13 +318,11 @@ impl HubApp {
         }
         let handle: ConfigHandle = Arc::new(RwLock::new(Arc::new(config)));
         self.config_handle = Some(Arc::clone(&handle));
-        let keepalive_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        self.keepalive_status = Some(Arc::clone(&keepalive_status));
         let circuit_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
         self.circuit_status = Some(Arc::clone(&circuit_status));
         let server_state = Arc::clone(&self.server);
         runtime.spawn(async move {
-            let result = proxy::run_server(handle, rx, keepalive_status, circuit_status).await;
+            let result = proxy::run_server(handle, rx, circuit_status).await;
             let mut server = server_state.lock();
             server.running = false;
             server.shutdown = None;
@@ -353,7 +349,6 @@ impl HubApp {
             self.message = AppMessage::new("正在停止代理", MessageKind::Info);
             drop(server);
             self.config_handle = None;
-            self.keepalive_status = None;
             self.circuit_status = None;
         } else {
             self.message = AppMessage::new("代理未运行", MessageKind::Error);
@@ -504,7 +499,6 @@ impl eframe::App for HubApp {
                                 &mut self.message,
                                 &mut self.provider_mapping_drafts,
                                 &mut self.provider_header_drafts,
-                                self.keepalive_status.as_ref(),
                                 self.circuit_status.as_ref(),
                             );
                         }

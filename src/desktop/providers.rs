@@ -16,7 +16,6 @@ pub fn provider_section(
     message: &mut AppMessage,
     mapping_drafts: &mut Vec<TextDraft>,
     header_drafts: &mut Vec<TextDraft>,
-    keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) {
     resize_drafts(mapping_drafts, config.providers.len());
@@ -70,7 +69,6 @@ pub fn provider_section(
                             message,
                             &mut mapping_drafts[idx],
                             &mut header_drafts[idx],
-                            keepalive_status,
                             circuit_status,
                         );
                     });
@@ -184,7 +182,6 @@ fn provider_detail_panel(
     message: &mut AppMessage,
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
-    keepalive_status: Option<&proxy::KeepaliveStatusHandle>,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) -> bool {
     let mut delete_requested = false;
@@ -310,34 +307,6 @@ fn provider_detail_panel(
                     });
                     ui.end_row();
                 });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                form_label(ui, "运行状态");
-                if let Some(status_handle) = keepalive_status {
-                    let status = status_handle.read().get(&provider.name).cloned();
-                    match status {
-                        Some(status) => {
-                            if let Some(success) = status.last_success {
-                                ui.colored_label(good(), format!("最近成功 {}", success));
-                            } else {
-                                ui.label(egui::RichText::new("等待首次心跳").color(muteds()));
-                            }
-                            if let Some(error) = status.last_error {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(176, 54, 64),
-                                    format!("最近失败: {}", error),
-                                );
-                            }
-                        }
-                        None => {
-                            ui.label(egui::RichText::new("等待首次心跳").color(muteds()));
-                        }
-                    }
-                } else {
-                    ui.label(egui::RichText::new("代理未启动").color(muteds()));
-                }
-            });
-            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 form_label(ui, "熔断状态");
                 provider_circuit_detail(ui, circuit_status, &provider.name);
@@ -413,38 +382,6 @@ fn provider_detail_panel(
                     );
                     ui.label(egui::RichText::new("排查后建议关闭").color(muteds()));
                     ui.label("");
-                    ui.end_row();
-                });
-        });
-
-        ui.add_space(12.0);
-        form_group(ui, "连接保活", |ui| {
-            egui::Grid::new("provider_keepalive_form")
-                .num_columns(4)
-                .spacing(egui::vec2(14.0, 10.0))
-                .show(ui, |ui| {
-                    form_label(ui, "心跳");
-                    ui.horizontal(|ui| {
-                        switch(ui, &mut provider.persist_keepalive);
-                        ui.label("启用");
-                    });
-                    form_label(ui, "间隔(秒)");
-                    ui.add(
-                        egui::DragValue::new(&mut provider.persist_keepalive_interval)
-                            .range(5..=86400),
-                    );
-                    ui.end_row();
-
-                    form_label(ui, "模型");
-                    let model = provider
-                        .persist_keepalive_model
-                        .get_or_insert_with(String::new);
-                    ui.add(egui::TextEdit::singleline(model).desired_width(220.0));
-                    form_label(ui, "提示词");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut provider.persist_keepalive_prompt)
-                            .desired_width(220.0),
-                    );
                     ui.end_row();
                 });
         });
@@ -810,13 +747,6 @@ pub fn default_provider() -> ProviderConfig {
         description: None,
         system_prompt_override: None,
         strip_thought: false,
-        persistent_session: false,
-        persist_interval: 3.0,
-        persist_max_wait: 0,
-        persist_keepalive: false,
-        persist_keepalive_interval: 30,
-        persist_keepalive_model: None,
-        persist_keepalive_prompt: "Hi".to_string(),
         extra: Default::default(),
         auth_account_id: None,
     }

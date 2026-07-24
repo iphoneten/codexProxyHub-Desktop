@@ -257,18 +257,6 @@ debug_sse_max_events: 120
 | `strip_thought` | bool | `false` | UI 可编辑，核心有限使用 | 保留给思考内容处理/兼容旧配置。 |
 | `system_prompt_override` | string/null | `null` | 生效 | chat 请求发往该渠道前，可覆盖系统提示词。空字符串等同于不覆盖。 |
 
-### 持久会话字段
-
-| 字段 | 类型 | 默认值 | 当前状态 | 说明 |
-| --- | --- | --- | --- | --- |
-| `persistent_session` | bool | `false` | 兼容保留 | 旧版持久会话字段，当前核心代理逻辑未启用完整保活机制。 |
-| `persist_interval` | number | `3.0` | 兼容保留 | 持久会话间隔。 |
-| `persist_max_wait` | number | `0` | 兼容保留 | 持久会话最大等待时间。 |
-| `persist_keepalive` | bool | `false` | 已生效 | 是否对该渠道启用后台心跳。默认关闭，开启后会产生上游请求和少量 token 消耗。 |
-| `persist_keepalive_interval` | number | `30` | 已生效 | 心跳间隔秒数，最小 5 秒。 |
-| `persist_keepalive_model` | string/null | `null` | 已生效 | 心跳使用的模型。为空时使用该渠道模型列表的第一个模型。 |
-| `persist_keepalive_prompt` | string | `Hi` | 已生效 | 心跳请求使用的提示词。 |
-
 ## 路由和故障转移行为
 
 1. 根据请求模型生成候选模型列表：原模型优先，然后追加 `routing.model_fallbacks`。

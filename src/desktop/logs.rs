@@ -472,6 +472,7 @@ fn read_sqlite_log_page(
     if !path.exists() {
         return Ok((Vec::new(), 0));
     }
+    proxy::recover_stale_running_usage_logs(path.clone(), std::time::Duration::from_secs(30 * 60));
     let conn = proxy::open_usage_log_connection(path)
         .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)

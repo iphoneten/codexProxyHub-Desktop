@@ -497,6 +497,30 @@ pub(super) fn recover_interrupted_usage_logs(path: PathBuf) {
     );
 }
 
+pub(super) fn recover_stale_running_usage_logs(path: PathBuf, max_age: Duration) {
+    let Ok(conn) = open_usage_log_connection(path) else {
+        return;
+    };
+    if ensure_usage_log_schema(&conn).is_err() {
+        return;
+    }
+    let cutoff = chrono::Local::now()
+        .checked_sub_signed(
+            chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::minutes(30)),
+        )
+        .unwrap_or_else(chrono::Local::now)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let _ = conn.execute(
+        r#"
+        UPDATE usage_logs
+        SET status = 'error', error = '请求超过最大运行时长仍未完成，已自动结束运行中状态'
+        WHERE status = 'running' AND ts <= ?1
+        "#,
+        params![cutoff],
+    );
+}
+
 pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"

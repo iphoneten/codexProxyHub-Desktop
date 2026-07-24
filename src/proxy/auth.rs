@@ -110,7 +110,6 @@ mod tests {
             ))),
             clients: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Mutex::new(HashMap::new())),
-            keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             provider_circuits: Arc::new(Mutex::new(HashMap::new())),
             provider_loads: Arc::new(Mutex::new(HashMap::new())),

@@ -108,13 +108,6 @@ pub(super) fn auth_account_as_provider(
         }),
         system_prompt_override: None,
         strip_thought: false,
-        persistent_session: false,
-        persist_interval: 3.0,
-        persist_max_wait: 0,
-        persist_keepalive: false,
-        persist_keepalive_interval: 30,
-        persist_keepalive_model: None,
-        persist_keepalive_prompt: "Hi".to_string(),
         extra: Default::default(),
         auth_account_id: Some(account.id.clone()),
     }

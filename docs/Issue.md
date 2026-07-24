@@ -56,7 +56,7 @@ docs/doc.md:139 说 provider_type 只有 openai/anthropic,实际还有 google_ai
 doc.md 的 max_concurrency 默认写 5,代码是 None(运行时兜底 5)。
 
 ## 15. config 无语义校验
-config.rs:207-215 — session_ttl_hours(文档 1-720)、persist_keepalive_interval(文档最小 5s)、port 等都不校验。且 #[serde(flatten)] extra 会静默吞拼写错的字段名。建议加 validate() + 未知字段 warn。
+config.rs:207-215 — session_ttl_hours(文档 1-720)、port 等都不校验。且 #[serde(flatten)] extra 会静默吞拼写错的字段名。建议加 validate() + 未知字段 warn。
 
 ## 16. Web 登录面缺少速率限制/失败审计
 web/auth.rs:32-67 + web/admin.rs:116-146 — 用户 API Key 登录和 admin_key 登录都是无限次同步比较,没有 IP/会话维度限速、失败计数、冷却或失败日志。若 server.host 配成 0.0.0.0 或被反代暴露,API Key/admin_key 可被在线枚举。

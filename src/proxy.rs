@@ -33,7 +33,6 @@ use uuid::Uuid;
 
 mod auth;
 mod handlers;
-mod keepalive;
 mod oauth;
 mod routing;
 mod streaming;
@@ -42,7 +41,6 @@ mod usage_log;
 
 use auth::*;
 use handlers::*;
-use keepalive::*;
 use oauth::*;
 use routing::*;
 use streaming::*;
@@ -72,6 +70,10 @@ pub(crate) fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()>
     usage_log::ensure_usage_log_schema(conn)
 }
 
+pub(crate) fn recover_stale_running_usage_logs(path: PathBuf, max_age: Duration) {
+    usage_log::recover_stale_running_usage_logs(path, max_age)
+}
+
 pub(crate) fn api_key_id(api_key: &str) -> String {
     if api_key.trim().is_empty() {
         return String::new();
@@ -96,6 +98,16 @@ fn request_api_key_id(config: &AppConfig, headers: &HeaderMap) -> String {
     api_key_id(token)
 }
 
+#[cfg(test)]
+pub(super) fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    if let (Ok(name), Ok(value)) = (
+        header::HeaderName::from_bytes(name.as_bytes()),
+        HeaderValue::from_str(value),
+    ) {
+        headers.insert(name, value);
+    }
+}
+
 // 配置句柄：Arc<RwLock<Arc<AppConfig>>>
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
@@ -110,15 +122,6 @@ pub enum ProviderCircuitStatus {
     Open,
     HalfOpen,
 }
-
-#[derive(Clone, Debug, Default)]
-pub struct KeepaliveStatus {
-    pub last_attempt: Option<String>,
-    pub last_success: Option<String>,
-    pub last_error: Option<String>,
-}
-
-pub type KeepaliveStatusHandle = Arc<RwLock<HashMap<String, KeepaliveStatus>>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderCircuitSnapshot {
@@ -377,7 +380,6 @@ struct AppState {
     config: ConfigHandle,
     clients: Arc<Mutex<HashMap<(u64, String), Client>>>,
     counters: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
-    keepalive_headers: Arc<Mutex<HashMap<String, HeaderMap>>>,
     api_key_limiters: Arc<Mutex<HashMap<String, ApiKeyLimiter>>>,
     provider_circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
     provider_loads: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
@@ -446,19 +448,6 @@ impl AppState {
         self.usage_injection
             .lock()
             .insert(provider.name.clone(), false);
-    }
-
-    fn remember_keepalive_headers(&self, provider: &ProviderConfig, request_headers: &HeaderMap) {
-        let headers = keepalive_safe_headers(request_headers);
-        if !headers.is_empty() {
-            self.keepalive_headers
-                .lock()
-                .insert(provider.name.clone(), headers);
-        }
-    }
-
-    fn cached_keepalive_headers(&self, provider: &ProviderConfig) -> Option<HeaderMap> {
-        self.keepalive_headers.lock().get(&provider.name).cloned()
     }
 
     fn preferred_provider_for_session(&self, session_key: &str) -> Option<String> {
@@ -777,7 +766,6 @@ async fn send_stream_request(
 pub async fn run_server(
     config: ConfigHandle,
     shutdown: oneshot::Receiver<()>,
-    keepalive_status: KeepaliveStatusHandle,
     circuit_status: ProviderCircuitStatusHandle,
 ) -> Result<()> {
     // server 监听端口只用启动时那一份配置（改端口无法热切）
@@ -794,7 +782,6 @@ pub async fn run_server(
         config: Arc::clone(&config),
         clients: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Mutex::new(HashMap::new())),
-        keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
         api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
         provider_circuits: Arc::new(Mutex::new(HashMap::new())),
         provider_loads: Arc::new(Mutex::new(HashMap::new())),
@@ -804,13 +791,6 @@ pub async fn run_server(
         oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
     };
-    let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
-    let keepalive_task = tokio::spawn(keepalive_loop(
-        state.clone(),
-        keepalive_status,
-        keepalive_stop_rx,
-    ));
-
     let mut app = Router::new()
         .route("/", get(index))
         .route("/v1", get(index))
@@ -839,10 +819,8 @@ pub async fn run_server(
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown.await;
-            let _ = keepalive_stop_tx.send(());
         })
         .await;
-    let _ = keepalive_task.await;
     result?;
     Ok(())
 }
@@ -865,7 +843,6 @@ mod state_tests {
             ))),
             clients: Arc::new(Mutex::new(HashMap::new())),
             counters: Arc::new(Mutex::new(HashMap::new())),
-            keepalive_headers: Arc::new(Mutex::new(HashMap::new())),
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             provider_circuits: Arc::new(Mutex::new(HashMap::new())),
             provider_loads: Arc::new(Mutex::new(HashMap::new())),
