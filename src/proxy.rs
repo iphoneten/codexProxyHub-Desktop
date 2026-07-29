@@ -373,6 +373,7 @@ struct AuthAccess {
 #[derive(Clone)]
 struct SessionAffinity {
     provider: String,
+    request_model: String,
 }
 
 #[derive(Clone)]
@@ -450,26 +451,44 @@ impl AppState {
             .insert(provider.name.clone(), false);
     }
 
-    fn preferred_provider_for_session(&self, session_key: &str) -> Option<String> {
-        if session_key.trim().is_empty() {
+    fn preferred_provider_for_affinity(&self, affinity_key: &str) -> Option<(String, String)> {
+        if affinity_key.trim().is_empty() {
             return None;
         }
         self.session_affinity
             .lock()
-            .get(session_key)
-            .map(|affinity| affinity.provider.clone())
+            .get(affinity_key)
+            .map(|affinity| (affinity.provider.clone(), affinity.request_model.clone()))
     }
 
-    fn remember_session_provider(&self, session_key: &str, provider: &str) {
-        if session_key.trim().is_empty() || provider.trim().is_empty() {
+    fn remember_affinity_provider(&self, affinity_key: &str, provider: &str, request_model: &str) {
+        if affinity_key.trim().is_empty()
+            || provider.trim().is_empty()
+            || request_model.trim().is_empty()
+        {
             return;
         }
         self.session_affinity.lock().insert(
-            session_key.to_string(),
+            affinity_key.to_string(),
             SessionAffinity {
                 provider: provider.to_string(),
+                request_model: request_model.to_string(),
             },
         );
+    }
+
+    fn forget_affinity_provider(&self, affinity_key: &str, provider: &str, request_model: &str) {
+        if affinity_key.trim().is_empty() {
+            return;
+        }
+        let mut affinities = self.session_affinity.lock();
+        let should_remove = affinities.get(affinity_key).is_some_and(|affinity| {
+            affinity.provider == provider
+                && normalize_model(&affinity.request_model) == normalize_model(request_model)
+        });
+        if should_remove {
+            affinities.remove(affinity_key);
+        }
     }
 
     fn raw_sse_capture_for(&self, provider: &ProviderConfig) -> Option<RawSseCapture> {
@@ -857,20 +876,42 @@ mod state_tests {
     #[test]
     fn session_affinity_remembers_successful_provider() {
         let state = test_state();
-        state.remember_session_provider("responses:gpt-test:conversation-1", "muyuan");
+        state.remember_affinity_provider("api-key:key-1:gpt-test", "muyuan", "gpt-test");
 
         assert_eq!(
-            state.preferred_provider_for_session("responses:gpt-test:conversation-1"),
-            Some("muyuan".to_string())
+            state.preferred_provider_for_affinity("api-key:key-1:gpt-test"),
+            Some(("muyuan".to_string(), "gpt-test".to_string()))
         );
     }
 
     #[test]
     fn session_affinity_ignores_empty_session_key() {
         let state = test_state();
-        state.remember_session_provider("", "muyuan");
+        state.remember_affinity_provider("", "muyuan", "gpt-test");
 
-        assert_eq!(state.preferred_provider_for_session(""), None);
+        assert_eq!(state.preferred_provider_for_affinity(""), None);
+    }
+
+    #[test]
+    fn session_affinity_only_forgets_matching_provider_and_model() {
+        let state = test_state();
+        let key = "api-key:key-1:gpt-test";
+        state.remember_affinity_provider(key, "channel-b", "gpt-fallback");
+
+        state.forget_affinity_provider(key, "channel-a", "gpt-fallback");
+        assert_eq!(
+            state.preferred_provider_for_affinity(key),
+            Some(("channel-b".to_string(), "gpt-fallback".to_string()))
+        );
+
+        state.forget_affinity_provider(key, "channel-b", "gpt-primary");
+        assert_eq!(
+            state.preferred_provider_for_affinity(key),
+            Some(("channel-b".to_string(), "gpt-fallback".to_string()))
+        );
+
+        state.forget_affinity_provider(key, "channel-b", "gpt-fallback");
+        assert_eq!(state.preferred_provider_for_affinity(key), None);
     }
 
     #[test]

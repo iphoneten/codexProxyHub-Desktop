@@ -144,10 +144,11 @@ pub(super) async fn responses(
     let api_key_name = auth.key_name;
     let allowed_providers = auth.allowed_providers;
     let mut permit = Some(auth.permit);
-    let session_key = auth_session_key(&headers, &model, &api_key_id);
+    let affinity_key = api_key_affinity_key(&model, &api_key_id);
     let mut providers = provider_attempts(&cfg, &state, &model, "responses", &allowed_providers);
-    if let Some(preferred) = state.preferred_provider_for_session(&session_key) {
-        prefer_provider(&mut providers, &preferred);
+    if let Some((preferred, preferred_model)) = state.preferred_provider_for_affinity(&affinity_key)
+    {
+        prefer_provider(&mut providers, &preferred, &preferred_model);
     }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
@@ -210,12 +211,14 @@ pub(super) async fn responses(
             .await
             {
                 Ok(result) => {
-                    remember_session_provider(&state, &session_key, &provider);
                     return Ok(commit_result(
                         state.snapshot(),
+                        state,
                         "responses",
                         &provider.name,
                         &model,
+                        &affinity_key,
+                        &request_model,
                         result,
                         started,
                         stream,
@@ -257,12 +260,14 @@ pub(super) async fn responses(
         .await
         {
             Ok(result) => {
-                remember_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
+                    state,
                     "responses",
                     &provider.name,
                     &model,
+                    &affinity_key,
+                    &request_model,
                     result,
                     started,
                     stream,
@@ -285,12 +290,14 @@ pub(super) async fn responses(
                 .await
                 {
                     Ok(result) => {
-                        remember_session_provider(&state, &session_key, &provider);
                         return Ok(commit_result(
                             state.snapshot(),
+                            state,
                             "responses",
                             &provider.name,
                             &model,
+                            &affinity_key,
+                            &request_model,
                             result,
                             started,
                             stream,
@@ -403,53 +410,34 @@ pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool
         || is_google_openai_endpoint(&provider.base_url)
 }
 
-pub(super) fn auth_session_key(headers: &HeaderMap, model: &str, api_key_id: &str) -> String {
-    for name in ["conversation_id", "session_id"] {
-        if let Some(value) = headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return format!(
-                "auth:{}:{value}",
-                normalize_model(model).to_ascii_lowercase()
-            );
-        }
+pub(super) fn api_key_affinity_key(model: &str, api_key_id: &str) -> String {
+    if api_key_id.trim().is_empty() {
+        return String::new();
     }
-    if !api_key_id.trim().is_empty() {
-        return format!(
-            "auth:{}:key:{api_key_id}",
-            normalize_model(model).to_ascii_lowercase()
-        );
-    }
-    if let Some(value) = headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return format!(
-            "auth:{}:request:{value}",
-            normalize_model(model).to_ascii_lowercase()
-        );
-    }
-    String::new()
+    format!(
+        "api-key:{}:{}",
+        api_key_id.trim(),
+        normalize_model(model).to_ascii_lowercase()
+    )
 }
 
-fn remember_session_provider(state: &AppState, session_key: &str, provider: &ProviderConfig) {
-    state.remember_session_provider(session_key, &provider.name);
-}
-
-pub(super) fn prefer_provider(providers: &mut Vec<(ProviderConfig, String)>, preferred: &str) {
-    let Some(index) = providers
-        .iter()
-        .position(|(provider, _)| provider.name == preferred)
-    else {
+pub(super) fn prefer_provider(
+    providers: &mut Vec<(ProviderConfig, String)>,
+    preferred: &str,
+    preferred_model: &str,
+) {
+    let Some(index) = providers.iter().position(|(provider, model)| {
+        provider.name == preferred && normalize_model(model) == normalize_model(preferred_model)
+    }) else {
         return;
     };
+    let request_model = providers[index].1.clone();
     let item = providers.remove(index);
-    providers.insert(0, item);
+    let insert_at = providers
+        .iter()
+        .position(|(_, model)| normalize_model(model) == normalize_model(&request_model))
+        .unwrap_or(providers.len());
+    providers.insert(insert_at, item);
 }
 
 pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
@@ -480,26 +468,16 @@ mod tests {
     }
 
     #[test]
-    fn auth_session_key_uses_conversation_before_session() {
-        let mut headers = HeaderMap::new();
-        insert_header(&mut headers, "session_id", "session-1");
-        insert_header(&mut headers, "conversation_id", "conversation-1");
-
+    fn api_key_affinity_key_uses_api_key_and_normalized_model() {
         assert_eq!(
-            auth_session_key(&headers, "GPT-TEST", "key-1"),
-            "auth:gpt-test:conversation-1"
+            api_key_affinity_key("GPT-TEST", "key-1"),
+            "api-key:key-1:gpt-test"
         );
     }
 
     #[test]
-    fn auth_session_key_falls_back_to_api_key_identity() {
-        let mut headers = HeaderMap::new();
-        insert_header(&mut headers, "x-request-id", "request-changes-each-call");
-
-        assert_eq!(
-            auth_session_key(&headers, "GPT-TEST", "key-1"),
-            "auth:gpt-test:key:key-1"
-        );
+    fn api_key_affinity_key_ignores_empty_api_key_identity() {
+        assert_eq!(api_key_affinity_key("GPT-TEST", ""), "");
     }
 
     #[test]
@@ -510,7 +488,7 @@ mod tests {
             (provider_with_name("rawchat"), "gpt-test".to_string()),
         ];
 
-        prefer_provider(&mut providers, "muyuan");
+        prefer_provider(&mut providers, "muyuan", "gpt-test");
 
         assert_eq!(providers[0].0.name, "muyuan");
         assert_eq!(providers[1].0.name, "anyrouter");
@@ -526,7 +504,7 @@ mod tests {
             (channel, "gpt-test".to_string()),
         ];
 
-        prefer_provider(&mut providers, "channel-a");
+        prefer_provider(&mut providers, "channel-a", "gpt-test");
 
         assert_eq!(providers[0].0.name, "channel-a");
         assert_eq!(providers[1].0.name, "auth:acct");
@@ -546,11 +524,28 @@ mod tests {
             (channel, "gpt-test".to_string()),
         ];
 
-        prefer_provider(&mut providers, "auth:acct-b");
+        prefer_provider(&mut providers, "auth:acct-b", "gpt-test");
 
         assert_eq!(providers[0].0.name, "auth:acct-b");
         assert_eq!(providers[1].0.name, "auth:acct-a");
         assert_eq!(providers[2].0.name, "channel-a");
+    }
+
+    #[test]
+    fn prefer_provider_does_not_move_fallback_model_ahead_of_requested_model() {
+        let mut providers = vec![
+            (provider_with_name("primary-a"), "gpt-primary".to_string()),
+            (provider_with_name("primary-b"), "gpt-primary".to_string()),
+            (provider_with_name("fallback-a"), "gpt-fallback".to_string()),
+            (provider_with_name("sticky"), "gpt-fallback".to_string()),
+        ];
+
+        prefer_provider(&mut providers, "sticky", "gpt-fallback");
+
+        assert_eq!(providers[0].0.name, "primary-a");
+        assert_eq!(providers[1].0.name, "primary-b");
+        assert_eq!(providers[2].0.name, "sticky");
+        assert_eq!(providers[2].1, "gpt-fallback");
     }
 
     #[test]
@@ -603,10 +598,11 @@ pub(super) async fn forward_openai(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let model = body_model(&body)?;
-    let session_key = auth_session_key(&headers, &model, &api_key_id);
+    let affinity_key = api_key_affinity_key(&model, &api_key_id);
     let mut providers = provider_attempts(&cfg, &state, &model, api, &allowed_providers);
-    if let Some(preferred) = state.preferred_provider_for_session(&session_key) {
-        prefer_provider(&mut providers, &preferred);
+    if let Some((preferred, preferred_model)) = state.preferred_provider_for_affinity(&affinity_key)
+    {
+        prefer_provider(&mut providers, &preferred, &preferred_model);
     }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
@@ -665,12 +661,14 @@ pub(super) async fn forward_openai(
         .await
         {
             Ok(result) => {
-                remember_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
+                    state,
                     api,
                     &provider.name,
                     &model,
+                    &affinity_key,
+                    &request_model,
                     result,
                     started,
                     stream,
@@ -692,12 +690,14 @@ pub(super) async fn forward_openai(
                         .await
                     {
                         Ok(result) => {
-                            remember_session_provider(&state, &session_key, &provider);
                             return Ok(commit_result(
                                 state.snapshot(),
+                                state,
                                 api,
                                 &provider.name,
                                 &model,
+                                &affinity_key,
+                                &request_model,
                                 result,
                                 started,
                                 stream,
@@ -806,9 +806,12 @@ pub(super) async fn forward_openai(
 
 pub(super) fn commit_result(
     cfg: Arc<AppConfig>,
+    state: AppState,
     api: &str,
     provider: &str,
     model: &str,
+    affinity_key: &str,
+    affinity_model: &str,
     mut result: ProviderResult,
     started: Instant,
     stream: bool,
@@ -836,6 +839,8 @@ pub(super) fn commit_result(
         let api_key_name = api_key_name.to_string();
         let provider = provider.to_string();
         let model = model.to_string();
+        let affinity_key = affinity_key.to_string();
+        let affinity_model = affinity_model.to_string();
         let upstream_model = result.upstream_model.clone();
         tokio::spawn(async move {
             let mut circuit_guard = circuit_guard;
@@ -848,6 +853,7 @@ pub(super) fn commit_result(
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_failure(StatusCode::BAD_GATEWAY, &error, None);
                     }
+                    state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -876,6 +882,7 @@ pub(super) fn commit_result(
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_success();
                     }
+                    state.remember_affinity_provider(&affinity_key, &provider, &affinity_model);
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -904,6 +911,7 @@ pub(super) fn commit_result(
                             None,
                         );
                     }
+                    state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -930,6 +938,7 @@ pub(super) fn commit_result(
         if let Some(guard) = circuit_guard {
             guard.mark_success();
         }
+        state.remember_affinity_provider(affinity_key, provider, affinity_model);
         log_success(
             &cfg,
             api,
