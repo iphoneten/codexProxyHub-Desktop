@@ -210,7 +210,7 @@ pub(super) async fn responses(
             .await
             {
                 Ok(result) => {
-                    remember_auth_session_provider(&state, &session_key, &provider);
+                    remember_session_provider(&state, &session_key, &provider);
                     return Ok(commit_result(
                         state.snapshot(),
                         "responses",
@@ -257,7 +257,7 @@ pub(super) async fn responses(
         .await
         {
             Ok(result) => {
-                remember_auth_session_provider(&state, &session_key, &provider);
+                remember_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
                     "responses",
@@ -285,7 +285,7 @@ pub(super) async fn responses(
                 .await
                 {
                     Ok(result) => {
-                        remember_auth_session_provider(&state, &session_key, &provider);
+                        remember_session_provider(&state, &session_key, &provider);
                         return Ok(commit_result(
                             state.snapshot(),
                             "responses",
@@ -437,10 +437,8 @@ pub(super) fn auth_session_key(headers: &HeaderMap, model: &str, api_key_id: &st
     String::new()
 }
 
-fn remember_auth_session_provider(state: &AppState, session_key: &str, provider: &ProviderConfig) {
-    if provider.auth_account_id.is_some() {
-        state.remember_session_provider(session_key, &provider.name);
-    }
+fn remember_session_provider(state: &AppState, session_key: &str, provider: &ProviderConfig) {
+    state.remember_session_provider(session_key, &provider.name);
 }
 
 pub(super) fn prefer_provider(providers: &mut Vec<(ProviderConfig, String)>, preferred: &str) {
@@ -450,14 +448,8 @@ pub(super) fn prefer_provider(providers: &mut Vec<(ProviderConfig, String)>, pre
     else {
         return;
     };
-    // 会话亲和只在同来源组内提前，避免破坏「账号优先 / 渠道优先」的组顺序。
-    let is_auth = providers[index].0.auth_account_id.is_some();
     let item = providers.remove(index);
-    let insert_at = providers
-        .iter()
-        .position(|(provider, _)| provider.auth_account_id.is_some() == is_auth)
-        .unwrap_or(providers.len());
-    providers.insert(insert_at, item);
+    providers.insert(0, item);
 }
 
 pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
@@ -525,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn prefer_provider_keeps_auth_accounts_ahead_when_affinity_is_channel() {
+    fn prefer_provider_moves_sticky_channel_ahead_of_auth_accounts() {
         let mut auth = provider_with_name("auth:acct");
         auth.auth_account_id = Some("acct".to_string());
         let channel = provider_with_name("channel-a");
@@ -536,9 +528,9 @@ mod tests {
 
         prefer_provider(&mut providers, "channel-a");
 
-        assert_eq!(providers[0].0.name, "auth:acct");
-        assert_eq!(providers[1].0.name, "channel-a");
-        assert!(providers[0].0.auth_account_id.is_some());
+        assert_eq!(providers[0].0.name, "channel-a");
+        assert_eq!(providers[1].0.name, "auth:acct");
+        assert!(providers[1].0.auth_account_id.is_some());
     }
 
     #[test]
@@ -673,7 +665,7 @@ pub(super) async fn forward_openai(
         .await
         {
             Ok(result) => {
-                remember_auth_session_provider(&state, &session_key, &provider);
+                remember_session_provider(&state, &session_key, &provider);
                 return Ok(commit_result(
                     state.snapshot(),
                     api,
@@ -700,7 +692,7 @@ pub(super) async fn forward_openai(
                         .await
                     {
                         Ok(result) => {
-                            remember_auth_session_provider(&state, &session_key, &provider);
+                            remember_session_provider(&state, &session_key, &provider);
                             return Ok(commit_result(
                                 state.snapshot(),
                                 api,
