@@ -508,6 +508,7 @@ pub(super) async fn send_anthropic_messages_passthrough(
         match send_result {
             Ok(resp) if resp.status().is_success() => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                let response_headers = anthropic_passthrough_response_headers(resp.headers());
                 if stream {
                     if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
                         let text = resp.text().await.unwrap_or_default();
@@ -535,12 +536,13 @@ pub(super) async fn send_anthropic_messages_passthrough(
                     // 原样透传字节流，只旁路解析 usage / 完成事件 / 流内错误
                     let (usage_rx, body_stream) =
                         stream_with_usage_probe(upstream, SseProbeKind::Anthropic, started, None);
-                    let response = Response::builder()
+                    let mut response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header(header::CACHE_CONTROL, "no-cache")
                         .body(Body::from_stream(body_stream))
                         .map_err(|e| ProxyError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    response.headers_mut().extend(response_headers);
                     return Ok(ProviderResult {
                         response,
                         upstream_model: request_model,
@@ -561,7 +563,7 @@ pub(super) async fn send_anthropic_messages_passthrough(
                 let upstream_model = response_model(&value).unwrap_or(request_model);
                 let usage = extract_token_usage(&value);
                 return Ok(ProviderResult {
-                    response: (StatusCode::OK, Json(value)).into_response(),
+                    response: (status, response_headers, Json(value)).into_response(),
                     upstream_model,
                     usage,
                     usage_rx: None,
@@ -579,8 +581,8 @@ pub(super) async fn send_anthropic_messages_passthrough(
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
                 if err.retryable() {
+                    tokio::time::sleep(retry_delay(attempt)).await;
                     continue;
                 }
                 return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
@@ -1274,7 +1276,7 @@ pub(super) fn upstream_headers(
             || lower.starts_with("x-codex-")
             || lower.starts_with("x-openai-")
             || lower.starts_with("x-stainless-")
-            || lower.starts_with("anthropic-")
+            || (provider.provider_type == "anthropic" && lower.starts_with("anthropic-"))
             || lower.starts_with("chatgpt-");
 
         // 精确名白名单：不带前缀但需要透传的少数几个
@@ -1301,6 +1303,23 @@ pub(super) fn upstream_headers(
             continue;
         }
         headers.insert(name.clone(), value.clone());
+    }
+    headers
+}
+
+pub(super) fn anthropic_passthrough_response_headers(
+    upstream: &reqwest::header::HeaderMap,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in upstream {
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower == "request-id"
+            || lower == "x-request-id"
+            || lower == "retry-after"
+            || lower.starts_with("anthropic-ratelimit-")
+        {
+            headers.append(name.clone(), value.clone());
+        }
     }
     headers
 }

@@ -32,6 +32,7 @@ use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ANTHROPIC_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 mod auth;
 mod handlers;
@@ -49,6 +50,8 @@ use streaming::*;
 use upstream::*;
 use usage_log::*;
 
+#[cfg(test)]
+mod anthropic_passthrough_tests;
 #[cfg(test)]
 mod messages_e2e_tests;
 #[cfg(test)]
@@ -843,8 +846,14 @@ pub async fn run_server(
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses))
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route(
+            "/v1/messages",
+            post(messages).layer(DefaultBodyLimit::max(MAX_ANTHROPIC_REQUEST_BODY_BYTES)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(count_tokens).layer(DefaultBodyLimit::max(MAX_ANTHROPIC_REQUEST_BODY_BYTES)),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
