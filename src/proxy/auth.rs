@@ -14,12 +14,7 @@ pub(super) fn authorize_and_acquire(
             allowed_providers: Vec::new(),
         });
     }
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .unwrap_or_default();
+    let token = request_client_token(headers);
 
     if let Some(key) = config
         .auth

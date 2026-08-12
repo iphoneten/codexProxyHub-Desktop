@@ -591,6 +591,151 @@ fn chat_skips_openai_provider_that_declares_no_chat_support() {
 }
 
 #[test]
+fn inbound_messages_api_only_selects_anthropic_providers() {
+    let anthropic = provider("anthropic", "chat", json!({}));
+    let openai = provider(
+        "openai",
+        "auto",
+        json!({"supports_chat": true, "supports_responses": true}),
+    );
+    let google = provider("google_ai_studio", "chat", json!({"supports_chat": true}));
+
+    // 入站 Anthropic 协议只能直通 anthropic 渠道
+    assert!(provider_supports_api(&anthropic, "messages"));
+    // OpenAI / Google 渠道没有 /messages 端点，必须被排除，否则 failover 打到必然 404 的上游
+    assert!(!provider_supports_api(&openai, "messages"));
+    assert!(!provider_supports_api(&google, "messages"));
+}
+
+#[test]
+fn inbound_messages_ignores_supports_chat_capability() {
+    // anthropic 渠道即使显式声明 supports_chat:false，也仍然能承接入站 /messages：
+    // 该 capability 描述的是 OpenAI 协议面，与原生 Messages 直通无关
+    let anthropic = provider(
+        "anthropic",
+        "chat",
+        json!({"supports_chat": false, "supports_responses": false}),
+    );
+
+    assert!(provider_supports_api(&anthropic, "messages"));
+}
+
+#[test]
+fn anthropic_stream_completes_on_message_stop() {
+    // Anthropic 原生流没有 [DONE] 哨兵，以 message_stop 收尾。
+    // 不识别它会让直通流被误判为「完成事件前断开」而记成失败。
+    assert!(sse_stream_completed(
+        SseProbeKind::Anthropic,
+        &json!({"type": "message_stop"}).to_string()
+    ));
+    assert!(!sse_stream_completed(
+        SseProbeKind::Anthropic,
+        &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}})
+            .to_string()
+    ));
+    // Responses 的完成事件不应被 Anthropic 探针认领，反之亦然
+    assert!(!sse_stream_completed(
+        SseProbeKind::Anthropic,
+        &json!({"type": "response.completed"}).to_string()
+    ));
+    assert!(!sse_stream_completed(
+        SseProbeKind::Responses,
+        &json!({"type": "message_stop"}).to_string()
+    ));
+}
+
+#[test]
+fn client_token_accepts_anthropic_x_api_key_header() {
+    // Anthropic SDK / Claude Code 只发 x-api-key，不发 Authorization
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "x-api-key", "sk-anthropic-style");
+    assert_eq!(request_client_token(&headers), "sk-anthropic-style");
+
+    // Authorization 优先于 x-api-key
+    let mut both = HeaderMap::new();
+    insert_header(&mut both, "authorization", "Bearer sk-bearer");
+    insert_header(&mut both, "x-api-key", "sk-xapikey");
+    assert_eq!(request_client_token(&both), "sk-bearer");
+
+    assert_eq!(request_client_token(&HeaderMap::new()), "");
+}
+
+#[test]
+fn anthropic_version_headers_pass_through_to_upstream() {
+    let mut provider = provider("anthropic", "chat", json!({}));
+    provider.api_key = "sk-upstream".to_string();
+    let mut request_headers = HeaderMap::new();
+    insert_header(&mut request_headers, "anthropic-version", "2023-06-01");
+    insert_header(
+        &mut request_headers,
+        "anthropic-beta",
+        "prompt-caching-2024-07-31",
+    );
+    // 客户端鉴权头绝不能透传给上游
+    insert_header(&mut request_headers, "x-api-key", "sk-client");
+
+    let headers = upstream_headers(&provider, &request_headers, false);
+
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        "prompt-caching-2024-07-31"
+    );
+    assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+    // 上游拿到的是渠道自己的 key，不是客户端的
+    assert_eq!(headers.get("x-api-key").unwrap(), "sk-upstream");
+}
+
+#[test]
+fn anthropic_system_prompt_override_uses_top_level_field() {
+    let mut provider = provider("anthropic", "chat", json!({}));
+    provider.system_prompt_override = Some("be terse".to_string());
+    let mut body = json!({
+        "model": "claude-test",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    apply_anthropic_system_prompt_override(&provider, &mut body);
+
+    // Anthropic 的 system 在顶层，不是 messages 里的一条
+    assert_eq!(body["system"], "be terse");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
+async fn anthropic_error_response_uses_anthropic_error_shape() {
+    // Anthropic SDK 只认 {"type":"error","error":{"type","message"}}；
+    // 回 OpenAI 形状会让客户端解析不出错误信息
+    let response = anthropic_error_response(ProxyError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate limited",
+    ));
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "rate_limit_error");
+    assert_eq!(value["error"]["message"], "rate limited");
+}
+
+#[tokio::test]
+async fn anthropic_error_response_maps_status_to_error_type() {
+    for (status, expected) in [
+        (StatusCode::UNAUTHORIZED, "authentication_error"),
+        (StatusCode::FORBIDDEN, "permission_error"),
+        (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error"),
+        (StatusCode::BAD_GATEWAY, "api_error"),
+    ] {
+        let response = anthropic_error_response(ProxyError::new(status, "x"));
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"], expected, "status={status}");
+    }
+}
+
+#[test]
 fn responses_auto_requires_native_responses_or_chat_fallback() {
     let no_wire_api = provider(
         "openai",

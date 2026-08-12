@@ -10,7 +10,9 @@ pub(super) async fn index(State(_state): State<AppState>) -> impl IntoResponse {
             "/v1/chat/completions",
             "/v1/completions",
             "/v1/embeddings",
-            "/v1/responses"
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/messages/count_tokens"
         ]
     }))
 }
@@ -128,6 +130,140 @@ pub(super) async fn embeddings(
         auth.allowed_providers,
     )
     .await
+}
+
+/// 入站 Anthropic Messages API。请求体原样直通到 `provider_type: anthropic` 渠道，
+/// 复用统一的鉴权、模型/Token 限额、渠道选择、failover、熔断与用量日志。
+///
+/// 错误响应用 Anthropic 的 `{"type":"error","error":{...}}` 形状，
+/// 否则 Anthropic SDK 解析不出错误信息，只会抛一个无上下文的异常。
+pub(super) async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match messages_inner(state, headers, body).await {
+        Ok(response) => response,
+        Err(err) => anthropic_error_response(err),
+    }
+}
+
+async fn messages_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+) -> Result<Response, ProxyError> {
+    let cfg = state.snapshot();
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let api_key_id = request_api_key_id(&cfg, &headers);
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
+    enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
+    forward_openai(
+        state,
+        headers,
+        body,
+        "/messages",
+        "messages",
+        Some(auth.permit),
+        api_key_id,
+        auth.key_name,
+        auth.allowed_providers,
+    )
+    .await
+}
+
+/// 入站 `POST /v1/messages/count_tokens`。Claude Code 在发消息前会先调它估算上下文大小。
+/// 纯只读估算，不产生 token 消耗，因此不写用量日志、不计入每日限额，
+/// 但仍然要过鉴权和模型白名单。
+pub(super) async fn count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match count_tokens_inner(state, headers, body).await {
+        Ok(response) => response,
+        Err(err) => anthropic_error_response(err),
+    }
+}
+
+async fn count_tokens_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+) -> Result<Response, ProxyError> {
+    let cfg = state.snapshot();
+    let auth = authorize_and_acquire(&state, &cfg, &headers)?;
+    let model = body_model(&body)?;
+    ensure_api_key_allows_model(&auth, &model)?;
+
+    let providers = provider_attempts(&cfg, &state, &model, "messages", &auth.allowed_providers);
+    let mut last_error = None;
+    for (provider, request_model) in providers {
+        let provider = match state.provider_with_fresh_oauth(&provider).await {
+            Ok(provider) => provider,
+            Err(err) => {
+                last_error = Some(err);
+                continue;
+            }
+        };
+        let mut upstream_body = with_model(body.clone(), &request_model);
+        apply_model_mapping(&provider, &mut upstream_body);
+        let client = state.client_for_provider(&provider);
+        match send_json_to_provider(
+            &client,
+            &provider,
+            "/messages/count_tokens",
+            &headers,
+            upstream_body,
+        )
+        .await
+        {
+            Ok(value) => return Ok((StatusCode::OK, Json(value)).into_response()),
+            Err(err) => {
+                if should_stop_failover(err.status) {
+                    return Err(err);
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(ProxyError::new(
+            final_failover_status(err.status),
+            err.message,
+        ));
+    }
+    Err(ProxyError::new(
+        StatusCode::BAD_GATEWAY,
+        format!("模型 '{}' 没有可用的 Anthropic 渠道", model),
+    ))
+}
+
+/// Anthropic 客户端只认 `{"type":"error","error":{"type","message"}}`。
+/// 这里把内部 ProxyError 的 HTTP 状态映射到 Anthropic 的 error.type 取值。
+pub(super) fn anthropic_error_response(err: ProxyError) -> Response {
+    let error_type = match err.status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => "overloaded_error",
+        _ => "api_error",
+    };
+    (
+        err.status,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": err.message,
+            }
+        })),
+    )
+        .into_response()
 }
 
 pub(super) async fn responses(
@@ -627,6 +763,8 @@ pub(super) async fn forward_openai(
         let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
         if path == "/chat/completions" {
             apply_system_prompt_override(&provider, &mut upstream_body);
+        } else if path == "/messages" {
+            apply_anthropic_system_prompt_override(&provider, &mut upstream_body);
         }
         let upstream_attempt_model = upstream_body
             .get("model")

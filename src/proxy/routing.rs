@@ -180,6 +180,10 @@ pub(super) fn provider_supports_api(provider: &ProviderConfig, api: &str) -> boo
         !matches!(provider.capabilities.get("supports_responses"), Some(false));
 
     match api {
+        // 入站 Anthropic Messages API：原生直通，只有 anthropic 渠道能承接。
+        // 其它渠道（OpenAI / Google 等）没有 /messages 端点，直接排除，
+        // 否则 failover 会把请求打到必然 404 的上游上。
+        "messages" => provider.provider_type == "anthropic",
         // Anthropic providers are translated through /messages, so their native
         // supports_chat capability does not apply to the proxy-facing API.
         "chat" => provider.provider_type == "anthropic" || supports_chat,
@@ -295,6 +299,22 @@ pub(super) fn apply_system_prompt_override(provider: &ProviderConfig, body: &mut
             .cloned(),
     );
     obj.insert("messages".to_string(), Value::Array(next));
+}
+
+/// Anthropic Messages 协议的 system 提示在**顶层 `system` 字段**，不是 messages 里的一条。
+/// 复用 OpenAI 版会静默无效，所以单独实现一份。
+pub(super) fn apply_anthropic_system_prompt_override(provider: &ProviderConfig, body: &mut Value) {
+    let Some(prompt) = provider
+        .system_prompt_override
+        .as_ref()
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.insert("system".to_string(), Value::String(prompt.clone()));
 }
 
 pub(super) fn responses_to_chat_body(body: &Value) -> Result<Value, ProxyError> {
@@ -630,6 +650,7 @@ mod preference_tests {
             base_url: "https://example.test/v1".to_string(),
             website: None,
             api_key: "sk".to_string(),
+            use_proxy: false,
             models: vec!["gpt-test".to_string()],
             model_mapping: HashMap::new(),
             extra_headers: HashMap::new(),

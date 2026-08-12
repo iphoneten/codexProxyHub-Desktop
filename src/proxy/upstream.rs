@@ -315,6 +315,20 @@ pub(super) async fn send_to_provider(
         )
         .await;
     }
+    // 入站 Anthropic Messages API：请求体与响应都不翻译，原样直通。
+    // 走独立分支是因为下面的泛化流式路径会用 Chat/Responses 的 SSE 探针去解析
+    // Anthropic 事件（content_block_delta / message_stop），必然误判成无有效输出。
+    if path == "/messages" {
+        return send_anthropic_messages_passthrough(
+            &client,
+            provider,
+            request_headers,
+            body,
+            stream,
+            started,
+        )
+        .await;
+    }
     if stream {
         let upstream_model = body
             .get("model")
@@ -457,6 +471,127 @@ pub(super) async fn send_to_provider(
         usage,
         usage_rx: None,
     })
+}
+
+// 入站 Anthropic Messages API 原生直通：客户端已经说 Anthropic 协议，
+// 请求体和响应体都不做翻译，只做渠道选择、鉴权头替换、重试与 usage 统计。
+pub(super) async fn send_anthropic_messages_passthrough(
+    client: &Client,
+    provider: &ProviderConfig,
+    request_headers: &HeaderMap,
+    body: Value,
+    stream: bool,
+    started: Instant,
+) -> Result<ProviderResult, ProxyError> {
+    let request_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let url = upstream_url(provider, "/messages");
+    let req = client
+        .post(url)
+        .headers(upstream_headers(provider, request_headers, stream))
+        .json(&body);
+
+    for attempt in 0..=provider.max_retries {
+        let send_result = if stream {
+            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
+        } else {
+            req.try_clone()
+                .unwrap()
+                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
+                .send()
+                .await
+                .map_err(UpstreamSendError::Request)
+        };
+        match send_result {
+            Ok(resp) if resp.status().is_success() => {
+                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                if stream {
+                    if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
+                        let text = resp.text().await.unwrap_or_default();
+                        return Err(ProxyError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!("{} body={}", msg, clean_upstream_error(&text)),
+                        ));
+                    }
+                    let upstream = match prepare_openai_stream(
+                        resp,
+                        provider.request_timeout,
+                        provider.stream_idle_timeout,
+                        provider.stream_max_duration,
+                        SseProbeKind::Anthropic,
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(err) if attempt < provider.max_retries && err.retryable() => {
+                            tokio::time::sleep(retry_delay(attempt)).await;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    // 原样透传字节流，只旁路解析 usage / 完成事件 / 流内错误
+                    let (usage_rx, body_stream) =
+                        stream_with_usage_probe(upstream, SseProbeKind::Anthropic, started, None);
+                    let response = Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(Body::from_stream(body_stream))
+                        .map_err(|e| ProxyError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    return Ok(ProviderResult {
+                        response,
+                        upstream_model: request_model,
+                        usage: TokenUsage::default(),
+                        usage_rx: Some(usage_rx),
+                    });
+                }
+                let value = resp.json::<Value>().await.map_err(|e| {
+                    ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Anthropic JSON 解析失败: {e}"),
+                    )
+                })?;
+                // 拦截 200 + 假 JSON（缺 content 数组），交给上层 failover
+                if let Err(msg) = validate_upstream_anthropic_json(&value) {
+                    return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
+                }
+                let upstream_model = response_model(&value).unwrap_or(request_model);
+                let usage = extract_token_usage(&value);
+                return Ok(ProviderResult {
+                    response: (StatusCode::OK, Json(value)).into_response(),
+                    upstream_model,
+                    usage,
+                    usage_rx: None,
+                });
+            }
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let retry_after = parse_retry_after(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                if attempt < provider.max_retries && retryable_status(status) {
+                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    continue;
+                }
+                return Err(upstream_status_error(status, &text, retry_after));
+            }
+            Err(err) if attempt < provider.max_retries => {
+                tokio::time::sleep(retry_delay(attempt)).await;
+                if err.retryable() {
+                    continue;
+                }
+                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            }
+            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+        }
+    }
+    Err(ProxyError::new(
+        StatusCode::BAD_GATEWAY,
+        "Anthropic 上游请求失败",
+    ))
 }
 
 // Anthropic 渠道专用：OpenAI chat 请求翻译到 /messages，响应/流反向翻译回 OpenAI
@@ -1131,11 +1266,15 @@ pub(super) fn upstream_headers(
         }
 
         // 前缀白名单：codex-cli / openai SDK / stainless 系列客户端签名
+        // anthropic-*：入站 Messages API 客户端（Claude Code / Anthropic SDK）会发
+        // anthropic-version 与 anthropic-beta，上游按这两个头决定协议版本和特性开关，
+        // 吃掉会导致 beta 特性静默失效。
         let prefix_match = lower.starts_with("codex-")
             || lower.starts_with("openai-")
             || lower.starts_with("x-codex-")
             || lower.starts_with("x-openai-")
             || lower.starts_with("x-stainless-")
+            || lower.starts_with("anthropic-")
             || lower.starts_with("chatgpt-");
 
         // 精确名白名单：不带前缀但需要透传的少数几个

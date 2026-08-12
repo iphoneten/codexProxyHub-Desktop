@@ -108,7 +108,7 @@ Authorization: Bearer sk-proxy-xxx
 | --- | --- | --- | --- |
 | `model_fallbacks` | map<string,array<string>> | `{}` | 模型 fallback 列表。请求模型不可用或对应渠道失败时，会按列表尝试替代模型。 |
 | `auth_preference` | string | `provider_first` | 请求来源优先级。`provider_first` 先普通渠道后 Auth 账号；`auth_first` 先 Auth 账号后普通渠道。各自内部仍按 `priority`/`weight` 排序。 |
-| `auth_proxy` | string | `""` | Auth 账号专用代理。用于 OAuth 换 token、额度刷新、运行时 token 刷新，以及 Auth 账号上游请求。普通渠道不受影响。支持 `http://`/`https://`/`socks5h://`。留空不强制代理。 |
+| `auth_proxy` | string | `""` | 统一上游代理。用于 OAuth、Auth 账号请求，以及显式开启 `use_proxy` 的普通渠道。支持 `http://`/`https://`/`socks5h://`。留空不强制代理。 |
 
 示例：
 
@@ -147,6 +147,7 @@ routing:
 | `base_url` | string | 必填 | 上游 API Base URL，不要带具体接口路径之外的重复后缀。OpenAI 兼容一般形如 `https://example.com/v1`。 |
 | `website` | string/null | `null` | 渠道官网或管理地址，仅用于展示。 |
 | `api_key` | string | 必填 | 上游渠道 API Key。`openai` 类型使用 Bearer；`anthropic` 类型使用 `x-api-key`。 |
+| `use_proxy` | bool | `false` | 是否使用 `routing.auth_proxy` 访问该渠道。关闭时保持直连/系统代理行为。 |
 | `description` | string/null | `null` | 渠道备注，仅用于展示。 |
 
 ### 模型字段
@@ -261,7 +262,7 @@ debug_sse_max_events: 120
 
 1. 根据请求模型生成候选模型列表：原模型优先，然后追加 `routing.model_fallbacks`。
 2. 对每个候选模型过滤 provider：必须 `enabled: true`，且 `models` 或 `model_mapping` 能匹配模型。
-3. 按 `routing.auth_preference` 决定先尝试 Auth 账号还是普通渠道。账号优先时 Auth 账号会先被尝试，并使用 `routing.auth_proxy`。
+3. 按 `routing.auth_preference` 决定先尝试 Auth 账号还是普通渠道。Auth 账号使用 `routing.auth_proxy`；普通渠道仅在 `use_proxy: true` 时使用。
 4. 在同一来源内按 `priority` 从小到大尝试，同一 `priority` 内按 `weight` 做轮询排序。
 5. 单个 provider 失败后，先按 `max_retries` 在该 provider 内重试。
 6. 重试耗尽后继续尝试下一个 provider。
@@ -326,6 +327,50 @@ extra_headers:
 `{api_key}` 会在请求发送前替换为该渠道的 `api_key`。配置 Bearer 认证后不会再发送 `x-api-key`。
 
 代理侧仍暴露 OpenAI 兼容接口，上游实际走 Anthropic `/messages`，并在请求/响应之间做协议转换。
+
+## 入站 Anthropic Messages API
+
+除 OpenAI 兼容接口外，代理还直接暴露 Anthropic 协议端点，供 Claude Code、Anthropic 官方 SDK
+等原生客户端接入：
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /v1/messages` | Anthropic Messages API，支持流式与非流式 |
+| `POST /v1/messages/count_tokens` | Token 估算，只读、不计入每日限额 |
+
+鉴权同时接受两种客户端惯例，任选其一：
+
+```http
+x-api-key: <代理的 API Key>
+Authorization: Bearer <代理的 API Key>
+```
+
+Anthropic 官方 SDK 只发 `x-api-key`。这里填的是**代理自己的** `auth.api_keys` 里的 key，
+不是上游渠道的 key；代理会替换成所选渠道的凭据再转发，客户端 key 不会外泄给上游。
+
+行为要点：
+
+- **只直通 `provider_type: anthropic` 渠道。** 请求体与响应体都不做协议翻译，原样转发。
+  OpenAI / Google 等渠道没有 `/messages` 端点，即使声明了同一个模型也会被排除在候选之外。
+- 客户端的 `anthropic-version` 与 `anthropic-beta` 头会透传给上游；未提供 `anthropic-version`
+  时代理补 `2023-06-01`。
+- 复用统一的模型匹配、优先级、权重、模型 fallback、失败重试与故障转移、熔断和用量日志。
+  用量日志里 `api` 字段记为 `messages`。
+- 渠道的 `system_prompt_override` 生效，写入 Anthropic 的顶层 `system` 字段。
+- 错误按 Anthropic 形状返回，客户端 SDK 可以正常解析：
+
+```json
+{"type": "error", "error": {"type": "authentication_error", "message": "无效或缺失 API Key"}}
+```
+
+Claude Code 接入示例：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_AUTH_TOKEN=<代理的 API Key>
+```
+
+注意 `strip_thought` 只作用于 OpenAI 协议面，对入站 `/messages` 的原生直通不生效。
 
 ## 旧配置兼容说明
 

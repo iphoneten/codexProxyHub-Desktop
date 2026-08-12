@@ -2,7 +2,7 @@ use crate::config::{AppConfig, ProviderConfig};
 use anyhow::{anyhow, Result};
 use axum::{
     body::{to_bytes, Body},
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,6 +31,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 mod auth;
 mod handlers;
 mod oauth;
@@ -47,6 +49,8 @@ use streaming::*;
 use upstream::*;
 use usage_log::*;
 
+#[cfg(test)]
+mod messages_e2e_tests;
 #[cfg(test)]
 mod tests;
 
@@ -89,13 +93,30 @@ fn request_api_key_id(config: &AppConfig, headers: &HeaderMap) -> String {
     if !config.auth.enabled {
         return String::new();
     }
-    let token = headers
+    api_key_id(request_client_token(headers))
+}
+
+/// 提取客户端 API Key。兼容两种客户端惯例：
+/// - OpenAI / codex 系：`Authorization: Bearer <key>`
+/// - Anthropic SDK / Claude Code：`x-api-key: <key>`
+///
+/// Anthropic 官方 SDK 只发 `x-api-key`，不发 Authorization，
+/// 入站 `/v1/messages` 必须认这个头，否则开启鉴权后必然 401。
+pub(super) fn request_client_token(headers: &HeaderMap) -> &str {
+    if let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .unwrap_or_default();
-    api_key_id(token)
+        .filter(|token| !token.is_empty())
+    {
+        return token;
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -409,8 +430,8 @@ impl AppState {
 
     fn client_for_provider(&self, provider: &ProviderConfig) -> Client {
         let connect_timeout = provider.connect_timeout.max(1);
-        // Auth 账号请求使用 routing.auth_proxy；普通渠道保持直连/系统代理行为。
-        let proxy_url = if provider.auth_account_id.is_some() {
+        // Auth 账号始终使用统一代理；普通渠道按各自开关决定。
+        let proxy_url = if provider.auth_account_id.is_some() || provider.use_proxy {
             self.snapshot().routing.auth_proxy.trim().to_string()
         } else {
             String::new()
@@ -822,12 +843,15 @@ pub async fn run_server(
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
     if initial.web.enabled {
         app = app
@@ -882,6 +906,40 @@ mod state_tests {
             state.preferred_provider_for_affinity("api-key:key-1:gpt-test"),
             Some(("muyuan".to_string(), "gpt-test".to_string()))
         );
+    }
+
+    #[test]
+    fn provider_client_uses_shared_proxy_only_when_enabled_or_auth_account() {
+        let state = test_state();
+        let mut cfg = (*state.snapshot()).clone();
+        cfg.routing.auth_proxy = "http://127.0.0.1:7890".to_string();
+        *state.config.write() = Arc::new(cfg);
+
+        let mut provider: ProviderConfig = serde_json::from_value(json!({
+            "name": "test",
+            "provider_type": "openai",
+            "base_url": "https://example.test/v1",
+            "api_key": "sk-test"
+        }))
+        .unwrap();
+
+        state.client_for_provider(&provider);
+        assert!(state.clients.lock().contains_key(&(10, String::new())));
+
+        provider.use_proxy = true;
+        state.client_for_provider(&provider);
+        assert!(state
+            .clients
+            .lock()
+            .contains_key(&(10, "http://127.0.0.1:7890".to_string())));
+
+        provider.use_proxy = false;
+        provider.auth_account_id = Some("auth-1".to_string());
+        state.client_for_provider(&provider);
+        assert!(state
+            .clients
+            .lock()
+            .contains_key(&(10, "http://127.0.0.1:7890".to_string())));
     }
 
     #[test]

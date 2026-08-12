@@ -28,7 +28,8 @@ routing:
   model_fallbacks: {}
   # provider_first: 先渠道后 Auth 账号；auth_first: 先 Auth 账号后渠道
   auth_preference: provider_first
-  # Auth 账号专用代理（OAuth/额度/运行时刷新/Auth 上游）。留空表示不强制代理。
+  # 统一上游代理。Auth 账号始终使用；普通渠道需设置 use_proxy: true。
+  # 留空表示不强制代理。
   # 示例: http://127.0.0.1:7890 或 socks5h://127.0.0.1:7890
   auth_proxy: ""
 
@@ -37,6 +38,7 @@ usage_log:
   sqlite_path: logs/proxy_usage.sqlite3
 
 # provider 默认超时/重试字段：connect_timeout: 10, request_timeout: 60, max_retries: 3
+# 普通渠道默认直连；设置 use_proxy: true 后使用 routing.auth_proxy。
 # 流式保护默认关闭：stream_idle_timeout: 0, stream_max_duration: 0
 # 原始 SSE 抓取默认关闭。排查渠道流式收尾问题时可在单个 provider 上开启：
 # debug_capture_sse: true
@@ -53,6 +55,10 @@ usage_log:
 #     supports_chat: true
 #     supports_responses: false
 #   responses_mode: chat
+# anthropic 类型渠道同时承接两种入站协议：
+#   - OpenAI 兼容接口（/v1/chat/completions 等）：翻译成 /messages 再发给上游
+#   - 原生 Anthropic 接口（/v1/messages）：请求与响应原样直通，供 Claude Code / Anthropic SDK 接入
+# 入站 /v1/messages 只会选中 provider_type: anthropic 的渠道。
 # Anthropic Bearer 认证示例（默认使用 x-api-key）：
 # - name: anthropic-bearer
 #   enabled: true

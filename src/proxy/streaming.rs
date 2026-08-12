@@ -1539,21 +1539,19 @@ pub(super) fn sse_stream_completed(kind: SseProbeKind, data: &str) -> bool {
     if matches!(kind, SseProbeKind::Chat) {
         return chat_stream_completed(data);
     }
-    if !matches!(kind, SseProbeKind::Responses) {
-        return false;
-    }
-    matches!(
-        serde_json::from_str::<Value>(data)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .as_deref(),
-        Some("response.completed")
-    )
+    let event_type = serde_json::from_str::<Value>(data).ok().and_then(|value| {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    // Anthropic 原生流以 message_stop 收尾（没有 [DONE] 哨兵）。
+    // 不识别它，直通流会被判成「上游流在完成事件前断开」而误记为失败。
+    let expected = match kind {
+        SseProbeKind::Anthropic => "message_stop",
+        _ => "response.completed",
+    };
+    event_type.as_deref() == Some(expected)
 }
 
 pub(super) fn chat_stream_completed(data: &str) -> bool {

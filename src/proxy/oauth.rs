@@ -74,6 +74,7 @@ pub(super) fn auth_account_as_provider(
         },
         website: None,
         api_key: account.access_token.clone(),
+        use_proxy: true,
         models: auth_account_models(account, auth),
         model_mapping: account.model_mapping.clone(),
         extra_headers,

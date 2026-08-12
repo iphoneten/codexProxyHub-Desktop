@@ -18,6 +18,7 @@ pub fn provider_section(
     header_drafts: &mut Vec<TextDraft>,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
 ) {
+    let shared_proxy = config.routing.auth_proxy.clone();
     resize_drafts(mapping_drafts, config.providers.len());
     resize_drafts(header_drafts, config.providers.len());
 
@@ -70,6 +71,7 @@ pub fn provider_section(
                             &mut mapping_drafts[idx],
                             &mut header_drafts[idx],
                             circuit_status,
+                            &shared_proxy,
                         );
                     });
                 if delete_provider {
@@ -183,6 +185,7 @@ fn provider_detail_panel(
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
+    shared_proxy: &str,
 ) -> bool {
     let mut delete_requested = false;
     section(ui, "渠道详情", |ui| {
@@ -331,6 +334,15 @@ fn provider_detail_panel(
                     ui.add(egui::DragValue::new(&mut provider.request_timeout).range(1..=600));
                     ui.end_row();
 
+                    form_label(ui, "网络代理");
+                    ui.horizontal(|ui| {
+                        switch(ui, &mut provider.use_proxy);
+                        ui.label("使用设置代理");
+                    });
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+
                     form_label(ui, "Retries");
                     ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
                     form_label(ui, "Stream Idle");
@@ -407,7 +419,7 @@ fn provider_detail_panel(
                         .color(muteds()),
                 );
                 if soft_button(ui, "同步上游模型").clicked() {
-                    match sync_upstream_models(provider) {
+                    match sync_upstream_models(provider, shared_proxy) {
                         Ok(models) => {
                             let count = models.len();
                             provider.models = models;
@@ -611,17 +623,25 @@ fn serialize_extra_headers(provider: &ProviderConfig) -> String {
         .join("\n")
 }
 
-fn sync_upstream_models(provider: &ProviderConfig) -> Result<Vec<String>, String> {
+fn sync_upstream_models(
+    provider: &ProviderConfig,
+    shared_proxy: &str,
+) -> Result<Vec<String>, String> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(
             provider.connect_timeout.max(1),
         ))
         .timeout(std::time::Duration::from_secs(
             provider.request_timeout.max(1),
-        ))
-        .build()
-        .map_err(|err| err.to_string())?;
+        ));
+    let proxy_url = shared_proxy.trim();
+    if provider.use_proxy && !proxy_url.is_empty() {
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|err| format!("代理地址无效: {err}"))?;
+        // 先禁用系统代理，再加入渠道显式代理，避免 no_proxy 清掉刚配置的代理。
+        builder = builder.no_proxy().proxy(proxy);
+    }
+    let client = builder.build().map_err(|err| err.to_string())?;
 
     let mut request = client.get(&url);
     if provider.provider_type == "anthropic" {
@@ -726,6 +746,7 @@ pub fn default_provider() -> ProviderConfig {
         base_url: "https://api.openai.com/v1".to_string(),
         website: None,
         api_key: String::new(),
+        use_proxy: false,
         models: vec!["gpt-5.5".to_string()],
         model_mapping: Default::default(),
         extra_headers: Default::default(),

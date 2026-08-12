@@ -541,6 +541,13 @@ impl eframe::App for HubApp {
                                     ui.set_max_width(640.0);
                                     settings::server_section(ui, config);
                                     ui.add_space(14.0);
+                                    auth_accounts::proxy_settings_section(
+                                        ui,
+                                        config,
+                                        &mut self.auth_accounts_state,
+                                        &mut self.message,
+                                    );
+                                    ui.add_space(14.0);
                                     settings::auth_models_section(ui, config);
                                     ui.add_space(14.0);
                                     settings::routing_section(

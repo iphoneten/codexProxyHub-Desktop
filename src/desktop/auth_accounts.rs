@@ -1,6 +1,6 @@
 use super::common::{
     accent, badge, border, confirm_delete_button, good, heading_color, muteds, primary_button,
-    soft_button, surface, switch, text_color,
+    section, soft_button, surface, switch, text_color,
 };
 use super::{AppMessage, MessageKind};
 use crate::auth_quota::{self, AuthQuotaSnapshot};
@@ -77,6 +77,63 @@ impl AuthAccountsState {
             || self.proxy_check_running
             || self.proxy_check_pending.lock().is_some()
     }
+}
+
+pub fn proxy_settings_section(
+    ui: &mut egui::Ui,
+    config: &mut AppConfig,
+    state: &mut AuthAccountsState,
+    message: &mut AppMessage,
+) {
+    apply_proxy_check_pending(state, message);
+    section(ui, "网络代理", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("代理地址");
+            ui.add(
+                egui::TextEdit::singleline(&mut config.routing.auth_proxy)
+                    .desired_width(320.0)
+                    .hint_text("例如 http://127.0.0.1:7890"),
+            );
+            let check_label = if state.proxy_check_running {
+                "检查中..."
+            } else {
+                "检查代理"
+            };
+            if soft_button(ui, check_label).clicked() && !state.proxy_check_running {
+                start_proxy_check(config, state, message);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                muteds(),
+                "Auth 账号始终使用；普通渠道可在渠道详情中单独开启。",
+            );
+            if let Some(ip) = state.proxy_exit_ip.as_ref() {
+                let via = state
+                    .proxy_checked_via
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("直连");
+                ui.label(
+                    egui::RichText::new(format!("出口 IP: {ip}（{via}）"))
+                        .size(12.0)
+                        .color(good()),
+                );
+            } else if let Some(err) = state.proxy_check_error.as_ref() {
+                ui.label(
+                    egui::RichText::new(format!("检查失败: {err}"))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(220, 38, 38)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("未检查出口 IP")
+                        .size(12.0)
+                        .color(muteds()),
+                );
+            }
+        });
+    });
 }
 
 struct QuotaJobResult {
@@ -161,46 +218,6 @@ pub fn auth_accounts_section(
                 ui.horizontal(|ui| {
                     account_type_tab(ui, &mut state.active_account_type, "openai", "OpenAI");
                     account_type_tab(ui, &mut state.active_account_type, "grok", "Grok");
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Auth 代理").size(12.0).color(muteds()));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut config.routing.auth_proxy)
-                            .desired_width(280.0)
-                            .hint_text("例如 http://127.0.0.1:7890"),
-                    );
-                    let check_label = if state.proxy_check_running {
-                        "检查中..."
-                    } else {
-                        "检查代理"
-                    };
-                    if soft_button(ui, check_label).clicked() && !state.proxy_check_running {
-                        start_proxy_check(config, state, message);
-                    }
-                    if let Some(ip) = state.proxy_exit_ip.as_ref() {
-                        let via = state
-                            .proxy_checked_via
-                            .as_deref()
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or("直连");
-                        ui.label(
-                            egui::RichText::new(format!("出口 IP: {ip}（{via}）"))
-                                .size(12.0)
-                                .color(good()),
-                        );
-                    } else if let Some(err) = state.proxy_check_error.as_ref() {
-                        ui.label(
-                            egui::RichText::new(format!("检查失败: {err}"))
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(220, 38, 38)),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("未检查出口 IP")
-                                .size(12.0)
-                                .color(muteds()),
-                        );
-                    }
                 });
             });
         });

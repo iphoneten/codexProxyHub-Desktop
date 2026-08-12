@@ -22,7 +22,9 @@ Rust 桌面版 OpenAI 兼容中转管理工具，基于旧版 `codeProxyHub` 的
 - `POST /v1/completions`
 - `POST /v1/embeddings`
 - `POST /v1/responses`
-- Bearer API Key 鉴权。
+- `POST /v1/messages`（入站 Anthropic Messages API，原生直通到 `provider_type: anthropic` 渠道）
+- `POST /v1/messages/count_tokens`
+- Bearer API Key 鉴权（入站 Anthropic 协议同时接受 `x-api-key`）。
 - 按模型匹配、优先级、权重和模型 fallback 选择 provider。
 - 上游 429、5xx、网络错误时重试和故障转移。
 - Chat Completions 与 Responses 流式响应中途断开时，在同一客户端 SSE 连接内续接下一个可用渠道。

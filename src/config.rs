@@ -20,6 +20,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub usage_log: UsageLogConfig,
     #[serde(default)]
+    pub response_cache: ResponseCacheConfig,
+    #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub auth_accounts: Vec<AuthAccountConfig>,
@@ -123,7 +125,7 @@ pub struct RoutingConfig {
     pub model_fallbacks: HashMap<String, Vec<String>>,
     #[serde(default = "default_routing_auth_preference")]
     pub auth_preference: String,
-    /// Auth 账号专用代理。用于 OAuth 换 token、额度刷新、运行时刷新与 Auth 上游请求。
+    /// 统一上游代理。Auth 账号始终使用；普通渠道由 use_proxy 决定是否使用。
     #[serde(default)]
     pub auth_proxy: String,
 }
@@ -155,6 +157,60 @@ impl Default for UsageLogConfig {
     }
 }
 
+/// 代理侧响应缓存。命中时直接返回上一次的上游响应，不打上游。
+///
+/// 只缓存成功响应（HTTP 2xx 且结构校验通过）。缓存在进程内存里，重启即失效——
+/// 响应体可能包含用户对话内容，落盘会把它变成一份需要额外管理的明文副本。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 条目存活秒数。0 表示不过期（仍受 max_entries 限制）。
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// 最多保留多少条。超出后按插入顺序淘汰最旧的。
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    /// 单条响应体字节上限，超过则不缓存，避免长响应吃满内存。
+    #[serde(default = "default_cache_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// 是否缓存流式响应。流式需要先把整段 SSE 收完才能落缓存，
+    /// 命中时按原字节重放。
+    #[serde(default = "default_true")]
+    pub cache_streaming: bool,
+    /// 参与缓存的代理侧接口。默认全部：chat / completion / embedding / responses / messages。
+    #[serde(default = "default_cache_apis")]
+    pub apis: Vec<String>,
+    /// 是否按 API Key 隔离缓存。默认 true：不同 Key 之间不共享缓存条目。
+    /// 设为 false 可提高命中率，但一个 Key 的响应会被另一个 Key 读到。
+    #[serde(default = "default_true")]
+    pub isolate_by_api_key: bool,
+}
+
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_seconds: default_cache_ttl_seconds(),
+            max_entries: default_cache_max_entries(),
+            max_body_bytes: default_cache_max_body_bytes(),
+            cache_streaming: true,
+            apis: default_cache_apis(),
+            isolate_by_api_key: true,
+        }
+    }
+}
+
+impl ResponseCacheConfig {
+    // 响应缓存模块尚未接入代理处理链；接入后移除此临时豁免。
+    #[allow(dead_code)]
+    pub fn covers_api(&self, api: &str) -> bool {
+        self.apis
+            .iter()
+            .any(|item| item.trim() == "*" || item.trim() == api)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -166,6 +222,9 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub website: Option<String>,
     pub api_key: String,
+    /// 是否使用 routing.auth_proxy 访问该渠道。
+    #[serde(default)]
+    pub use_proxy: bool,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -444,6 +503,24 @@ fn default_priority() -> i32 {
 fn default_usage_backend() -> String {
     "sqlite".to_string()
 }
+fn default_cache_ttl_seconds() -> u64 {
+    300
+}
+fn default_cache_max_entries() -> usize {
+    512
+}
+fn default_cache_max_body_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn default_cache_apis() -> Vec<String> {
+    vec![
+        "chat".to_string(),
+        "completion".to_string(),
+        "embedding".to_string(),
+        "responses".to_string(),
+        "messages".to_string(),
+    ]
+}
 fn default_sqlite_path() -> String {
     "logs/proxy_usage.sqlite3".to_string()
 }
@@ -581,6 +658,35 @@ providers: []
         let reloaded: AppConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(reloaded.routing.auth_proxy, "http://127.0.0.1:7890");
         assert_eq!(reloaded.routing.auth_preference, "auth_first");
+    }
+
+    #[test]
+    fn provider_proxy_switch_defaults_off_and_roundtrips() {
+        let default_cfg: AppConfig = serde_yaml::from_str(
+            r#"
+providers:
+  - name: direct
+    base_url: https://example.test/v1
+    api_key: sk-test
+"#,
+        )
+        .unwrap();
+        assert!(!default_cfg.providers[0].use_proxy);
+
+        let enabled_cfg: AppConfig = serde_yaml::from_str(
+            r#"
+providers:
+  - name: proxied
+    base_url: https://example.test/v1
+    api_key: sk-test
+    use_proxy: true
+"#,
+        )
+        .unwrap();
+        assert!(enabled_cfg.providers[0].use_proxy);
+
+        let yaml = serde_yaml::to_string(&enabled_cfg).unwrap();
+        assert!(yaml.contains("use_proxy: true"));
     }
 
     #[test]
