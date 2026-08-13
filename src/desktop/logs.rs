@@ -1,7 +1,7 @@
 use super::assets::AnimatedGif;
 use super::common::{
-    accent, border, format_compact_tokens, good, loading_icon, metric_tile, muteds, section,
-    soft_button, switch, table_header,
+    accent, border, confirm_delete_button, format_compact_tokens, good, loading_icon, metric_tile,
+    muteds, section, soft_button, switch, table_header,
 };
 use super::{AppMessage, MessageKind};
 use crate::config::AppConfig;
@@ -52,13 +52,55 @@ impl LogRange {
     }
 }
 
+/// 日志状态筛选。用的是表格「状态」列展示的口径（见 `status_text`），
+/// 不是数据库里的原始值：成功对应 `ok` / `stream_started`，运行中对应 `running`，
+/// 失败是其余一切（`error` 以及任何非预期值），确保没有行会从所有筛选里漏掉。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LogStatusFilter {
+    #[default]
+    All,
+    Success,
+    Failed,
+    Running,
+}
+
+impl LogStatusFilter {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::All, "全部状态"),
+        (Self::Success, "成功"),
+        (Self::Failed, "失败"),
+        (Self::Running, "运行中"),
+    ];
+
+    fn label(self) -> &'static str {
+        Self::OPTIONS
+            .iter()
+            .find(|(status, _)| *status == self)
+            .map(|(_, label)| *label)
+            .unwrap_or("全部状态")
+    }
+
+    /// 传给 SQL 的筛选标记，`None` 表示不限状态。取值必须与
+    /// `STATUS_FILTER_CLAUSE` 里的分支一致。
+    fn sql_kind(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Success => Some("success"),
+            Self::Failed => Some("failed"),
+            Self::Running => Some("running"),
+        }
+    }
+}
+
 pub struct LogViewState {
     pub(crate) rows: Vec<LogRow>,
     pub(crate) loaded_path: String,
     loaded_range: LogRange,
     loaded_api_key_id: String,
+    loaded_status: LogStatusFilter,
     range: LogRange,
     api_key_id: String,
+    status: LogStatusFilter,
     pub(crate) page: usize,
     pub(crate) total: usize,
     pub(crate) last_refresh: Option<Instant>,
@@ -73,13 +115,33 @@ impl Default for LogViewState {
             loaded_path: String::new(),
             loaded_range: LogRange::default(),
             loaded_api_key_id: String::new(),
+            loaded_status: LogStatusFilter::default(),
             range: LogRange::default(),
             api_key_id: String::new(),
+            status: LogStatusFilter::default(),
             page: 0,
             total: 0,
             last_refresh: None,
             totals: LogTotals::default(),
             live: true,
+        }
+    }
+}
+
+/// 日志页当前生效的筛选条件。读取和清空共用同一份，避免两边条件走偏。
+#[derive(Clone, Copy)]
+struct LogFilter<'a> {
+    range: LogRange,
+    status: LogStatusFilter,
+    api_key_id: &'a str,
+}
+
+impl LogViewState {
+    fn filter(&self) -> LogFilter<'_> {
+        LogFilter {
+            range: self.range,
+            status: self.status,
+            api_key_id: &self.api_key_id,
         }
     }
 }
@@ -101,7 +163,8 @@ pub fn logs_section(
     let path = config.usage_log_sqlite_path();
     let source_key = format!("sqlite:{}", path.display());
     let filter_changed = log_view.loaded_range != log_view.range
-        || log_view.loaded_api_key_id != log_view.api_key_id;
+        || log_view.loaded_api_key_id != log_view.api_key_id
+        || log_view.loaded_status != log_view.status;
     if log_view.loaded_path != source_key || filter_changed {
         log_view.page = 0;
         refresh_logs(config, log_view, Some(message));
@@ -131,6 +194,15 @@ pub fn logs_section(
                     .selectable_value(&mut log_view.range, range, label)
                     .changed();
             }
+            egui::ComboBox::from_id_source("log_status_filter")
+                .selected_text(log_view.status.label())
+                .show_ui(ui, |ui| {
+                    for (status, label) in LogStatusFilter::OPTIONS {
+                        changed |= ui
+                            .selectable_value(&mut log_view.status, status, label)
+                            .changed();
+                    }
+                });
             egui::ComboBox::from_id_source("log_api_key_filter")
                 .selected_text(selected_api_key_label(config, log_view))
                 .show_ui(ui, |ui| {
@@ -150,10 +222,25 @@ pub fn logs_section(
             if soft_button(ui, "清空选项").clicked() {
                 log_view.range = LogRange::All;
                 log_view.api_key_id.clear();
+                log_view.status = LogStatusFilter::All;
                 log_view.page = 0;
                 refresh_logs(config, log_view, None);
                 *message = AppMessage::new("已清空筛选选项", MessageKind::Success);
             }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if confirm_delete_button(ui, "usage_logs_clear", "清空日志") {
+                clear_logs(config, log_view, message);
+            }
+            ui.label(
+                egui::RichText::new(format!("清空范围: {}", clear_scope_label(config, log_view)))
+                    .color(muteds()),
+            )
+            .on_hover_text(
+                "按当前筛选条件删除请求日志，运行中的请求会保留。\n\
+                 清空包含今日的日志会同时重置各 API Key 的当日 Token 用量统计。",
+            );
         });
         let totals = log_view.totals;
         ui.horizontal_wrapped(|ui| {
@@ -334,6 +421,68 @@ fn normalized_api_key_name_filter<'a>(
         .filter(|name| !name.is_empty() && *name != "未命名 Key")
 }
 
+/// 「清空日志」按钮旁展示的生效范围，和实际 DELETE 使用的筛选条件一一对应。
+fn clear_scope_label(config: &AppConfig, log_view: &LogViewState) -> String {
+    let range_label = LogRange::OPTIONS
+        .iter()
+        .find(|(range, _)| *range == log_view.range)
+        .map(|(_, label)| *label)
+        .unwrap_or("全部");
+    let mut label = range_label.to_string();
+    if log_view.status != LogStatusFilter::All {
+        label.push_str(" · ");
+        label.push_str(log_view.status.label());
+    }
+    if !log_view.api_key_id.trim().is_empty() {
+        label.push_str(" · ");
+        label.push_str(&selected_api_key_label(config, log_view));
+    }
+    label
+}
+
+/// 按日志页当前的筛选条件删除记录，删完后立刻重新加载当前页。
+fn clear_logs(config: &AppConfig, log_view: &mut LogViewState, message: &mut AppMessage) {
+    let path = config.usage_log_sqlite_path();
+    if !path.exists() {
+        *message = AppMessage::new("暂无日志文件，无需清空", MessageKind::Info);
+        return;
+    }
+    let scope = clear_scope_label(config, log_view);
+    let filter = log_view.filter();
+    let api_key_name = api_key_name_for_id(config, filter.api_key_id);
+    let api_key_filter = normalized_api_key_filter(filter.api_key_id);
+    let api_key_name_filter =
+        normalized_api_key_name_filter(api_key_filter, api_key_name.as_deref());
+    let result = proxy::delete_usage_logs(
+        path,
+        filter.range.start_timestamp().as_deref(),
+        api_key_filter,
+        api_key_name_filter,
+        filter.status.sql_kind(),
+    );
+    match result {
+        Ok(0) => {
+            let hint = if log_view.status == LogStatusFilter::Running {
+                "运行中的请求不会被清空"
+            } else {
+                "没有匹配的日志可清空"
+            };
+            *message = AppMessage::new(format!("{hint}（{scope}）"), MessageKind::Info);
+        }
+        Ok(removed) => {
+            log_view.page = 0;
+            refresh_logs(config, log_view, None);
+            *message = AppMessage::new(
+                format!("已清空 {removed} 条日志（{scope}）"),
+                MessageKind::Success,
+            );
+        }
+        Err(err) => {
+            *message = AppMessage::new(format!("清空日志失败: {err}"), MessageKind::Error);
+        }
+    }
+}
+
 pub fn refresh_logs(
     config: &AppConfig,
     log_view: &mut LogViewState,
@@ -344,41 +493,31 @@ pub fn refresh_logs(
     log_view.loaded_path = format!("sqlite:{}", path.display());
     log_view.loaded_range = log_view.range;
     log_view.loaded_api_key_id = log_view.api_key_id.clone();
+    log_view.loaded_status = log_view.status;
     log_view.last_refresh = Some(Instant::now());
-    let (final_rows, final_total, note) = match read_log_page(
-        config,
-        log_view.range,
-        &log_view.api_key_id,
-        log_view.page,
-        LOG_PAGE_SIZE,
-    ) {
-        Ok((rows, total)) => {
-            let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
-            if log_view.page >= total_pages {
-                log_view.page = total_pages - 1;
-                match read_log_page(
-                    config,
-                    log_view.range,
-                    &log_view.api_key_id,
-                    log_view.page,
-                    LOG_PAGE_SIZE,
-                ) {
-                    Ok((rows2, total2)) => {
-                        let count = rows2.len();
-                        (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
+    let (final_rows, final_total, note) =
+        match read_log_page(config, log_view.filter(), log_view.page, LOG_PAGE_SIZE) {
+            Ok((rows, total)) => {
+                let total_pages = total.div_ceil(LOG_PAGE_SIZE).max(1);
+                if log_view.page >= total_pages {
+                    log_view.page = total_pages - 1;
+                    match read_log_page(config, log_view.filter(), log_view.page, LOG_PAGE_SIZE) {
+                        Ok((rows2, total2)) => {
+                            let count = rows2.len();
+                            (rows2, total2, Ok(format!("已加载 {} 条日志", count)))
+                        }
+                        Err(err) => (Vec::new(), 0, Err(err)),
                     }
-                    Err(err) => (Vec::new(), 0, Err(err)),
+                } else {
+                    let count = rows.len();
+                    (rows, total, Ok(format!("已加载 {} 条日志", count)))
                 }
-            } else {
-                let count = rows.len();
-                (rows, total, Ok(format!("已加载 {} 条日志", count)))
             }
-        }
-        Err(err) => (Vec::new(), 0, Err(err)),
-    };
+            Err(err) => (Vec::new(), 0, Err(err)),
+        };
     log_view.total = final_total;
     log_view.rows = final_rows;
-    if let Ok(totals) = read_filtered_log_totals(config, log_view.range, &log_view.api_key_id) {
+    if let Ok(totals) = read_filtered_log_totals(config, log_view.filter()) {
         log_view.totals = totals;
     }
     if let Some(msg) = message {
@@ -391,22 +530,19 @@ pub fn refresh_logs(
 
 fn read_filtered_log_totals(
     config: &AppConfig,
-    range: LogRange,
-    api_key_id: &str,
+    filter: LogFilter<'_>,
 ) -> Result<LogTotals, String> {
-    let api_key_name = api_key_name_for_id(config, api_key_id);
+    let api_key_name = api_key_name_for_id(config, filter.api_key_id);
     read_sqlite_log_totals(
         config.usage_log_sqlite_path(),
-        range,
-        api_key_id,
+        filter,
         api_key_name.as_deref(),
     )
 }
 
 fn read_sqlite_log_totals(
     path: PathBuf,
-    range: LogRange,
-    api_key_id: &str,
+    filter: LogFilter<'_>,
     api_key_name: Option<&str>,
 ) -> Result<LogTotals, String> {
     if !path.exists() {
@@ -416,23 +552,22 @@ fn read_sqlite_log_totals(
         .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
-    let range_start = range.start_timestamp();
-    let api_key_filter = normalized_api_key_filter(api_key_id);
+    let range_start = filter.range.start_timestamp();
+    let api_key_filter = normalized_api_key_filter(filter.api_key_id);
     let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
     let (input_tokens, output_tokens) = conn
         .query_row(
-            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
-             FROM usage_logs
-             WHERE (?1 IS NULL OR ts >= ?1)
-               AND (
-                   ?2 IS NULL
-                   OR api_key_id = ?2
-                   OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
-               )",
+            &format!(
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                 FROM usage_logs
+                 WHERE {}",
+                proxy::USAGE_LOG_FILTER_WHERE
+            ),
             rusqlite::params![
                 range_start.as_deref(),
-                api_key_filter.as_deref(),
-                api_key_name_filter
+                api_key_filter,
+                api_key_name_filter,
+                filter.status.sql_kind()
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -445,16 +580,14 @@ fn read_sqlite_log_totals(
 
 fn read_log_page(
     config: &AppConfig,
-    range: LogRange,
-    api_key_id: &str,
+    filter: LogFilter<'_>,
     page: usize,
     page_size: usize,
 ) -> Result<(Vec<LogRow>, usize), String> {
-    let api_key_name = api_key_name_for_id(config, api_key_id);
+    let api_key_name = api_key_name_for_id(config, filter.api_key_id);
     read_sqlite_log_page(
         config.usage_log_sqlite_path(),
-        range,
-        api_key_id,
+        filter,
         api_key_name.as_deref(),
         page,
         page_size,
@@ -463,8 +596,7 @@ fn read_log_page(
 
 fn read_sqlite_log_page(
     path: PathBuf,
-    range: LogRange,
-    api_key_id: &str,
+    filter: LogFilter<'_>,
     api_key_name: Option<&str>,
     page: usize,
     page_size: usize,
@@ -477,52 +609,47 @@ fn read_sqlite_log_page(
         .map_err(|err| format!("打开 SQLite 日志失败: {err}"))?;
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
-    let range_start = range.start_timestamp();
-    let api_key_filter = normalized_api_key_filter(api_key_id);
+    let range_start = filter.range.start_timestamp();
+    let api_key_filter = normalized_api_key_filter(filter.api_key_id);
     let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
+    let status_kind = filter.status.sql_kind();
     let total = conn
         .query_row(
-            "SELECT COUNT(*)
-             FROM usage_logs
-             WHERE (?1 IS NULL OR ts >= ?1)
-               AND (
-                   ?2 IS NULL
-                   OR api_key_id = ?2
-                   OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
-               )",
+            &format!(
+                "SELECT COUNT(*) FROM usage_logs WHERE {}",
+                proxy::USAGE_LOG_FILTER_WHERE
+            ),
             rusqlite::params![
                 range_start.as_deref(),
-                api_key_filter.as_deref(),
-                api_key_name_filter
+                api_key_filter,
+                api_key_name_filter,
+                status_kind
             ],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|err| format!("读取 SQLite 日志数量失败: {err}"))? as usize;
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             r#"
             SELECT
                 ts, status, api_key_name, api, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error
             FROM usage_logs
-            WHERE (?1 IS NULL OR ts >= ?1)
-              AND (
-                  ?2 IS NULL
-                  OR api_key_id = ?2
-                  OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
-              )
+            WHERE {}
             ORDER BY id DESC
-            LIMIT ?4
-            OFFSET ?5
+            LIMIT ?5
+            OFFSET ?6
             "#,
-        )
+            proxy::USAGE_LOG_FILTER_WHERE
+        ))
         .map_err(|err| format!("读取 SQLite 日志失败: {err}"))?;
     let rows = stmt
         .query_map(
             rusqlite::params![
                 range_start.as_deref(),
-                api_key_filter.as_deref(),
+                api_key_filter,
                 api_key_name_filter,
+                status_kind,
                 page_size as i64,
                 page.saturating_mul(page_size) as i64
             ],
@@ -670,6 +797,47 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_running_test_log(conn: &rusqlite::Connection, ts: &str, api_key_id: &str) {
+        conn.execute(
+            r#"
+            INSERT INTO usage_logs
+                (ts, api, status, channel, request_model, upstream_model,
+                 latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                 token_source, api_key_id, api_key_name)
+            VALUES
+                (?1, 'responses', 'running', 'test-channel', 'gpt-test', 'gpt-test',
+                 0, NULL, 0, 0, '', 'pending', ?2, 'A')
+            "#,
+            rusqlite::params![ts, api_key_id],
+        )
+        .unwrap();
+    }
+
+    /// 写入指定原始状态的行，用于验证状态筛选的分组口径。
+    fn insert_test_log_with_status(conn: &rusqlite::Connection, ts: &str, status: &str) {
+        conn.execute(
+            r#"
+            INSERT INTO usage_logs
+                (ts, api, status, channel, request_model, upstream_model,
+                 latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                 token_source, api_key_id, api_key_name)
+            VALUES
+                (?1, 'responses', ?2, 'test-channel', 'gpt-test', 'gpt-test',
+                 100, 50, 5, 1, '', 'upstream', 'key-a', 'A')
+            "#,
+            rusqlite::params![ts, status],
+        )
+        .unwrap();
+    }
+
+    fn test_filter(range: LogRange, status: LogStatusFilter, api_key_id: &str) -> LogFilter<'_> {
+        LogFilter {
+            range,
+            status,
+            api_key_id,
+        }
+    }
+
     #[test]
     fn log_range_starts_at_local_day_boundary() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
@@ -716,22 +884,194 @@ mod tests {
         insert_test_log(&conn, &old_ts, "key-a", "A", 30);
         drop(conn);
 
-        let (rows, total) =
-            read_sqlite_log_page(path.clone(), LogRange::Today, "key-a", Some("A"), 0, 20).unwrap();
+        let (rows, total) = read_sqlite_log_page(
+            path.clone(),
+            test_filter(LogRange::Today, LogStatusFilter::All, "key-a"),
+            Some("A"),
+            0,
+            20,
+        )
+        .unwrap();
         assert_eq!(total, 2);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].api_key_name, "A");
-        let today_totals =
-            read_sqlite_log_totals(path.clone(), LogRange::Today, "key-a", Some("A")).unwrap();
+        let today_totals = read_sqlite_log_totals(
+            path.clone(),
+            test_filter(LogRange::Today, LogStatusFilter::All, "key-a"),
+            Some("A"),
+        )
+        .unwrap();
         assert_eq!(today_totals.input_tokens, 50);
         assert_eq!(today_totals.output_tokens, 2);
 
-        let (_, total) =
-            read_sqlite_log_page(path.clone(), LogRange::All, "key-a", Some("A"), 0, 20).unwrap();
+        let (_, total) = read_sqlite_log_page(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::All, "key-a"),
+            Some("A"),
+            0,
+            20,
+        )
+        .unwrap();
         assert_eq!(total, 3);
-        let all_totals = read_sqlite_log_totals(path.clone(), LogRange::All, "", None).unwrap();
+        let all_totals = read_sqlite_log_totals(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::All, ""),
+            None,
+        )
+        .unwrap();
         assert_eq!(all_totals.input_tokens, 100);
         assert_eq!(all_totals.output_tokens, 4);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_logs_filter_by_status_group() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-status-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        // 运行中的行用当前时间，避免被 recover_stale_running_usage_logs 改成 error。
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        insert_test_log_with_status(&conn, &ts, "ok");
+        insert_test_log_with_status(&conn, &ts, "stream_started");
+        insert_test_log_with_status(&conn, &ts, "error");
+        insert_test_log_with_status(&conn, &ts, "some_unexpected_status");
+        insert_running_test_log(&conn, &ts, "key-a");
+        drop(conn);
+
+        let count = |status: LogStatusFilter| {
+            read_sqlite_log_page(
+                path.clone(),
+                test_filter(LogRange::All, status, ""),
+                None,
+                0,
+                20,
+            )
+            .unwrap()
+            .1
+        };
+        assert_eq!(count(LogStatusFilter::All), 5);
+        // 成功只含 ok / stream_started。
+        assert_eq!(count(LogStatusFilter::Success), 2);
+        // 失败兜住 error 以及任何非预期状态，保证没有行从所有筛选里漏掉。
+        assert_eq!(count(LogStatusFilter::Failed), 2);
+        assert_eq!(count(LogStatusFilter::Running), 1);
+
+        // 汇总口径必须跟着状态筛选走。
+        let success_totals = read_sqlite_log_totals(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::Success, ""),
+            None,
+        )
+        .unwrap();
+        assert_eq!(success_totals.input_tokens, 10);
+        assert_eq!(success_totals.output_tokens, 2);
+
+        // 只清失败的：成功和运行中都留着。
+        let removed = proxy::delete_usage_logs(
+            path.clone(),
+            None,
+            None,
+            None,
+            LogStatusFilter::Failed.sql_kind(),
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(count(LogStatusFilter::All), 3);
+        assert_eq!(count(LogStatusFilter::Failed), 0);
+
+        // 选中「运行中」时清空删不到任何行，运行中的记录必须保住。
+        let removed_running = proxy::delete_usage_logs(
+            path.clone(),
+            None,
+            None,
+            None,
+            LogStatusFilter::Running.sql_kind(),
+        )
+        .unwrap();
+        assert_eq!(removed_running, 0);
+        assert_eq!(count(LogStatusFilter::Running), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn clearing_logs_respects_filter_and_keeps_running_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-clear-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        let today = chrono::Local::now().date_naive();
+        let today_ts = today
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let old_ts = today
+            .checked_sub_signed(chrono::Duration::days(10))
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        // 运行中的行用当前时间，避免被 recover_stale_running_usage_logs 判定为超时。
+        let running_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        insert_test_log(&conn, &today_ts, "key-a", "A", 10);
+        insert_test_log(&conn, &today_ts, "key-b", "B", 20);
+        insert_test_log(&conn, &old_ts, "key-a", "A", 30);
+        insert_running_test_log(&conn, &running_ts, "key-a");
+        drop(conn);
+
+        // 只清 key-a 的今日日志：key-b 今日、key-a 历史和运行中的行都要保留。
+        let removed = proxy::delete_usage_logs(
+            path.clone(),
+            LogRange::Today.start_timestamp().as_deref(),
+            Some("key-a"),
+            Some("A"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
+        let (_, total) = read_sqlite_log_page(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::All, ""),
+            None,
+            0,
+            20,
+        )
+        .unwrap();
+        assert_eq!(total, 3);
+
+        // 全量清空：只剩运行中的行。
+        let removed_all = proxy::delete_usage_logs(path.clone(), None, None, None, None).unwrap();
+        assert_eq!(removed_all, 2);
+        let (rows, total) = read_sqlite_log_page(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::All, ""),
+            None,
+            0,
+            20,
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].status, "running");
+        let totals = read_sqlite_log_totals(
+            path.clone(),
+            test_filter(LogRange::All, LogStatusFilter::All, ""),
+            None,
+        )
+        .unwrap();
+        assert_eq!(totals.input_tokens, 0);
+        assert_eq!(totals.output_tokens, 0);
+
+        // 已经清空后再点一次不应该报错，也不会再删到任何行。
+        let removed_again = proxy::delete_usage_logs(path.clone(), None, None, None, None).unwrap();
+        assert_eq!(removed_again, 0);
 
         let _ = std::fs::remove_file(path);
     }

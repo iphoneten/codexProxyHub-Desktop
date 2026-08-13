@@ -2,7 +2,7 @@ use super::{
     account_type_matches, auth_proxy_url, AccountQuotaView, AuthAccountsState, AuthAvailability,
 };
 use crate::{
-    auth_quota::{self, GrokCheckResult},
+    auth_quota::{self, GrokCheckResult, GrokQuotaResult},
     config::{AppConfig, AuthAccountConfig},
     desktop::{AppMessage, MessageKind},
 };
@@ -17,7 +17,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 struct CheckResult {
     account_id: String,
-    result: GrokCheckResult,
+    result: GrokQuotaResult,
     silent: bool,
 }
 
@@ -76,7 +76,10 @@ pub(super) fn apply_pending(
         let view = state.views.entry(job.account_id.clone()).or_default();
         view.refreshing = false;
         view.checked_at = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        match job.result {
+        if job.result.billing.is_some() {
+            view.billing = job.result.billing;
+        }
+        match job.result.check {
             GrokCheckResult::Available => set_available(view, &mut available),
             GrokCheckResult::QuotaExhausted(err) => {
                 view.availability = AuthAvailability::QuotaExhausted;
@@ -109,9 +112,9 @@ pub(super) fn apply_pending(
                 MessageKind::Error
             };
             let text = if disabled == 0 {
-                format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽")
+                format!("Grok 额度刷新完成，{available} 个可用，{exhausted} 个额度耗尽")
             } else {
-                format!("Grok 授权检查完成，{available} 个可用，{exhausted} 个额度耗尽，已停用 {disabled} 个授权失效账号")
+                format!("Grok 额度刷新完成，{available} 个可用，{exhausted} 个额度耗尽，已停用 {disabled} 个授权失效账号")
             };
             *message = AppMessage::new(text, kind);
         }
@@ -134,7 +137,7 @@ pub(super) fn check_all(
         AppMessage::new("没有已启用的 Grok 账号可检查", MessageKind::Error)
     } else {
         AppMessage::new(
-            format!("正在并发检查 {count} 个 Grok 账号授权"),
+            format!("正在并发刷新 {count} 个 Grok 账号额度"),
             MessageKind::Info,
         )
     };
@@ -188,7 +191,7 @@ pub(super) fn queue_single(
     let account = account.clone();
     let pending = Arc::clone(&state.grok.pending);
     thread::spawn(move || {
-        let result = auth_quota::check_grok_account(&account, proxy_url.as_deref());
+        let result = auth_quota::check_grok_account_quota(&account, proxy_url.as_deref());
         pending.lock().push(CheckResult {
             account_id: account.id,
             result,

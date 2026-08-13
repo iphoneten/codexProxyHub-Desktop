@@ -48,6 +48,7 @@ use oauth::*;
 use routing::*;
 use streaming::*;
 use upstream::*;
+pub(crate) use usage_log::USAGE_LOG_FILTER_WHERE;
 use usage_log::*;
 
 #[cfg(test)]
@@ -79,6 +80,16 @@ pub(crate) fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()>
 
 pub(crate) fn recover_stale_running_usage_logs(path: PathBuf, max_age: Duration) {
     usage_log::recover_stale_running_usage_logs(path, max_age)
+}
+
+pub(crate) fn delete_usage_logs(
+    path: PathBuf,
+    range_start: Option<&str>,
+    api_key_id: Option<&str>,
+    api_key_name: Option<&str>,
+    status_kind: Option<&str>,
+) -> rusqlite::Result<usize> {
+    usage_log::delete_usage_logs(path, range_start, api_key_id, api_key_name, status_kind)
 }
 
 pub(crate) fn api_key_id(api_key: &str) -> String {
@@ -877,11 +888,71 @@ pub async fn run_server(
     Ok(())
 }
 
+/// 启动前校验：普通渠道和 Auth 账号在路由时是等价的可用上游，
+/// 因此任一侧有启用项即可启动。
 pub fn validate_config(config: &AppConfig) -> Result<()> {
-    if config.providers.iter().filter(|p| p.enabled).count() == 0 {
-        return Err(anyhow!("没有启用的 provider"));
+    let enabled_providers = config.providers.iter().filter(|p| p.enabled).count();
+    let enabled_auth_accounts = config
+        .auth_accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .count();
+    if enabled_providers == 0 && enabled_auth_accounts == 0 {
+        return Err(anyhow!("没有启用的渠道或 Auth 账号"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod validate_config_tests {
+    use super::*;
+    use crate::config::AuthAccountConfig;
+
+    fn base_config() -> AppConfig {
+        let mut cfg = AppConfig::load("config.example.yaml").unwrap();
+        cfg.providers.clear();
+        cfg.auth_accounts.clear();
+        cfg
+    }
+
+    fn enabled_account(id: &str) -> AuthAccountConfig {
+        serde_json::from_value(json!({"id": id})).unwrap()
+    }
+
+    #[test]
+    fn validate_config_rejects_config_without_provider_or_auth_account() {
+        let cfg = base_config();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_accepts_auth_account_only_config() {
+        let mut cfg = base_config();
+        cfg.auth_accounts = vec![enabled_account("acct-1")];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_config_ignores_disabled_auth_accounts() {
+        let mut cfg = base_config();
+        let mut account = enabled_account("acct-1");
+        account.enabled = false;
+        cfg.auth_accounts = vec![account];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_accepts_provider_only_config() {
+        let mut cfg = base_config();
+        let provider: ProviderConfig = serde_json::from_value(json!({
+            "name": "channel-a",
+            "base_url": "https://example.test/v1",
+            "api_key": "sk-test"
+        }))
+        .unwrap();
+        cfg.providers = vec![provider];
+        assert!(validate_config(&cfg).is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -7,8 +7,162 @@ use super::{AppMessage, MessageKind, TextDraft};
 use crate::config::{AppConfig, ProviderConfig};
 use crate::proxy;
 use eframe::egui;
-use std::time::Instant;
+use parking_lot::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    thread,
+    time::Instant,
+};
 
+/// 模型同步在后台线程执行，UI 只轮询结果，避免阻塞渲染线程造成窗口卡顿。
+#[derive(Default)]
+pub struct ModelSyncState {
+    inflight: HashSet<String>,
+    pending: Arc<Mutex<Vec<ModelSyncOutcome>>>,
+}
+
+impl ModelSyncState {
+    pub fn has_pending(&self) -> bool {
+        !self.inflight.is_empty() || !self.pending.lock().is_empty()
+    }
+
+    fn is_syncing(&self, provider_name: &str) -> bool {
+        self.inflight.contains(provider_name)
+    }
+}
+
+struct ModelSyncOutcome {
+    provider_name: String,
+    provider_index: usize,
+    result: Result<Vec<String>, String>,
+}
+
+/// 后台线程需要的渠道字段快照，避免跨线程持有配置引用。
+struct ModelSyncRequest {
+    provider_name: String,
+    provider_index: usize,
+    provider_type: String,
+    base_url: String,
+    api_key: String,
+    use_proxy: bool,
+    proxy_url: String,
+    connect_timeout: u64,
+    request_timeout: u64,
+    extra_headers: HashMap<String, String>,
+}
+
+/// 每帧调用，把后台线程的同步结果写回配置。
+pub fn apply_model_sync_pending(
+    config: &mut AppConfig,
+    state: &mut ModelSyncState,
+    message: &mut AppMessage,
+) {
+    let outcomes: Vec<ModelSyncOutcome> = {
+        let mut pending = state.pending.lock();
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+    };
+
+    for outcome in outcomes {
+        state.inflight.remove(&outcome.provider_name);
+        match outcome.result {
+            Ok(models) => {
+                let count = models.len();
+                match locate_provider(config, outcome.provider_index, &outcome.provider_name) {
+                    Some(idx) => {
+                        config.providers[idx].models = models;
+                        *message = AppMessage::new(
+                            format!("已同步渠道 [{}] 的 {count} 个模型", outcome.provider_name),
+                            MessageKind::Success,
+                        );
+                    }
+                    None => {
+                        *message = AppMessage::new(
+                            format!(
+                                "渠道 [{}] 已改名或删除，{count} 个同步结果被丢弃",
+                                outcome.provider_name
+                            ),
+                            MessageKind::Error,
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                *message = AppMessage::new(
+                    format!("同步渠道 [{}] 模型失败: {err}", outcome.provider_name),
+                    MessageKind::Error,
+                );
+            }
+        }
+    }
+}
+
+/// 优先按发起同步时的下标命中，下标失效则按渠道名回退查找。
+fn locate_provider(config: &AppConfig, index: usize, name: &str) -> Option<usize> {
+    if config
+        .providers
+        .get(index)
+        .is_some_and(|provider| provider.name == name)
+    {
+        return Some(index);
+    }
+    config
+        .providers
+        .iter()
+        .position(|provider| provider.name == name)
+}
+
+fn start_model_sync(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    shared_proxy: &str,
+    state: &mut ModelSyncState,
+    message: &mut AppMessage,
+) {
+    if state.is_syncing(&provider.name) {
+        *message = AppMessage::new(
+            format!("渠道 [{}] 正在同步模型", provider.name),
+            MessageKind::Info,
+        );
+        return;
+    }
+
+    let request = ModelSyncRequest {
+        provider_name: provider.name.clone(),
+        provider_index,
+        provider_type: provider.provider_type.clone(),
+        base_url: provider.base_url.clone(),
+        api_key: provider.api_key.clone(),
+        use_proxy: provider.use_proxy,
+        proxy_url: shared_proxy.trim().to_string(),
+        connect_timeout: provider.connect_timeout,
+        request_timeout: provider.request_timeout,
+        extra_headers: provider.extra_headers.clone(),
+    };
+    state.inflight.insert(request.provider_name.clone());
+
+    let pending = Arc::clone(&state.pending);
+    thread::spawn(move || {
+        let provider_name = request.provider_name.clone();
+        let provider_index = request.provider_index;
+        let result = sync_upstream_models(&request);
+        pending.lock().push(ModelSyncOutcome {
+            provider_name,
+            provider_index,
+            result,
+        });
+    });
+
+    *message = AppMessage::new(
+        format!("正在同步渠道 [{}] 的上游模型...", provider.name),
+        MessageKind::Info,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn provider_section(
     ui: &mut egui::Ui,
     config: &mut AppConfig,
@@ -17,6 +171,7 @@ pub fn provider_section(
     mapping_drafts: &mut Vec<TextDraft>,
     header_drafts: &mut Vec<TextDraft>,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
+    model_sync: &mut ModelSyncState,
 ) {
     let shared_proxy = config.routing.auth_proxy.clone();
     resize_drafts(mapping_drafts, config.providers.len());
@@ -67,11 +222,13 @@ pub fn provider_section(
                         delete_provider = provider_detail_panel(
                             ui,
                             provider,
+                            idx,
                             message,
                             &mut mapping_drafts[idx],
                             &mut header_drafts[idx],
                             circuit_status,
                             &shared_proxy,
+                            model_sync,
                         );
                     });
                 if delete_provider {
@@ -178,14 +335,17 @@ fn provider_list_panel(ui: &mut egui::Ui, config: &mut AppConfig, selected: &mut
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provider_detail_panel(
     ui: &mut egui::Ui,
     provider: &mut ProviderConfig,
+    provider_index: usize,
     message: &mut AppMessage,
     mapping_draft: &mut TextDraft,
     header_draft: &mut TextDraft,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
     shared_proxy: &str,
+    model_sync: &mut ModelSyncState,
 ) -> bool {
     let mut delete_requested = false;
     section(ui, "渠道详情", |ui| {
@@ -418,23 +578,17 @@ fn provider_detail_panel(
                         .size(12.0)
                         .color(muteds()),
                 );
-                if soft_button(ui, "同步上游模型").clicked() {
-                    match sync_upstream_models(provider, shared_proxy) {
-                        Ok(models) => {
-                            let count = models.len();
-                            provider.models = models;
-                            *message = AppMessage::new(
-                                format!("已同步渠道 [{}] 的 {} 个模型", provider.name, count),
-                                MessageKind::Success,
-                            );
-                        }
-                        Err(err) => {
-                            *message = AppMessage::new(
-                                format!("同步渠道 [{}] 模型失败: {err}", provider.name),
-                                MessageKind::Error,
-                            );
-                        }
-                    }
+                let syncing = model_sync.is_syncing(&provider.name);
+                let sync_label = if syncing {
+                    "同步中..."
+                } else {
+                    "同步上游模型"
+                };
+                if soft_button(ui, sync_label).clicked() && !syncing {
+                    start_model_sync(provider, provider_index, shared_proxy, model_sync, message);
+                }
+                if syncing {
+                    ui.spinner();
                 }
             });
             let mut models_text = provider.models.join("\n");
@@ -623,39 +777,36 @@ fn serialize_extra_headers(provider: &ProviderConfig) -> String {
         .join("\n")
 }
 
-fn sync_upstream_models(
-    provider: &ProviderConfig,
-    shared_proxy: &str,
-) -> Result<Vec<String>, String> {
-    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+fn sync_upstream_models(request: &ModelSyncRequest) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", request.base_url.trim_end_matches('/'));
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(
-            provider.connect_timeout.max(1),
+            request.connect_timeout.max(1),
         ))
         .timeout(std::time::Duration::from_secs(
-            provider.request_timeout.max(1),
+            request.request_timeout.max(1),
         ));
-    let proxy_url = shared_proxy.trim();
-    if provider.use_proxy && !proxy_url.is_empty() {
+    let proxy_url = request.proxy_url.trim();
+    if request.use_proxy && !proxy_url.is_empty() {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|err| format!("代理地址无效: {err}"))?;
         // 先禁用系统代理，再加入渠道显式代理，避免 no_proxy 清掉刚配置的代理。
         builder = builder.no_proxy().proxy(proxy);
     }
     let client = builder.build().map_err(|err| err.to_string())?;
 
-    let mut request = client.get(&url);
-    if provider.provider_type == "anthropic" {
-        request = request
-            .header("x-api-key", &provider.api_key)
+    let mut http_request = client.get(&url);
+    if request.provider_type == "anthropic" {
+        http_request = http_request
+            .header("x-api-key", &request.api_key)
             .header("anthropic-version", "2023-06-01");
-    } else if provider.provider_type == "google_ai_studio"
-        && !crate::proxy::is_google_openai_endpoint(&provider.base_url)
+    } else if request.provider_type == "google_ai_studio"
+        && !crate::proxy::is_google_openai_endpoint(&request.base_url)
     {
-        request = request.header("x-goog-api-key", &provider.api_key);
+        http_request = http_request.header("x-goog-api-key", &request.api_key);
     } else {
-        request = request.bearer_auth(&provider.api_key);
+        http_request = http_request.bearer_auth(&request.api_key);
     }
-    for (name, value) in &provider.extra_headers {
+    for (name, value) in &request.extra_headers {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
@@ -669,10 +820,10 @@ fn sync_upstream_models(
         ) {
             continue;
         }
-        request = request.header(name, value);
+        http_request = http_request.header(name, value);
     }
 
-    let response = request
+    let response = http_request
         .send()
         .map_err(|err| format_model_sync_request_error(&url, &err))?;
     let status = response.status();

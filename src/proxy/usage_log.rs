@@ -469,6 +469,56 @@ pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusq
     )
 }
 
+/// 请求日志的公共筛选条件，读取（计数 / 分页 / 汇总）和清空共用同一份，
+/// 保证「删的就是筛选出来的」。绑定参数顺序固定为：
+/// `?1` 起始时间、`?2` api_key_id、`?3` api_key_name、`?4` 状态标记，
+/// 四个都允许传 `NULL` 表示该维度不过滤。
+///
+/// 状态标记用的是界面「状态」列的口径而不是数据库原始值：`success` 覆盖
+/// `ok` / `stream_started`，`running` 只匹配运行中，`failed` 是其余一切
+/// （`error` 以及任何非预期值），这样不会有行从所有筛选里漏掉。
+pub(crate) const USAGE_LOG_FILTER_WHERE: &str = r#"
+    (?1 IS NULL OR ts >= ?1)
+      AND (
+          ?2 IS NULL
+          OR api_key_id = ?2
+          OR (api_key_id = '' AND ?3 IS NOT NULL AND api_key_name = ?3)
+      )
+      AND (
+          ?4 IS NULL
+          OR (?4 = 'success' AND status IN ('ok', 'stream_started'))
+          OR (?4 = 'running' AND status = 'running')
+          OR (?4 = 'failed' AND status NOT IN ('ok', 'stream_started', 'running'))
+      )
+"#;
+
+/// 按筛选条件删除请求日志，返回实际删除的行数。参数含义与
+/// `USAGE_LOG_FILTER_WHERE` 一致，全部传 `None` 即清空整表。
+///
+/// `status = 'running'` 的行一律保留：流式请求的日志是先插入再按 id 回填的
+/// （见 `update_usage_log_sqlite`），删掉正在进行的行会让这次请求完成后
+/// 永久丢失记录。因此状态筛选选中「运行中」时这里会删不到任何行。
+pub(super) fn delete_usage_logs(
+    path: PathBuf,
+    range_start: Option<&str>,
+    api_key_id: Option<&str>,
+    api_key_name: Option<&str>,
+    status_kind: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let conn = open_usage_log_connection(path)?;
+    ensure_usage_log_schema(&conn)?;
+    let removed = conn.execute(
+        &format!("DELETE FROM usage_logs WHERE status != 'running' AND {USAGE_LOG_FILTER_WHERE}"),
+        params![range_start, api_key_id, api_key_name, status_kind],
+    )?;
+    // 只在全量清空后回收磁盘空间：SQLite 删行只会把页标记为可复用，文件不会变小。
+    // WAL 模式下 VACUUM 需要独占访问，代理正在写日志时会失败，忽略即可。
+    if removed > 0 && range_start.is_none() && api_key_id.is_none() && status_kind.is_none() {
+        let _ = conn.execute_batch("VACUUM");
+    }
+    Ok(removed)
+}
+
 pub(crate) fn open_usage_log_connection(path: PathBuf) -> rusqlite::Result<Connection> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);

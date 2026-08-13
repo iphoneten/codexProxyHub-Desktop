@@ -3,7 +3,7 @@ use super::common::{
     section, soft_button, surface, switch, text_color,
 };
 use super::{AppMessage, MessageKind};
-use crate::auth_quota::{self, AuthQuotaSnapshot};
+use crate::auth_quota::{self, AuthQuotaSnapshot, GrokBillingSummary};
 use crate::config::{AppConfig, AuthAccountConfig};
 use eframe::egui;
 use parking_lot::Mutex;
@@ -33,18 +33,23 @@ enum AuthAvailability {
 struct AccountQuotaView {
     availability: AuthAvailability,
     plan_type: Option<String>,
-    primary_used: Option<f64>,
-    secondary_used: Option<f64>,
-    code_review_used: Option<f64>,
-    primary_reset: Option<String>,
-    secondary_reset: Option<String>,
-    code_review_reset: Option<String>,
-    primary_window: Option<String>,
-    secondary_window: Option<String>,
-    code_review_window: Option<String>,
+    /// 逐个额度窗口展示，标签由上游窗口时长决定。
+    windows: Vec<UsageRow>,
+    reset_credits: Option<i64>,
+    applicable_reset_credits: Option<i64>,
+    /// Grok/xAI 账单额度，仅免费档 cli-chat-proxy 授权能取到。
+    billing: Option<GrokBillingSummary>,
     checked_at: Option<String>,
     error: Option<String>,
     refreshing: bool,
+}
+
+#[derive(Clone)]
+struct UsageRow {
+    label: String,
+    used: Option<f64>,
+    reset: Option<String>,
+    window: Option<String>,
 }
 impl Default for AuthAvailability {
     fn default() -> Self {
@@ -200,8 +205,7 @@ pub fn auth_accounts_section(
                         {
                             refresh_all_accounts(config, state, message, &active_type);
                         }
-                        if active_type == "grok" && soft_button(ui, "全部检查授权").clicked()
-                        {
+                        if active_type == "grok" && soft_button(ui, "全部刷新额度").clicked() {
                             grok::check_all(config, state, message);
                         }
                         if soft_button(ui, "导入账号").clicked() {
@@ -381,34 +385,36 @@ fn account_card(
             });
 
             ui.add_space(10.0);
-            if is_openai {
-                usage_row(
-                    ui,
-                    "主额度",
-                    view.primary_used,
-                    view.primary_reset.as_deref(),
-                    view.primary_window.as_deref(),
-                );
-                usage_row(
-                    ui,
-                    "次额度",
-                    view.secondary_used,
-                    view.secondary_reset.as_deref(),
-                    view.secondary_window.as_deref(),
-                );
-                usage_row(
-                    ui,
-                    "代码审查",
-                    view.code_review_used,
-                    view.code_review_reset.as_deref(),
-                    view.code_review_window.as_deref(),
-                );
-            } else {
+            if view.windows.is_empty() && view.billing.is_none() {
                 ui.label(
-                    egui::RichText::new("OpenAI-compatible API Key 授权")
+                    egui::RichText::new(empty_quota_text(is_grok, view.checked_at.is_some()))
                         .size(12.0)
                         .color(muteds()),
                 );
+            } else {
+                for row in &view.windows {
+                    usage_row(
+                        ui,
+                        &row.label,
+                        row.used,
+                        row.reset.as_deref(),
+                        row.window.as_deref(),
+                    );
+                }
+                if let Some(billing) = view.billing.as_ref() {
+                    billing_rows(ui, billing);
+                }
+                if let Some(credits) = view.reset_credits {
+                    let applicable = view
+                        .applicable_reset_credits
+                        .map(|value| format!("（可用于当前额度 {value} 次）"))
+                        .unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(format!("额度重置券 {credits} 张{applicable}"))
+                            .size(11.0)
+                            .color(muteds()),
+                    );
+                }
             }
 
             if let Some(error) = view.error.as_deref() {
@@ -510,16 +516,14 @@ fn account_card(
                     );
                 }
                 let check_label = if view.refreshing {
-                    "检查中..."
+                    "刷新中..."
                 } else {
-                    "检查授权"
+                    "刷新额度"
                 };
                 if is_grok && soft_button(ui, check_label).clicked() && !view.refreshing {
                     grok::queue_single(account, state, proxy_url.clone());
-                    *message = AppMessage::new(
-                        format!("正在检查 Grok 授权: {}", account.name),
-                        MessageKind::Info,
-                    );
+                    *message =
+                        AppMessage::new(format!("正在刷新额度: {}", account.name), MessageKind::Info);
                 }
                 if confirm_delete_button(ui, ("auth_account_delete", account.id.as_str()), "删除")
                 {
@@ -578,6 +582,72 @@ fn usage_row(
             .color(muteds()),
     );
     ui.add_space(4.0);
+}
+
+/// 纯 API Key 的 Grok 账号上游没有账单接口，刷新过一次后就不要再提示去点按钮。
+fn empty_quota_text(is_grok: bool, checked: bool) -> &'static str {
+    match (is_grok, checked) {
+        (true, true) => "OpenAI-compatible API Key 授权 · 上游未提供额度数据",
+        (true, false) => "点击「刷新额度」获取 xAI 账单额度",
+        (false, true) => "上游未返回额度数据",
+        (false, false) => "点击「刷新额度」获取账号额度",
+    }
+}
+
+fn billing_rows(ui: &mut egui::Ui, billing: &GrokBillingSummary) {
+    let period = billing.period_type.as_deref().unwrap_or("账单");
+    let window = billing.period_seconds.map(format_window_seconds);
+    let reset = billing
+        .period_end
+        .map(|end| auth_quota::format_reset_at(Some(end)));
+    usage_row(
+        ui,
+        &format!("{period}额度"),
+        billing.usage_percent,
+        reset.as_deref(),
+        window.as_deref(),
+    );
+    if let (Some(limit), Some(used)) = (billing.monthly_limit_cents, billing.used_cents) {
+        ui.label(
+            egui::RichText::new(format!(
+                "已用 {} / 套餐 {}",
+                format_cents(used),
+                format_cents(limit)
+            ))
+            .size(11.0)
+            .color(muteds()),
+        );
+    }
+    if billing.on_demand_cap_cents.is_some() || billing.on_demand_used_cents.is_some() {
+        usage_row(ui, "按量额度", billing.on_demand_used_percent, None, None);
+        if let Some(cap) = billing.on_demand_cap_cents {
+            let used = billing
+                .on_demand_used_cents
+                .map(format_cents)
+                .unwrap_or_else(|| "-".to_string());
+            ui.label(
+                egui::RichText::new(format!("已用 {used} / 上限 {}", format_cents(cap)))
+                    .size(11.0)
+                    .color(muteds()),
+            );
+        }
+    }
+    for product in &billing.products {
+        let percent = product
+            .usage_percent
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "-".to_string());
+        ui.label(
+            egui::RichText::new(format!("{} · {percent}", product.product))
+                .size(11.0)
+                .color(muteds()),
+        );
+    }
+}
+
+/// xAI 账单金额单位是美分。
+fn format_cents(cents: f64) -> String {
+    format!("${:.2}", cents / 100.0)
 }
 
 fn format_window_seconds(seconds: i64) -> String {
@@ -652,45 +722,21 @@ fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState, message:
                     account.expires_at = tokens.expires_at;
                 }
                 view.plan_type = snapshot.plan_type;
-                view.primary_used = snapshot.primary.as_ref().map(|item| item.used_percent);
-                view.secondary_used = snapshot.secondary.as_ref().map(|item| item.used_percent);
-                view.code_review_used = snapshot.code_review.as_ref().map(|item| item.used_percent);
-                view.primary_reset = snapshot
-                    .primary
-                    .as_ref()
-                    .map(|item| auth_quota::format_reset_at(item.reset_at));
-                view.secondary_reset = snapshot
-                    .secondary
-                    .as_ref()
-                    .map(|item| auth_quota::format_reset_at(item.reset_at));
-                view.code_review_reset = snapshot
-                    .code_review
-                    .as_ref()
-                    .map(|item| auth_quota::format_reset_at(item.reset_at));
-                view.primary_window = snapshot
-                    .primary
-                    .as_ref()
-                    .and_then(|item| item.limit_window_seconds)
-                    .map(format_window_seconds);
-                view.secondary_window = snapshot
-                    .secondary
-                    .as_ref()
-                    .and_then(|item| item.limit_window_seconds)
-                    .map(format_window_seconds);
-                view.code_review_window = snapshot
-                    .code_review
-                    .as_ref()
-                    .and_then(|item| item.limit_window_seconds)
-                    .map(format_window_seconds);
+                view.windows = snapshot
+                    .windows
+                    .iter()
+                    .map(|window| UsageRow {
+                        label: window.label.clone(),
+                        used: Some(window.used_percent),
+                        reset: Some(auth_quota::format_reset_at(window.reset_at)),
+                        window: window.limit_window_seconds.map(format_window_seconds),
+                    })
+                    .collect();
+                view.reset_credits = snapshot.reset_credits;
+                view.applicable_reset_credits = snapshot.applicable_reset_credits;
                 view.checked_at = Some(snapshot.checked_at);
                 view.error = None;
-                view.availability = if snapshot.limit_reached
-                    || snapshot.allowed == Some(false)
-                    || snapshot
-                        .primary
-                        .as_ref()
-                        .is_some_and(|item| item.used_percent >= 100.0)
-                {
+                view.availability = if snapshot.limit_reached || snapshot.allowed == Some(false) {
                     AuthAvailability::QuotaExhausted
                 } else {
                     AuthAvailability::Available

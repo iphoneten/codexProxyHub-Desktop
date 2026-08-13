@@ -83,6 +83,7 @@ pub struct HubApp {
     log_view: LogViewState,
     overview_analytics: OverviewAnalyticsState,
     auth_accounts_state: auth_accounts::AuthAccountsState,
+    model_sync: providers::ModelSyncState,
     config_handle: Option<ConfigHandle>,
     circuit_status: Option<proxy::ProviderCircuitStatusHandle>,
     #[cfg(target_os = "macos")]
@@ -153,6 +154,7 @@ impl HubApp {
             log_view: LogViewState::default(),
             overview_analytics: OverviewAnalyticsState::default(),
             auth_accounts_state: auth_accounts::AuthAccountsState::default(),
+            model_sync: providers::ModelSyncState::default(),
             config_handle: None,
             circuit_status: None,
             #[cfg(target_os = "macos")]
@@ -426,6 +428,8 @@ impl eframe::App for HubApp {
 
         if let Some(config) = self.config.as_mut() {
             auth_accounts::tick_background_grok_check(config, &mut self.auth_accounts_state);
+            // 模型同步在后台线程完成，这里不分页面地回收结果，避免切换视图丢失。
+            providers::apply_model_sync_pending(config, &mut self.model_sync, &mut self.message);
         }
         self.sync_config_to_runtime();
 
@@ -500,6 +504,7 @@ impl eframe::App for HubApp {
                                 &mut self.provider_mapping_drafts,
                                 &mut self.provider_header_drafts,
                                 self.circuit_status.as_ref(),
+                                &mut self.model_sync,
                             );
                         }
                         AppView::AuthAccounts => {
@@ -565,6 +570,7 @@ impl eframe::App for HubApp {
 
         let repaint_ms = if self.log_view.rows.iter().any(|row| row.status == "running")
             || self.auth_accounts_state.has_refreshing()
+            || self.model_sync.has_pending()
         {
             100
         } else {
