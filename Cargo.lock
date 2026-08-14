@@ -3450,6 +3450,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower-http",
  "tray-icon",
  "uuid",

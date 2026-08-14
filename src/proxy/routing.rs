@@ -639,6 +639,7 @@ mod preference_tests {
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
             oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            root_cancel: CancellationToken::new(),
         }
     }
 

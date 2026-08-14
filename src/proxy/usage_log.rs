@@ -12,6 +12,8 @@ pub(super) struct UsageLogEvent<'a> {
     pub(super) usage: TokenUsage,
     pub(super) first_token_ms: Option<i64>,
     pub(super) token_source: Option<&'a str>,
+    /// 与响应头 `x-request-id` 同值，用来把一行日志和客户端侧的一次请求对上。
+    pub(super) request_id: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -27,6 +29,7 @@ pub(super) fn log_success(
     stream: bool,
     api_key_id: &str,
     api_key_name: &str,
+    request_id: &str,
 ) {
     log_usage(
         config,
@@ -43,6 +46,7 @@ pub(super) fn log_success(
             usage,
             first_token_ms,
             token_source: None,
+            request_id,
         },
     );
 }
@@ -57,6 +61,7 @@ pub(super) fn log_error(
     error: &str,
     api_key_id: &str,
     api_key_name: &str,
+    request_id: &str,
 ) {
     log_usage(
         config,
@@ -73,6 +78,7 @@ pub(super) fn log_error(
             usage: TokenUsage::default(),
             first_token_ms,
             token_source: None,
+            request_id,
         },
     );
 }
@@ -86,6 +92,7 @@ pub(super) fn log_stream_started(
     started: Instant,
     api_key_id: &str,
     api_key_name: &str,
+    request_id: &str,
 ) -> Option<i64> {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let log_provider = log_provider_name(config, provider);
@@ -105,6 +112,7 @@ pub(super) fn log_stream_started(
         0,
         0,
         "upstream_or_unknown",
+        request_id,
     )
     .ok()
 }
@@ -130,6 +138,7 @@ pub(super) fn start_stream_attempt_log(
         started,
         "",
         api_key_name,
+        "",
     )
 }
 
@@ -143,6 +152,7 @@ pub(super) fn start_stream_attempt_log_for_key(
     started: Instant,
     api_key_id: &str,
     api_key_name: &str,
+    request_id: &str,
 ) -> Option<i64> {
     stream.then(|| {
         log_stream_started(
@@ -154,6 +164,7 @@ pub(super) fn start_stream_attempt_log_for_key(
             started,
             api_key_id,
             api_key_name,
+            request_id,
         )
     })?
 }
@@ -179,6 +190,7 @@ pub(super) fn finish_failed_attempt_log(
         error,
         "",
         api_key_name,
+        "",
     );
 }
 
@@ -192,6 +204,7 @@ pub(super) fn finish_failed_attempt_log_for_key(
     error: &str,
     api_key_id: &str,
     api_key_name: &str,
+    request_id: &str,
 ) {
     let Some(id) = log_id else {
         return;
@@ -212,6 +225,7 @@ pub(super) fn finish_failed_attempt_log_for_key(
             usage: TokenUsage::default(),
             first_token_ms: None,
             token_source: None,
+            request_id,
         },
     )
     .is_err()
@@ -226,6 +240,7 @@ pub(super) fn finish_failed_attempt_log_for_key(
             error,
             api_key_id,
             api_key_name,
+            request_id,
         );
     }
 }
@@ -305,6 +320,7 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
         event.usage.input,
         event.usage.output,
         token_source,
+        event.request_id,
     );
 }
 
@@ -361,6 +377,7 @@ pub(super) fn log_usage_sqlite(
         input_tokens,
         output_tokens,
         token_source,
+        "",
     )
 }
 
@@ -381,6 +398,7 @@ pub(super) fn log_usage_sqlite_for_key(
     input_tokens: i64,
     output_tokens: i64,
     token_source: &str,
+    request_id: &str,
 ) -> rusqlite::Result<i64> {
     let conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
@@ -390,10 +408,10 @@ pub(super) fn log_usage_sqlite_for_key(
             (
                 ts, api, status, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source,
-                api_key_id, api_key_name
+                api_key_id, api_key_name, request_id
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         "#,
         params![
             ts,
@@ -409,7 +427,8 @@ pub(super) fn log_usage_sqlite_for_key(
             error,
             token_source,
             api_key_id,
-            api_key_name
+            api_key_name,
+            request_id
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -475,8 +494,9 @@ pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusq
 /// 四个都允许传 `NULL` 表示该维度不过滤。
 ///
 /// 状态标记用的是界面「状态」列的口径而不是数据库原始值：`success` 覆盖
-/// `ok` / `stream_started`，`running` 只匹配运行中，`failed` 是其余一切
-/// （`error` 以及任何非预期值），这样不会有行从所有筛选里漏掉。
+/// `ok` / `stream_started`，`running` 只匹配运行中，`aborted` 是客户端提前
+/// 断开导致的取消，`failed` 是其余一切（`error` 以及任何非预期值），
+/// 这样不会有行从所有筛选里漏掉。
 pub(crate) const USAGE_LOG_FILTER_WHERE: &str = r#"
     (?1 IS NULL OR ts >= ?1)
       AND (
@@ -488,7 +508,8 @@ pub(crate) const USAGE_LOG_FILTER_WHERE: &str = r#"
           ?4 IS NULL
           OR (?4 = 'success' AND status IN ('ok', 'stream_started'))
           OR (?4 = 'running' AND status = 'running')
-          OR (?4 = 'failed' AND status NOT IN ('ok', 'stream_started', 'running'))
+          OR (?4 = 'aborted' AND status = 'aborted')
+          OR (?4 = 'failed' AND status NOT IN ('ok', 'stream_started', 'running', 'aborted'))
       )
 "#;
 
@@ -589,7 +610,8 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
             error TEXT NOT NULL DEFAULT '',
             token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown',
             api_key_id TEXT NOT NULL DEFAULT '',
-            api_key_name TEXT NOT NULL DEFAULT ''
+            api_key_name TEXT NOT NULL DEFAULT '',
+            request_id TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts ON usage_logs(ts);
         CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(status);
@@ -602,6 +624,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "api_key_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "request_id", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 

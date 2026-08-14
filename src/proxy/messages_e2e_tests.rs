@@ -11,10 +11,11 @@
 //   - 只选 anthropic 渠道，跳过同模型的 openai 诱饵渠道
 //   - count_tokens 直通
 //   - 鉴权失败时返回 Anthropic 错误形状
+//   - 客户端中途断开：上游连接立刻释放，日志记「已取消」而不是成功
 
 use super::*;
 use axum::extract::Request;
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 
 // 上游观测到的请求，供断言
 #[derive(Clone, Default)]
@@ -158,6 +159,65 @@ async fn mock_decoy_upstream(seen: SeenLog) -> u16 {
 
 static USAGE_DB_SEQ: AtomicU16 = AtomicU16::new(0);
 
+// 「卡住的」Anthropic 上游：先吐出前几个事件（含一个真实 text_delta，
+// 这样 SSE 首帧探测才会放行、响应头才会发出去），之后一直挂着不结束，
+// 模拟推理模型长时间不吐字的窗口。
+//
+// released 是这个测试的关键探针：RouteHub 只要还在读这条连接，接收端就活着；
+// 客户端断开后 RouteHub 必须主动放开上游（drop 掉 reqwest 响应体），
+// 上游侧的 `tx.closed()` 才会醒过来。若少了取消信号，这里会一直等到 30s 超时。
+async fn mock_hanging_anthropic_upstream(released: Arc<AtomicBool>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move || {
+            let released = Arc::clone(&released);
+            async move {
+                let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+                tokio::spawn(async move {
+                    let events = [
+                        json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": "msg_hang",
+                                "model": "claude-mock",
+                                "usage": {"input_tokens": 5, "output_tokens": 0}
+                            }
+                        }),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
+                    ];
+                    for event in events {
+                        let name = event.get("type").and_then(Value::as_str).unwrap_or("");
+                        let frame = format!("event: {name}\ndata: {event}\n\n");
+                        if tx.send(Ok(Bytes::from(frame))).await.is_err() {
+                            released.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    // 然后就不说话了：这段窗口里唯一能结束上游生成的就是客户端断开
+                    tokio::select! {
+                        _ = tx.closed() => released.store(true, Ordering::SeqCst),
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(ReceiverStream::new(rx)))
+                    .unwrap()
+            }
+        }),
+    );
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    port
+}
+
 // 起一个真实的 RouteHub 服务，返回 (base_url, shutdown)
 //
 // decoy_port 指向一个**同样可用**的 mock：诱饵渠道声明了同一个模型且优先级更高，
@@ -275,6 +335,17 @@ async fn wait_for_usage_row(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("等待用量日志超时");
+}
+
+// 最新一行日志的 request_id，用来和响应头 x-request-id 对齐
+fn last_log_request_id(db_path: &std::path::Path) -> String {
+    let conn = open_usage_log_connection(db_path.to_path_buf()).unwrap();
+    conn.query_row(
+        "SELECT request_id FROM usage_logs ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -452,6 +523,80 @@ async fn inbound_count_tokens_passes_through() {
     assert_eq!(resp.status(), 200);
     let value: Value = resp.json().await.unwrap();
     assert_eq!(value["input_tokens"], 42);
+    assert!(decoy_seen.lock().is_empty());
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+// 客户端流到一半退出（Ctrl-C / 关窗口）：
+//   1. 上游连接必须立刻释放，否则上游继续生成、账号额度照扣；
+//   2. 这一行日志必须是「已取消」，不能算成功回答——否则统计和熔断都被污染。
+#[tokio::test]
+async fn inbound_messages_client_abort_cancels_upstream_and_logs_aborted() {
+    let decoy_seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(AtomicBool::new(false));
+    let upstream_port = mock_hanging_anthropic_upstream(Arc::clone(&released)).await;
+    let decoy_port = mock_decoy_upstream(Arc::clone(&decoy_seen)).await;
+    let (base, _shutdown, db_path) = start_routehub(upstream_port, decoy_port).await;
+
+    let mut resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("x-api-key", "sk-routehub-e2e")
+        .json(&json!({
+            "model": "claude-mock",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    // 响应头带回 request_id，客户端侧日志可以和代理这边对上
+    let request_id = resp
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .expect("响应应回写 x-request-id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        request_id.starts_with("req_"),
+        "意外的 request_id: {request_id}"
+    );
+
+    // 先确认流真的开起来了（拿到第一个事件），再模拟客户端退出
+    let mut started_streaming = false;
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        if String::from_utf8_lossy(&chunk).contains("message_start") {
+            started_streaming = true;
+            break;
+        }
+    }
+    assert!(started_streaming, "没有收到上游的第一个事件");
+    assert!(!released.load(Ordering::SeqCst));
+    drop(resp);
+
+    // 上游那边的接收端被 drop 说明代理已经放手；没有取消信号的话
+    // 这里要等到 mock 自己 30s 超时，轮询窗口内必然失败
+    let mut upstream_released = false;
+    for _ in 0..100 {
+        if released.load(Ordering::SeqCst) {
+            upstream_released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(upstream_released, "客户端断开后上游连接没有被及时释放");
+
+    let (api, status, channel, error, ..) = wait_for_usage_row(&db_path).await;
+    assert_eq!(api, "messages");
+    assert_eq!(status, "aborted", "客户端中断被记成了 {status}");
+    assert_eq!(channel, "mock-anthropic");
+    assert_eq!(error, STREAM_ABORTED_MESSAGE);
+    // 同一次请求：响应头和日志行用的是同一个 id
+    assert_eq!(last_log_request_id(&db_path), request_id);
     assert!(decoy_seen.lock().is_empty());
 
     let _ = std::fs::remove_file(db_path);

@@ -13,6 +13,7 @@ mod google_ai;
 mod macos_tray;
 mod oauth_login;
 mod proxy;
+mod request_ctx;
 mod responses_api;
 mod web;
 

@@ -205,7 +205,8 @@ pub fn auth_accounts_section(
                         {
                             refresh_all_accounts(config, state, message, &active_type);
                         }
-                        if active_type == "grok" && soft_button(ui, "全部刷新额度").clicked() {
+                        if active_type == "grok" && soft_button(ui, "全部刷新额度").clicked()
+                        {
                             grok::check_all(config, state, message);
                         }
                         if soft_button(ui, "导入账号").clicked() {
@@ -522,8 +523,10 @@ fn account_card(
                 };
                 if is_grok && soft_button(ui, check_label).clicked() && !view.refreshing {
                     grok::queue_single(account, state, proxy_url.clone());
-                    *message =
-                        AppMessage::new(format!("正在刷新额度: {}", account.name), MessageKind::Info);
+                    *message = AppMessage::new(
+                        format!("正在刷新额度: {}", account.name),
+                        MessageKind::Info,
+                    );
                 }
                 if confirm_delete_button(ui, ("auth_account_delete", account.id.as_str()), "删除")
                 {

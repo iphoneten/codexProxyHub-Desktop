@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use std::{collections::HashMap, io, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEFAULT_MAX_TOKENS: i64 = 4096;
@@ -498,10 +499,15 @@ fn extract_anthropic_usage(body: &Value) -> (i64, i64) {
 
 /// 把上游 Anthropic 流式响应转换成 OpenAI chat.completion.chunk 流。
 /// 返回：客户端字节流 + 最终 usage oneshot。
+///
+/// `cancel` 是本次请求的取消信号（客户端断开或代理关停）。翻译跑在 detached
+/// task 里，handler 早就返回了，只有这个信号能把它叫停；否则上游会继续生成、
+/// 继续扣账号额度，而结果没人接收。
 pub fn spawn_stream_translator<S>(
     stream: S,
     request_model: String,
     started: Instant,
+    cancel: CancellationToken,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
@@ -518,11 +524,25 @@ where
         let mut first_token_ms = None;
         // 首个 chunk 先发 role=assistant，OpenAI 客户端惯例
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
-            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
+            let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
             return;
         }
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
+                    return;
+                }
+                _ = tx.closed() => {
+                    let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
+                    return;
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -569,7 +589,7 @@ where
                             }
                             if send_json_chunk(&tx, &out).await.is_err() {
                                 let _ =
-                                    u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
+                                    u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
                                 return;
                             }
                         }
@@ -969,8 +989,12 @@ mod tests {
         });
         let bytes = Bytes::from(format!("data: {event}\n\n"));
         let input = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
-        let (_usage_rx, mut stream) =
-            spawn_stream_translator(input, "claude-test".to_string(), Instant::now());
+        let (_usage_rx, mut stream) = spawn_stream_translator(
+            input,
+            "claude-test".to_string(),
+            Instant::now(),
+            CancellationToken::new(),
+        );
         let mut out = String::new();
 
         while let Some(chunk) = stream.next().await {

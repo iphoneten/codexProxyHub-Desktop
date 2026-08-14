@@ -54,7 +54,8 @@ impl LogRange {
 
 /// 日志状态筛选。用的是表格「状态」列展示的口径（见 `status_text`），
 /// 不是数据库里的原始值：成功对应 `ok` / `stream_started`，运行中对应 `running`，
-/// 失败是其余一切（`error` 以及任何非预期值），确保没有行会从所有筛选里漏掉。
+/// 已取消对应 `aborted`（客户端提前断开），失败是其余一切（`error` 以及任何
+/// 非预期值），确保没有行会从所有筛选里漏掉。
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum LogStatusFilter {
     #[default]
@@ -62,14 +63,16 @@ enum LogStatusFilter {
     Success,
     Failed,
     Running,
+    Aborted,
 }
 
 impl LogStatusFilter {
-    const OPTIONS: [(Self, &'static str); 4] = [
+    const OPTIONS: [(Self, &'static str); 5] = [
         (Self::All, "全部状态"),
         (Self::Success, "成功"),
         (Self::Failed, "失败"),
         (Self::Running, "运行中"),
+        (Self::Aborted, "已取消"),
     ];
 
     fn label(self) -> &'static str {
@@ -88,6 +91,7 @@ impl LogStatusFilter {
             Self::Success => Some("success"),
             Self::Failed => Some("failed"),
             Self::Running => Some("running"),
+            Self::Aborted => Some("aborted"),
         }
     }
 }
@@ -752,6 +756,9 @@ fn status_text(status: &str) -> egui::RichText {
         ("运行中", accent())
     } else if status == "ok" || status == "stream_started" {
         ("成功", good())
+    } else if status == "aborted" {
+        // 客户端自己走了，不是故障，别用报错的红色
+        ("已取消", muteds())
     } else if status == "-" || status == "raw" {
         (status, muteds())
     } else {

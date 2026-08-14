@@ -6,16 +6,17 @@ pub(super) fn chat_stream_to_responses(
     custom_tool_names: HashSet<String>,
     started: Instant,
     strip_thought: bool,
+    cancel: CancellationToken,
 ) -> Result<ProviderResult, ProxyError> {
     let stream = resp
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
     let stream: ProxyByteStream = if strip_thought {
-        Box::pin(strip_thought_from_chat_sse_stream(stream))
+        Box::pin(strip_thought_from_chat_sse_stream(stream, cancel.clone()))
     } else {
         Box::pin(stream)
     };
-    chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started)
+    chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started, cancel)
 }
 
 pub(super) async fn prepare_anthropic_stream(
@@ -25,6 +26,7 @@ pub(super) async fn prepare_anthropic_stream(
     stream_idle_timeout: u64,
     stream_max_duration: u64,
     started: Instant,
+    cancel: CancellationToken,
 ) -> Result<
     (
         oneshot::Receiver<StreamOutcome>,
@@ -47,6 +49,7 @@ pub(super) async fn prepare_anthropic_stream(
         stream,
         request_model,
         started,
+        cancel,
     ))
 }
 
@@ -380,6 +383,7 @@ pub(super) fn chat_sse_stream_to_responses<S>(
     request_model: String,
     custom_tool_names: HashSet<String>,
     started: Instant,
+    cancel: CancellationToken,
 ) -> Result<ProviderResult, ProxyError>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -404,11 +408,7 @@ where
         macro_rules! push_evt {
             ($ev:expr, $data:expr) => {{
                 if send_response_sse(&tx, $ev, $data).await.is_err() {
-                    let _ = u_tx.send(StreamOutcome::failed(
-                        usage,
-                        first_token_ms,
-                        "client disconnected",
-                    ));
+                    let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                     return;
                 }
             }};
@@ -473,11 +473,11 @@ where
         loop {
             let chunk = tokio::select! {
                 _ = tx.closed() => {
-                    let _ = u_tx.send(StreamOutcome::failed(
-                        usage,
-                        first_token_ms,
-                        "client disconnected",
-                    ));
+                    let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
+                    return;
+                }
+                _ = cancel.cancelled() => {
+                    let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                     return;
                 }
                 chunk = stream.next() => chunk,
@@ -506,11 +506,7 @@ where
                             .await
                             .is_err()
                             {
-                                let _ = u_tx.send(StreamOutcome::failed(
-                                    usage,
-                                    first_token_ms,
-                                    "client disconnected",
-                                ));
+                                let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                                 return;
                             }
                             let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
@@ -629,11 +625,7 @@ where
                             .await
                             .is_err()
                             {
-                                let _ = u_tx.send(StreamOutcome::failed(
-                                    usage,
-                                    first_token_ms,
-                                    "client disconnected",
-                                ));
+                                let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                                 return;
                             }
                             let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
@@ -675,11 +667,7 @@ where
         .await
         .is_err()
         {
-            let _ = u_tx.send(StreamOutcome::failed(
-                usage,
-                first_token_ms,
-                "client disconnected",
-            ));
+            let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
         } else {
             let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
         }
@@ -1056,6 +1044,7 @@ pub(super) fn strip_thought_from_content_value(value: &mut Value) {
 
 pub(super) fn strip_thought_from_chat_sse_stream<S>(
     stream: S,
+    cancel: CancellationToken,
 ) -> impl Stream<Item = Result<Bytes, io::Error>>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -1065,7 +1054,17 @@ where
         let mut stream = Box::pin(stream);
         let mut buffer = String::new();
         let mut stripper = ThoughtStripper::default();
-        while let Some(item) = stream.next().await {
+        loop {
+            // 这一层只是改写 SSE，本身不产 usage；被取消就直接收工，
+            // 顺带 drop 掉上游 stream，让链路上游那一段也跟着结束。
+            let item = tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tx.closed() => return,
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -1366,6 +1365,7 @@ pub(super) fn stream_with_usage_probe<S>(
     kind: SseProbeKind,
     started: Instant,
     raw_capture: Option<RawSseCapture>,
+    cancel: CancellationToken,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
@@ -1388,7 +1388,16 @@ where
             .map(|capture| VecDeque::with_capacity(capture.max_events));
         let mut finish_note = "stream ended".to_string();
         'upstream: loop {
-            let chunk = stream.next().await;
+            // 只等 stream.next() 的话，客户端断开要等到上游下一个 chunk 才会被发现；
+            // 推理模型可能几十秒不吐字，这期间上游一直在生成、账号额度照扣。
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => {
+                    client_disconnected = true;
+                    finish_note = "client disconnected".to_string();
+                    break;
+                }
+                chunk = stream.next() => chunk,
+            };
             let Some(chunk) = chunk else {
                 finish_note = "upstream closed".to_string();
                 break;
@@ -1444,10 +1453,14 @@ where
         }
         let outcome = if let Some(error) = stream_error {
             StreamOutcome::failed(usage, first_token_ms, error)
-        } else if !completed && !client_disconnected {
-            StreamOutcome::failed(usage, first_token_ms, "上游流在完成事件前断开")
-        } else {
+        } else if completed {
+            // 上游已经把完成事件发出来了，最后一帧没送到客户端也算这次生成成功
             StreamOutcome::success(usage, first_token_ms)
+        } else if client_disconnected {
+            // 没跑完但责任在客户端：既不是成功回答，也不是上游故障
+            StreamOutcome::aborted(usage, first_token_ms)
+        } else {
+            StreamOutcome::failed(usage, first_token_ms, "上游流在完成事件前断开")
         };
         if let (Some(capture), Some(events)) = (raw_capture, raw_events) {
             write_raw_sse_capture(&capture, kind, &finish_note, usage, first_token_ms, &events);

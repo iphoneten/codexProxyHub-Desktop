@@ -43,6 +43,7 @@ fn test_state() -> AppState {
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
         oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        root_cancel: CancellationToken::new(),
     }
 }
 
@@ -321,7 +322,10 @@ async fn strip_thought_handles_stream_tags_across_chunks() {
         Ok::<Bytes, io::Error>(Bytes::from(format!("{first}\n\n"))),
         Ok::<Bytes, io::Error>(Bytes::from(format!("{second}\n\n{done}\n\n"))),
     ]);
-    let mut stream = Box::pin(strip_thought_from_chat_sse_stream(stream));
+    let mut stream = Box::pin(strip_thought_from_chat_sse_stream(
+        stream,
+        CancellationToken::new(),
+    ));
     let mut out = String::new();
     while let Some(chunk) = stream.next().await {
         out.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
@@ -1118,6 +1122,7 @@ async fn chat_stream_restores_custom_tool_calls() {
         "claude-test".to_string(),
         custom_tools,
         Instant::now(),
+        CancellationToken::new(),
     )
     .unwrap();
     let body = to_bytes(result.response.into_body(), 1024 * 1024)
@@ -1146,6 +1151,7 @@ async fn chat_stream_error_becomes_response_failed() {
         "claude-test".to_string(),
         HashSet::new(),
         Instant::now(),
+        CancellationToken::new(),
     )
     .unwrap();
     let body = to_bytes(result.response.into_body(), 1024 * 1024)
@@ -1175,6 +1181,7 @@ async fn chat_stream_to_responses_reports_error_outcome() {
         "claude-test".to_string(),
         HashSet::new(),
         Instant::now(),
+        CancellationToken::new(),
     )
     .unwrap();
     let rx = result.usage_rx.unwrap();
@@ -1192,7 +1199,7 @@ async fn chat_stream_to_responses_reports_error_outcome() {
 
 #[tokio::test]
 async fn chat_stream_to_responses_stops_when_client_disconnects() {
-    // 客户端断开后,spawned 任务应立即结束并汇报 disconnected,
+    // 客户端断开后,spawned 任务应立即结束并汇报「已取消」,
     // 避免持续消费上游 token 与占用熔断 inflight 计数。
     let mut payload = String::new();
     for i in 0..64 {
@@ -1207,6 +1214,7 @@ async fn chat_stream_to_responses_stops_when_client_disconnects() {
         "gpt-test".to_string(),
         HashSet::new(),
         Instant::now(),
+        CancellationToken::new(),
     )
     .unwrap();
     let rx = result.usage_rx.unwrap();
@@ -1217,11 +1225,9 @@ async fn chat_stream_to_responses_stops_when_client_disconnects() {
         .await
         .expect("usage_rx should resolve quickly after client disconnect")
         .expect("usage_rx not closed");
-    assert!(outcome
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("client disconnected"));
+    // 责任在客户端,不算上游故障:记 aborted 而不是 error
+    assert!(outcome.aborted);
+    assert_eq!(outcome.error.as_deref(), Some(STREAM_ABORTED_MESSAGE));
 }
 
 #[tokio::test]
@@ -1233,6 +1239,7 @@ async fn chat_stream_to_responses_stops_when_client_disconnects_before_upstream_
         "gpt-test".to_string(),
         HashSet::new(),
         Instant::now(),
+        CancellationToken::new(),
     )
     .unwrap();
     let rx = result.usage_rx.unwrap();
@@ -1242,11 +1249,35 @@ async fn chat_stream_to_responses_stops_when_client_disconnects_before_upstream_
         .await
         .expect("usage_rx should resolve without waiting for another upstream chunk")
         .expect("usage_rx not closed");
-    assert!(outcome
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("client disconnected"));
+    assert!(outcome.aborted);
+    assert_eq!(outcome.error.as_deref(), Some(STREAM_ABORTED_MESSAGE));
+}
+
+#[tokio::test]
+async fn chat_stream_to_responses_stops_when_context_is_cancelled() {
+    // 客户端还挂着（response body 没被丢），但请求上下文被取消：
+    // 代理关停或上层主动取消也必须能立刻叫停这个 detached 任务。
+    let stream = futures_util::stream::pending::<Result<Bytes, io::Error>>();
+    let cancel = CancellationToken::new();
+
+    let result = chat_sse_stream_to_responses(
+        stream,
+        "gpt-test".to_string(),
+        HashSet::new(),
+        Instant::now(),
+        cancel.clone(),
+    )
+    .unwrap();
+    let rx = result.usage_rx.unwrap();
+    // 故意不 drop response：唯一的结束信号只有取消
+    cancel.cancel();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+        .await
+        .expect("取消后应立即收到结果，而不是等上游下一个 chunk")
+        .expect("usage_rx not closed");
+    assert!(outcome.aborted);
+    drop(result.response);
 }
 
 #[tokio::test]
@@ -1276,8 +1307,13 @@ async fn stream_usage_probe_reports_unfinished_stream_as_error() {
     let bytes = Bytes::from(format!("data: {chunk}\n\n"));
     let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Chat,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     while let Some(chunk) = body_stream.next().await {
         chunk.unwrap();
     }
@@ -1296,8 +1332,13 @@ async fn stream_usage_probe_records_first_token_and_total_usage() {
     ));
     let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Chat,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     while let Some(chunk) = body_stream.next().await {
         chunk.unwrap();
     }
@@ -1321,8 +1362,13 @@ async fn responses_stream_usage_probe_counts_completed_event_usage() {
     let bytes = Bytes::from(format!("data: {first}\n\ndata: {completed}\n\n"));
     let stream = futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]);
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Responses,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     while let Some(chunk) = body_stream.next().await {
         chunk.unwrap();
     }
@@ -1343,8 +1389,13 @@ async fn responses_stream_closes_after_completed_event_even_if_upstream_stays_op
     let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) })
         .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Responses,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     assert!(body_stream.next().await.is_some());
     let ended = tokio::time::timeout(Duration::from_millis(100), body_stream.next())
         .await
@@ -1408,8 +1459,13 @@ async fn responses_stream_does_not_synthesize_completed_from_output_item_done_ta
         ));
     let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) });
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Responses,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     let mut body = String::new();
     while let Some(chunk) = body_stream.next().await {
         body.push_str(&String::from_utf8(chunk.unwrap().to_vec()).unwrap());
@@ -1490,8 +1546,13 @@ async fn responses_stream_waits_for_native_completed_after_commentary_tool_call(
         .chain(delayed_completed)
         .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Responses, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Responses,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     let mut body = String::new();
     while let Some(chunk) = tokio::time::timeout(Duration::from_secs(1), body_stream.next())
         .await
@@ -1524,8 +1585,13 @@ async fn stream_watchdog_reports_max_duration_after_first_output() {
     );
     let stream = apply_stream_watchdog(stream, 0, 1, "test");
 
-    let (rx, mut body_stream) =
-        stream_with_usage_probe(stream, SseProbeKind::Chat, Instant::now(), None);
+    let (rx, mut body_stream) = stream_with_usage_probe(
+        stream,
+        SseProbeKind::Chat,
+        Instant::now(),
+        None,
+        CancellationToken::new(),
+    );
     while let Some(chunk) = body_stream.next().await {
         let _ = chunk;
     }

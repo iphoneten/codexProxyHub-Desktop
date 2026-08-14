@@ -7,6 +7,7 @@ pub(super) async fn forward_responses_as_chat(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let chat_body = responses_to_chat_body(&body)?;
     let custom_tool_names = responses_custom_tool_names(body.get("tools"));
@@ -24,6 +25,7 @@ pub(super) async fn forward_responses_as_chat(
             request_model,
             custom_tool_names,
             started,
+            ctx,
         )
         .await;
     }
@@ -38,6 +40,7 @@ pub(super) async fn forward_responses_as_chat(
                 chat_body,
                 false,
                 started,
+                ctx,
             )
             .await?;
             response_json(result.response).await?
@@ -93,6 +96,7 @@ pub(super) async fn response_json(response: Response) -> Result<Value, ProxyErro
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_chat_stream_as_responses(
     state: &AppState,
     provider: &ProviderConfig,
@@ -101,6 +105,7 @@ pub(super) async fn send_chat_stream_as_responses(
     request_model: String,
     custom_tool_names: HashSet<String>,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     if is_google_native_provider(provider) {
         let result = send_to_provider(
@@ -111,6 +116,7 @@ pub(super) async fn send_chat_stream_as_responses(
             body,
             true,
             started,
+            ctx,
         )
         .await?;
         let stream = result
@@ -118,7 +124,13 @@ pub(super) async fn send_chat_stream_as_responses(
             .into_body()
             .into_data_stream()
             .map(|item| item.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
-        return chat_sse_stream_to_responses(stream, request_model, custom_tool_names, started);
+        return chat_sse_stream_to_responses(
+            stream,
+            request_model,
+            custom_tool_names,
+            started,
+            ctx.cancel_token(),
+        );
     }
     if provider.provider_type == "anthropic" {
         let client = state.client_for_provider(provider);
@@ -130,6 +142,7 @@ pub(super) async fn send_chat_stream_as_responses(
             request_model,
             custom_tool_names,
             started,
+            ctx,
         )
         .await;
     }
@@ -163,6 +176,7 @@ pub(super) async fn send_chat_stream_as_responses(
                     custom_tool_names,
                     started,
                     provider.strip_thought,
+                    ctx.cancel_token(),
                 );
             }
             Ok(resp) => {
@@ -197,6 +211,7 @@ pub(super) async fn send_chat_stream_as_responses(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_anthropic_chat_stream_as_responses(
     client: &Client,
     provider: &ProviderConfig,
@@ -205,6 +220,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
     request_model: String,
     custom_tool_names: HashSet<String>,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let mut anthropic_body = crate::anthropic::openai_to_anthropic_request(&body)
         .map_err(|err| ProxyError::new(StatusCode::BAD_REQUEST, format!("协议翻译失败: {err}")))?;
@@ -234,6 +250,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
                     provider.stream_idle_timeout,
                     provider.stream_max_duration,
                     started,
+                    ctx.cancel_token(),
                 )
                 .await
                 {
@@ -249,6 +266,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
                     request_model,
                     custom_tool_names,
                     started,
+                    ctx.cancel_token(),
                 )?;
                 result.usage_rx = Some(anthropic_usage_rx);
                 return Ok(result);
@@ -280,6 +298,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_to_provider(
     state: &AppState,
     provider: &ProviderConfig,
@@ -288,6 +307,7 @@ pub(super) async fn send_to_provider(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let client = state.client_for_provider(provider);
     // Google AI Studio 原生渠道：OpenAI chat 请求翻译到 GenerateContent。
@@ -300,6 +320,7 @@ pub(super) async fn send_to_provider(
             body,
             stream,
             started,
+            ctx,
         )
         .await;
     }
@@ -312,6 +333,7 @@ pub(super) async fn send_to_provider(
             body,
             stream,
             started,
+            ctx,
         )
         .await;
     }
@@ -326,6 +348,7 @@ pub(super) async fn send_to_provider(
             body,
             stream,
             started,
+            ctx,
         )
         .await;
     }
@@ -391,10 +414,14 @@ pub(super) async fn send_to_provider(
                         probe_kind,
                         started,
                         state.raw_sse_capture_for(provider),
+                        ctx.cancel_token(),
                     );
                     let body_stream: ProxyByteStream =
                         if provider.strip_thought && path == "/chat/completions" {
-                            Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                            Box::pin(strip_thought_from_chat_sse_stream(
+                                body_stream,
+                                ctx.cancel_token(),
+                            ))
                         } else {
                             Box::pin(body_stream)
                         };
@@ -482,6 +509,7 @@ pub(super) async fn send_anthropic_messages_passthrough(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = body
         .get("model")
@@ -534,8 +562,13 @@ pub(super) async fn send_anthropic_messages_passthrough(
                         Err(err) => return Err(err),
                     };
                     // 原样透传字节流，只旁路解析 usage / 完成事件 / 流内错误
-                    let (usage_rx, body_stream) =
-                        stream_with_usage_probe(upstream, SseProbeKind::Anthropic, started, None);
+                    let (usage_rx, body_stream) = stream_with_usage_probe(
+                        upstream,
+                        SseProbeKind::Anthropic,
+                        started,
+                        None,
+                        ctx.cancel_token(),
+                    );
                     let mut response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -604,6 +637,7 @@ pub(super) async fn send_to_anthropic_provider(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = body
         .get("model")
@@ -651,6 +685,7 @@ pub(super) async fn send_to_anthropic_provider(
                         provider.stream_idle_timeout,
                         provider.stream_max_duration,
                         started,
+                        ctx.cancel_token(),
                     )
                     .await
                     {
@@ -662,7 +697,10 @@ pub(super) async fn send_to_anthropic_provider(
                         Err(err) => return Err(err),
                     };
                     let body_stream: ProxyByteStream = if provider.strip_thought {
-                        Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                        Box::pin(strip_thought_from_chat_sse_stream(
+                            body_stream,
+                            ctx.cancel_token(),
+                        ))
                     } else {
                         Box::pin(body_stream)
                     };
@@ -742,6 +780,7 @@ pub(super) async fn send_to_google_ai_provider(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = body
         .get("model")
@@ -783,9 +822,13 @@ pub(super) async fn send_to_google_ai_provider(
                         resp.bytes_stream(),
                         request_model.clone(),
                         started,
+                        ctx.cancel_token(),
                     );
                     let body_stream: ProxyByteStream = if provider.strip_thought {
-                        Box::pin(strip_thought_from_chat_sse_stream(body_stream))
+                        Box::pin(strip_thought_from_chat_sse_stream(
+                            body_stream,
+                            ctx.cancel_token(),
+                        ))
                     } else {
                         Box::pin(body_stream)
                     };
@@ -862,6 +905,7 @@ pub(super) async fn send_responses_stream_as_chat(
     request_headers: &HeaderMap,
     responses_body: Value,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let request_model = responses_body
         .get("model")
@@ -909,6 +953,7 @@ pub(super) async fn send_responses_stream_as_chat(
                         stream,
                         request_model.clone(),
                         started,
+                        ctx.cancel_token(),
                     );
                 let response = Response::builder()
                     .status(status)
@@ -957,6 +1002,7 @@ pub(super) async fn send_chat_via_responses(
     body: Value,
     stream: bool,
     started: Instant,
+    ctx: &RequestContext,
 ) -> Result<ProviderResult, ProxyError> {
     let client = state.client_for_provider(provider);
     let request_model = body
@@ -981,6 +1027,7 @@ pub(super) async fn send_chat_via_responses(
             request_headers,
             responses_body,
             started,
+            ctx,
         )
         .await;
     }

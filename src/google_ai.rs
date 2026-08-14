@@ -11,6 +11,7 @@ use serde_json::{json, Map, Value};
 use std::{io, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub fn generate_content_path(model: &str, stream: bool) -> String {
@@ -155,10 +156,13 @@ pub fn google_to_openai_response(body: Value, request_model: &str) -> Value {
     })
 }
 
+/// `cancel`：本次请求的取消信号。翻译任务是 detached 的，客户端断开只会让
+/// 下游 channel 关掉，不加这个信号就得等上游下一个 chunk 才能发现。
 pub fn spawn_stream_translator<S>(
     stream: S,
     request_model: String,
     started: Instant,
+    cancel: CancellationToken,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     impl Stream<Item = Result<Bytes, io::Error>>,
@@ -175,7 +179,22 @@ where
         let mut first_token_ms = None;
         let mut sent_role = false;
         let mut error = None;
-        while let Some(item) = stream.next().await {
+        let mut aborted = false;
+        loop {
+            let item = tokio::select! {
+                _ = cancel.cancelled() => {
+                    aborted = true;
+                    break;
+                }
+                _ = tx.closed() => {
+                    aborted = true;
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -203,7 +222,7 @@ where
                             }
                             if send_sse(&tx, &chunk).await.is_err() {
                                 let _ =
-                                    usage_tx.send(StreamOutcome::success(usage, first_token_ms));
+                                    usage_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                                 return;
                             }
                         }
@@ -218,12 +237,13 @@ where
                 break;
             }
         }
-        if error.is_none() {
+        if error.is_none() && !aborted {
             let done = Bytes::from_static(b"data: [DONE]\n\n");
             let _ = tx.send(Ok(done)).await;
         }
         let outcome = match error {
             Some(error) => StreamOutcome::failed(usage, first_token_ms, error),
+            None if aborted => StreamOutcome::aborted(usage, first_token_ms),
             None => StreamOutcome::success(usage, first_token_ms),
         };
         let _ = usage_tx.send(outcome);

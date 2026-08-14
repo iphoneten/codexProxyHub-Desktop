@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 // ============================== 请求翻译 ==============================
@@ -508,6 +509,7 @@ pub fn spawn_responses_stream_translator(
     resp: reqwest::Response,
     request_model: String,
     started: Instant,
+    cancel: CancellationToken,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
@@ -515,13 +517,16 @@ pub fn spawn_responses_stream_translator(
     let stream = resp
         .bytes_stream()
         .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
-    spawn_responses_stream_translator_from_stream(stream, request_model, started)
+    spawn_responses_stream_translator_from_stream(stream, request_model, started, cancel)
 }
 
+/// `cancel`：本次请求的取消信号。detached 翻译任务只能靠它感知
+/// 「客户端已经不要这条流了」，否则会一直等上游下一个事件。
 pub fn spawn_responses_stream_translator_from_stream<S>(
     stream: S,
     request_model: String,
     started: Instant,
+    cancel: CancellationToken,
 ) -> (
     oneshot::Receiver<StreamOutcome>,
     ReceiverStream<Result<Bytes, io::Error>>,
@@ -537,11 +542,25 @@ where
         let mut stream = Box::pin(stream);
         let mut first_token_ms = None;
         if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
-            let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
+            let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
             return;
         }
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
+                    return;
+                }
+                _ = tx.closed() => {
+                    let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
+                    return;
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -555,7 +574,7 @@ where
                                 let terminal = state.build_terminal_chunk();
                                 if send_json_chunk(&tx, &terminal).await.is_err() {
                                     let _ = u_tx
-                                        .send(StreamOutcome::success(state.usage, first_token_ms));
+                                        .send(StreamOutcome::aborted(state.usage, first_token_ms));
                                     return;
                                 }
                             }
@@ -574,7 +593,7 @@ where
                             }
                             if send_json_chunk(&tx, &out).await.is_err() {
                                 let _ =
-                                    u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
+                                    u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
                                 return;
                             }
                         }
@@ -1277,6 +1296,7 @@ mod tests {
             stream,
             "gpt-test".to_string(),
             Instant::now(),
+            CancellationToken::new(),
         );
         let body = axum::body::Body::from_stream(body_stream);
         let text = String::from_utf8(to_bytes(body, 1024 * 1024).await.unwrap().to_vec()).unwrap();
@@ -1308,6 +1328,7 @@ mod tests {
             stream,
             "gpt-test".to_string(),
             Instant::now(),
+            CancellationToken::new(),
         );
         let body = axum::body::Body::from_stream(body_stream);
         let _ = to_bytes(body, 1024 * 1024).await.unwrap();
@@ -1337,6 +1358,7 @@ mod tests {
             stream,
             "gpt-test".to_string(),
             Instant::now(),
+            CancellationToken::new(),
         );
         let body = axum::body::Body::from_stream(body_stream);
         let body = tokio::time::timeout(Duration::from_millis(100), to_bytes(body, 1024 * 1024))
@@ -1367,6 +1389,7 @@ mod tests {
             stream,
             "gpt-test".to_string(),
             Instant::now(),
+            CancellationToken::new(),
         );
 
         let opening = tokio::time::timeout(Duration::from_millis(100), body_stream.next())

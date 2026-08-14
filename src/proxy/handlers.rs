@@ -59,6 +59,7 @@ pub(super) async fn get_model(
 
 pub(super) async fn chat_completions(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
@@ -70,6 +71,7 @@ pub(super) async fn chat_completions(
     enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
+        ctx,
         headers,
         body,
         "/chat/completions",
@@ -84,6 +86,7 @@ pub(super) async fn chat_completions(
 
 pub(super) async fn completions(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
@@ -95,6 +98,7 @@ pub(super) async fn completions(
     enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
+        ctx,
         headers,
         body,
         "/completions",
@@ -109,6 +113,7 @@ pub(super) async fn completions(
 
 pub(super) async fn embeddings(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
@@ -120,6 +125,7 @@ pub(super) async fn embeddings(
     enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
+        ctx,
         headers,
         body,
         "/embeddings",
@@ -139,10 +145,11 @@ pub(super) async fn embeddings(
 /// 否则 Anthropic SDK 解析不出错误信息，只会抛一个无上下文的异常。
 pub(super) async fn messages(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match messages_inner(state, headers, body).await {
+    match messages_inner(state, ctx, headers, body).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -150,6 +157,7 @@ pub(super) async fn messages(
 
 async fn messages_inner(
     state: AppState,
+    ctx: RequestContext,
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, ProxyError> {
@@ -161,6 +169,7 @@ async fn messages_inner(
     enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     forward_openai(
         state,
+        ctx,
         headers,
         body,
         "/messages",
@@ -268,6 +277,7 @@ pub(super) fn anthropic_error_response(err: ProxyError) -> Response {
 
 pub(super) async fn responses(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
@@ -321,6 +331,7 @@ pub(super) async fn responses(
             started,
             &api_key_id,
             &api_key_name,
+            ctx.request_id(),
         );
 
         // force_chat：判断本次 /responses 请求是否**从一开始就走 chat 翻译**。
@@ -343,6 +354,7 @@ pub(super) async fn responses(
                 upstream_body,
                 stream,
                 started,
+                &ctx,
             )
             .await
             {
@@ -362,6 +374,7 @@ pub(super) async fn responses(
                         permit.take(),
                         &api_key_id,
                         &api_key_name,
+                        &ctx,
                         Some(circuit_guard),
                     ));
                 }
@@ -377,6 +390,7 @@ pub(super) async fn responses(
                         &err.message,
                         &api_key_id,
                         &api_key_name,
+                        ctx.request_id(),
                     );
                     last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                 }
@@ -392,6 +406,7 @@ pub(super) async fn responses(
             upstream_body.clone(),
             stream,
             started,
+            &ctx,
         )
         .await
         {
@@ -411,6 +426,7 @@ pub(super) async fn responses(
                     permit.take(),
                     &api_key_id,
                     &api_key_name,
+                    &ctx,
                     Some(circuit_guard),
                 ));
             }
@@ -421,7 +437,7 @@ pub(super) async fn responses(
             {
                 let chat_body = upstream_body;
                 match forward_responses_as_chat(
-                    &state, &provider, &headers, chat_body, stream, started,
+                    &state, &provider, &headers, chat_body, stream, started, &ctx,
                 )
                 .await
                 {
@@ -441,6 +457,7 @@ pub(super) async fn responses(
                             permit.take(),
                             &api_key_id,
                             &api_key_name,
+                            &ctx,
                             Some(circuit_guard),
                         ));
                     }
@@ -456,6 +473,7 @@ pub(super) async fn responses(
                             &chat_err.message,
                             &api_key_id,
                             &api_key_name,
+                            ctx.request_id(),
                         );
                         last_error = Some(AttemptFailure::new(
                             &provider,
@@ -481,6 +499,7 @@ pub(super) async fn responses(
                         &failure.message,
                         &api_key_id,
                         &api_key_name,
+                        ctx.request_id(),
                     );
                     if !stream {
                         log_error(
@@ -493,6 +512,7 @@ pub(super) async fn responses(
                             &failure.message,
                             &api_key_id,
                             &api_key_name,
+                            ctx.request_id(),
                         );
                     }
                     return Err(ProxyError::new(failure.status, failure.message));
@@ -507,6 +527,7 @@ pub(super) async fn responses(
                     &failure.message,
                     &api_key_id,
                     &api_key_name,
+                    ctx.request_id(),
                 );
                 last_error = Some(failure);
             }
@@ -525,6 +546,7 @@ pub(super) async fn responses(
                 &failure.message,
                 &api_key_id,
                 &api_key_name,
+                ctx.request_id(),
             );
         }
         return Err(ProxyError::new(
@@ -723,6 +745,7 @@ mod tests {
 
 pub(super) async fn forward_openai(
     state: AppState,
+    ctx: RequestContext,
     headers: HeaderMap,
     body: Value,
     path: &'static str,
@@ -780,6 +803,7 @@ pub(super) async fn forward_openai(
             started,
             &api_key_id,
             &api_key_name,
+            ctx.request_id(),
         );
         // chat/completions 路径下预留一份 body 用于 responses fallback
         let fallback_body = if path == "/chat/completions" {
@@ -795,6 +819,7 @@ pub(super) async fn forward_openai(
             upstream_body,
             stream,
             started,
+            &ctx,
         )
         .await
         {
@@ -814,6 +839,7 @@ pub(super) async fn forward_openai(
                     permit.take(),
                     &api_key_id,
                     &api_key_name,
+                    &ctx,
                     Some(circuit_guard),
                 ));
             }
@@ -824,8 +850,10 @@ pub(super) async fn forward_openai(
                     err.status == StatusCode::NOT_FOUND
                         || err.status == StatusCode::METHOD_NOT_ALLOWED,
                 ) {
-                    match send_chat_via_responses(&state, &provider, &headers, fb, stream, started)
-                        .await
+                    match send_chat_via_responses(
+                        &state, &provider, &headers, fb, stream, started, &ctx,
+                    )
+                    .await
                     {
                         Ok(result) => {
                             return Ok(commit_result(
@@ -843,6 +871,7 @@ pub(super) async fn forward_openai(
                                 permit.take(),
                                 &api_key_id,
                                 &api_key_name,
+                                &ctx,
                                 Some(circuit_guard),
                             ));
                         }
@@ -858,6 +887,7 @@ pub(super) async fn forward_openai(
                                 &fb_err.message,
                                 &api_key_id,
                                 &api_key_name,
+                                ctx.request_id(),
                             );
                             last_error = Some(AttemptFailure::new(
                                 &provider,
@@ -884,6 +914,7 @@ pub(super) async fn forward_openai(
                         &failure.message,
                         &api_key_id,
                         &api_key_name,
+                        ctx.request_id(),
                     );
                     if !stream {
                         log_error(
@@ -896,6 +927,7 @@ pub(super) async fn forward_openai(
                             &failure.message,
                             &api_key_id,
                             &api_key_name,
+                            ctx.request_id(),
                         );
                     }
                     return Err(ProxyError::new(failure.status, failure.message));
@@ -910,6 +942,7 @@ pub(super) async fn forward_openai(
                     &failure.message,
                     &api_key_id,
                     &api_key_name,
+                    ctx.request_id(),
                 );
                 last_error = Some(failure);
             }
@@ -928,6 +961,7 @@ pub(super) async fn forward_openai(
                 &failure.message,
                 &api_key_id,
                 &api_key_name,
+                ctx.request_id(),
             );
         }
         return Err(ProxyError::new(
@@ -957,6 +991,7 @@ pub(super) fn commit_result(
     permit: Option<OwnedSemaphorePermit>,
     api_key_id: &str,
     api_key_name: &str,
+    ctx: &RequestContext,
     circuit_guard: Option<ProviderCircuitGuard>,
 ) -> Response {
     if let Some(rx) = result.usage_rx.take() {
@@ -970,6 +1005,7 @@ pub(super) fn commit_result(
                 started,
                 api_key_id,
                 api_key_name,
+                ctx.request_id(),
             )
         });
         let api = api.to_string();
@@ -980,13 +1016,43 @@ pub(super) fn commit_result(
         let affinity_key = affinity_key.to_string();
         let affinity_model = affinity_model.to_string();
         let upstream_model = result.upstream_model.clone();
+        let request_id = ctx.request_id().to_string();
         tokio::spawn(async move {
             let mut circuit_guard = circuit_guard;
             match rx.await {
+                // 客户端提前断开：上游已被我们主动取消，这既不是上游故障也不是成功回答。
+                // 单独记 aborted，熔断按成功放行（不是渠道的错），
+                // 会话粘性既不加强也不清除（这次没有得到任何关于渠道健康度的信息）。
+                Ok(outcome) if outcome.aborted => {
+                    if let Some(guard) = circuit_guard.take() {
+                        guard.mark_success();
+                    }
+                    finalize_stream_log(
+                        &cfg,
+                        log_id,
+                        started,
+                        UsageLogEvent {
+                            api: &api,
+                            api_key_id: &api_key_id,
+                            api_key_name: &api_key_name,
+                            provider: &provider,
+                            model: &model,
+                            upstream_model: &upstream_model,
+                            status: STREAM_ABORTED_STATUS,
+                            error: outcome.error.as_deref(),
+                            usage: outcome.usage,
+                            first_token_ms: outcome.first_token_ms,
+                            token_source: None,
+                            request_id: &request_id,
+                        },
+                    )
+                    .await
+                }
                 Ok(StreamOutcome {
                     usage: _,
                     first_token_ms,
                     error: Some(error),
+                    ..
                 }) => {
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_failure(StatusCode::BAD_GATEWAY, &error, None);
@@ -1008,6 +1074,7 @@ pub(super) fn commit_result(
                             usage: TokenUsage::default(),
                             first_token_ms,
                             token_source: None,
+                            request_id: &request_id,
                         },
                     )
                     .await
@@ -1016,6 +1083,7 @@ pub(super) fn commit_result(
                     usage,
                     first_token_ms,
                     error: None,
+                    ..
                 }) => {
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_success();
@@ -1037,6 +1105,7 @@ pub(super) fn commit_result(
                             usage,
                             first_token_ms,
                             token_source: None,
+                            request_id: &request_id,
                         },
                     )
                     .await
@@ -1066,6 +1135,7 @@ pub(super) fn commit_result(
                             usage: TokenUsage::default(),
                             first_token_ms: None,
                             token_source: None,
+                            request_id: &request_id,
                         },
                     )
                     .await
@@ -1089,6 +1159,7 @@ pub(super) fn commit_result(
             stream,
             api_key_id,
             api_key_name,
+            ctx.request_id(),
         );
     }
     if stream {

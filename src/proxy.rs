@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, ProviderConfig};
+use crate::request_ctx::RequestContext;
 use anyhow::{anyhow, Result};
 use axum::{
     body::{to_bytes, Body},
@@ -6,7 +7,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -28,6 +29,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -37,6 +39,7 @@ const MAX_ANTHROPIC_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 mod auth;
 mod handlers;
 mod oauth;
+mod request_layer;
 mod routing;
 mod streaming;
 mod upstream;
@@ -45,6 +48,7 @@ mod usage_log;
 use auth::*;
 use handlers::*;
 use oauth::*;
+use request_layer::*;
 use routing::*;
 use streaming::*;
 use upstream::*;
@@ -427,6 +431,9 @@ struct AppState {
     usage_injection: Arc<Mutex<HashMap<String, bool>>>,
     oauth_tokens: Arc<Mutex<HashMap<String, OAuthRuntimeToken>>>,
     oauth_refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    // server 级取消信号。每个请求的 ctx 都是它的子 token，
+    // 代理停止时一次取消就能叫停所有在飞的流式任务。
+    root_cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -662,6 +669,9 @@ pub(crate) struct StreamOutcome {
     pub(crate) usage: TokenUsage,
     pub(crate) first_token_ms: Option<i64>,
     pub(crate) error: Option<String>,
+    /// 客户端提前断开（或代理关停）导致的中断。
+    /// 与 `error` 的区别在于责任方不是上游：不该记成成功，也不该算渠道故障。
+    pub(crate) aborted: bool,
 }
 
 impl StreamOutcome {
@@ -670,6 +680,7 @@ impl StreamOutcome {
             usage,
             first_token_ms,
             error: None,
+            aborted: false,
         }
     }
 
@@ -682,9 +693,23 @@ impl StreamOutcome {
             usage,
             first_token_ms,
             error: Some(error.into()),
+            aborted: false,
+        }
+    }
+
+    /// 客户端断开/代理关停导致的中断，日志记为「已取消」。
+    pub(crate) fn aborted(usage: TokenUsage, first_token_ms: Option<i64>) -> Self {
+        Self {
+            usage,
+            first_token_ms,
+            error: Some(STREAM_ABORTED_MESSAGE.to_string()),
+            aborted: true,
         }
     }
 }
+
+pub(crate) const STREAM_ABORTED_MESSAGE: &str = "客户端提前断开，已取消上游生成";
+pub(crate) const STREAM_ABORTED_STATUS: &str = "aborted";
 
 struct ProviderResult {
     response: Response,
@@ -832,6 +857,7 @@ pub async fn run_server(
     let addr: SocketAddr = format!("{}:{}", bind_host, initial.server.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     recover_interrupted_usage_logs(initial.usage_log_sqlite_path());
+    let root_cancel = CancellationToken::new();
     let state = AppState {
         config: Arc::clone(&config),
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -844,6 +870,7 @@ pub async fn run_server(
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
         oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        root_cancel: root_cancel.clone(),
     };
     let mut app = Router::new()
         .route("/", get(index))
@@ -872,6 +899,12 @@ pub async fn run_server(
                 .allow_headers(Any),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // 注意顺序：这一层必须在 with_state 之前加，才能覆盖上面所有代理路由；
+        // 之后 nest 进来的 /user、/admin 是本地管理页面，不需要请求上下文。
+        .layer(axum::middleware::from_fn({
+            let root_cancel = state.root_cancel.clone();
+            move |req, next| attach_request_context(root_cancel.clone(), req, next)
+        }))
         .with_state(state);
     if initial.web.enabled {
         app = app
@@ -882,6 +915,10 @@ pub async fn run_server(
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown.await;
+            // 先取消在飞请求再让 graceful shutdown 收尾：
+            // 流式响应体不会自己结束，不取消的话 axum 会一直等着它们，
+            // 桌面端「停止」按钮看起来就像卡住了。
+            root_cancel.cancel();
         })
         .await;
     result?;
@@ -974,6 +1011,7 @@ mod state_tests {
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
             oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            root_cancel: CancellationToken::new(),
         }
     }
 

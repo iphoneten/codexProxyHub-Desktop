@@ -275,9 +275,7 @@ pub fn check_grok_accounts(
                 (
                     account_id,
                     GrokQuotaResult {
-                        check: GrokCheckResult::Unavailable(
-                            "Grok 授权检查线程异常".to_string(),
-                        ),
+                        check: GrokCheckResult::Unavailable("Grok 授权检查线程异常".to_string()),
                         billing: None,
                     },
                 )
@@ -420,12 +418,11 @@ fn parse_grok_billing(payload: &Value) -> Option<GrokBillingSummary> {
         Some(limit) if limit > 0.0 => used.min(limit),
         _ => used,
     });
-    let on_demand_used_cents = explicit_on_demand_used.or_else(|| {
-        match (used_cents, monthly_limit_cents) {
+    let on_demand_used_cents =
+        explicit_on_demand_used.or_else(|| match (used_cents, monthly_limit_cents) {
             (Some(used), Some(limit)) => Some((used - limit).max(0.0)),
             _ => None,
-        }
-    });
+        });
     let used_percent = match (monthly_limit_cents, included_used_cents) {
         (Some(limit), Some(used)) if limit > 0.0 => Some(used / limit * 100.0),
         _ => None,
