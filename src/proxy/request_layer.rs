@@ -5,6 +5,7 @@ use axum::middleware::Next;
 use tokio_util::sync::DropGuard;
 
 pub(super) const REQUEST_ID_HEADER: &str = "x-request-id";
+pub(super) const ROUTEHUB_REQUEST_ID_HEADER: &str = "x-routehub-request-id";
 
 /// 给每个请求挂上 [`RequestContext`]，并保证「没人要这条链路了」一定会变成取消信号。
 ///
@@ -31,7 +32,13 @@ pub(super) async fn attach_request_context(
 
     let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(ctx.request_id()) {
-        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+        response
+            .headers_mut()
+            .insert(ROUTEHUB_REQUEST_ID_HEADER, value.clone());
+        response
+            .headers_mut()
+            .entry(REQUEST_ID_HEADER)
+            .or_insert(value);
     }
     hold_guard_until_body_done(response, guard)
 }
@@ -93,6 +100,15 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/upstream-id",
+                get(|| async {
+                    Response::builder()
+                        .header(REQUEST_ID_HEADER, "upstream-request-id")
+                        .body(Body::from("ok"))
+                        .unwrap()
+                }),
+            )
             .layer(axum::middleware::from_fn(move |req, next| {
                 attach_request_context(root.clone(), req, next)
             }))
@@ -150,6 +166,23 @@ mod tests {
             resp.headers().get(REQUEST_ID_HEADER).unwrap(),
             HeaderValue::from_static("trace-abc")
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_request_id_is_preserved() {
+        let (base, _) = serve(CancellationToken::new()).await;
+        let resp = reqwest::get(format!("{base}/upstream-id")).await.unwrap();
+        assert_eq!(
+            resp.headers().get(REQUEST_ID_HEADER).unwrap(),
+            HeaderValue::from_static("upstream-request-id")
+        );
+        assert!(resp
+            .headers()
+            .get(ROUTEHUB_REQUEST_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("req_"));
     }
 
     #[tokio::test]

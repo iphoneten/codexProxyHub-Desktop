@@ -187,10 +187,11 @@ async fn messages_inner(
 /// 但仍然要过鉴权和模型白名单。
 pub(super) async fn count_tokens(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match count_tokens_inner(state, headers, body).await {
+    match count_tokens_inner(state, ctx, headers, body).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -198,6 +199,7 @@ pub(super) async fn count_tokens(
 
 async fn count_tokens_inner(
     state: AppState,
+    ctx: RequestContext,
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, ProxyError> {
@@ -225,6 +227,7 @@ async fn count_tokens_inner(
             "/messages/count_tokens",
             &headers,
             upstream_body,
+            &ctx,
         )
         .await
         {
@@ -379,7 +382,7 @@ pub(super) async fn responses(
                     ));
                 }
                 Err(err) => {
-                    record_attempt_failure(circuit_guard, &err);
+                    let aborted = record_attempt_failure(circuit_guard, &err);
                     finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
@@ -392,6 +395,9 @@ pub(super) async fn responses(
                         &api_key_name,
                         ctx.request_id(),
                     );
+                    if aborted {
+                        return Err(err);
+                    }
                     last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                 }
             }
@@ -462,7 +468,7 @@ pub(super) async fn responses(
                         ));
                     }
                     Err(chat_err) => {
-                        record_attempt_failure(circuit_guard, &chat_err);
+                        let aborted = record_attempt_failure(circuit_guard, &chat_err);
                         finish_failed_attempt_log_for_key(
                             &cfg,
                             early_log_id.take(),
@@ -475,6 +481,9 @@ pub(super) async fn responses(
                             &api_key_name,
                             ctx.request_id(),
                         );
+                        if aborted {
+                            return Err(chat_err);
+                        }
                         last_error = Some(AttemptFailure::new(
                             &provider,
                             &request_model,
@@ -485,7 +494,7 @@ pub(super) async fn responses(
                 }
             }
             Err(err) => {
-                record_attempt_failure(circuit_guard, &err);
+                let _ = record_attempt_failure(circuit_guard, &err);
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
                 if should_stop_failover(failure.status) {
@@ -876,7 +885,7 @@ pub(super) async fn forward_openai(
                             ));
                         }
                         Err(fb_err) => {
-                            record_attempt_failure(circuit_guard, &fb_err);
+                            let aborted = record_attempt_failure(circuit_guard, &fb_err);
                             finish_failed_attempt_log_for_key(
                                 &cfg,
                                 early_log_id.take(),
@@ -889,6 +898,9 @@ pub(super) async fn forward_openai(
                                 &api_key_name,
                                 ctx.request_id(),
                             );
+                            if aborted {
+                                return Err(fb_err);
+                            }
                             last_error = Some(AttemptFailure::new(
                                 &provider,
                                 &request_model,
@@ -899,7 +911,7 @@ pub(super) async fn forward_openai(
                         }
                     }
                 }
-                record_attempt_failure(circuit_guard, &err);
+                let _ = record_attempt_failure(circuit_guard, &err);
                 let failure = AttemptFailure::new(&provider, &request_model, started, err);
                 // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
                 // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
@@ -1024,9 +1036,7 @@ pub(super) fn commit_result(
                 // 单独记 aborted，熔断按成功放行（不是渠道的错），
                 // 会话粘性既不加强也不清除（这次没有得到任何关于渠道健康度的信息）。
                 Ok(outcome) if outcome.aborted => {
-                    if let Some(guard) = circuit_guard.take() {
-                        guard.mark_success();
-                    }
+                    drop(circuit_guard.take());
                     finalize_stream_log(
                         &cfg,
                         log_id,

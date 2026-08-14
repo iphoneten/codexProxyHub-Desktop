@@ -1,4 +1,5 @@
 use super::*;
+use crate::request_ctx::send_with_cancel;
 
 pub(super) fn chat_stream_to_responses(
     resp: reqwest::Response,
@@ -38,7 +39,8 @@ pub(super) async fn prepare_anthropic_stream(
         resp.bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
     );
-    let stream = prepare_sse_stream(upstream, request_timeout, SseProbeKind::Anthropic).await?;
+    let stream =
+        prepare_sse_stream(upstream, request_timeout, SseProbeKind::Anthropic, &cancel).await?;
     let stream = apply_stream_watchdog(
         stream,
         stream_idle_timeout,
@@ -59,12 +61,13 @@ pub(super) async fn prepare_openai_stream(
     stream_idle_timeout: u64,
     stream_max_duration: u64,
     kind: SseProbeKind,
+    cancel: &CancellationToken,
 ) -> Result<ProxyByteStream, ProxyError> {
     let upstream = Box::pin(
         resp.bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string()))),
     );
-    let stream = prepare_sse_stream(upstream, request_timeout, kind).await?;
+    let stream = prepare_sse_stream(upstream, request_timeout, kind, cancel).await?;
     Ok(apply_stream_watchdog(
         stream,
         stream_idle_timeout,
@@ -158,52 +161,56 @@ pub(super) async fn prepare_sse_stream(
     mut upstream: ProxyByteStream,
     timeout_secs: u64,
     kind: SseProbeKind,
+    cancel: &CancellationToken,
 ) -> Result<ProxyByteStream, ProxyError> {
     let timeout_secs = timeout_secs.max(1);
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
-        let mut prefix = Vec::new();
-        let mut text_buffer = String::new();
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(ProxyError::aborted()),
+        result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
+            let mut prefix = Vec::new();
+            let mut text_buffer = String::new();
 
-        loop {
-            match upstream.next().await {
-                Some(Ok(bytes)) => {
-                    text_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    prefix.extend_from_slice(&bytes);
-                    while let Some((event, consumed)) = next_sse_event(&text_buffer) {
-                        text_buffer.drain(..consumed);
-                        let Some(data) = sse_data(&event) else {
-                            continue;
-                        };
-                        match inspect_sse_probe_event(kind, &data) {
-                            SseProbeDecision::Continue => {}
-                            SseProbeDecision::Ready => {
-                                let prefix = Bytes::from(prefix);
-                                let stream = futures_util::stream::once(async move {
-                                    Ok::<Bytes, io::Error>(prefix)
-                                })
-                                .chain(upstream);
-                                return Ok(Box::pin(stream) as ProxyByteStream);
+            loop {
+                match upstream.next().await {
+                    Some(Ok(bytes)) => {
+                        text_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        prefix.extend_from_slice(&bytes);
+                        while let Some((event, consumed)) = next_sse_event(&text_buffer) {
+                            text_buffer.drain(..consumed);
+                            let Some(data) = sse_data(&event) else {
+                                continue;
+                            };
+                            match inspect_sse_probe_event(kind, &data) {
+                                SseProbeDecision::Continue => {}
+                                SseProbeDecision::Ready => {
+                                    let prefix = Bytes::from(prefix);
+                                    let stream = futures_util::stream::once(async move {
+                                        Ok::<Bytes, io::Error>(prefix)
+                                    })
+                                    .chain(upstream);
+                                    return Ok(Box::pin(stream) as ProxyByteStream);
+                                }
+                                SseProbeDecision::Error(err) => return Err(err),
                             }
-                            SseProbeDecision::Error(err) => return Err(err),
                         }
                     }
-                }
-                Some(Err(err)) => {
-                    return Err(ProxyError::new(
-                        StatusCode::BAD_GATEWAY,
-                        format!("上游流读取失败: {err}"),
-                    ));
-                }
-                None => {
-                    return Err(ProxyError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "上游流在首个有效输出前断开",
-                    ));
+                    Some(Err(err)) => {
+                        return Err(ProxyError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!("上游流读取失败: {err}"),
+                        ));
+                    }
+                    None => {
+                        return Err(ProxyError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "上游流在首个有效输出前断开",
+                        ));
+                    }
                 }
             }
-        }
-    })
-    .await;
+        }) => result,
+    };
 
     match result {
         Ok(result) => result,
@@ -407,7 +414,7 @@ where
         let mut first_token_ms = None;
         macro_rules! push_evt {
             ($ev:expr, $data:expr) => {{
-                if send_response_sse(&tx, $ev, $data).await.is_err() {
+                if send_response_sse(&tx, $ev, $data, &cancel).await.is_err() {
                     let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                     return;
                 }
@@ -502,6 +509,7 @@ where
                                 created_at,
                                 &full_text,
                                 &tool_calls,
+                                &cancel,
                             )
                             .await
                             .is_err()
@@ -621,6 +629,7 @@ where
                                 created_at,
                                 &full_text,
                                 &tool_calls,
+                                &cancel,
                             )
                             .await
                             .is_err()
@@ -647,6 +656,7 @@ where
                                 "error": {"message": message}
                             }
                         }),
+                        &cancel,
                     )
                     .await;
                     let _ = u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
@@ -663,6 +673,7 @@ where
             created_at,
             &full_text,
             &tool_calls,
+            &cancel,
         )
         .await
         .is_err()
@@ -695,7 +706,8 @@ pub(super) async fn send_response_stream_done(
     created_at: i64,
     full_text: &str,
     tool_calls: &[ChatToolCallState],
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
     send_response_sse(
         tx,
         "response.output_text.done",
@@ -706,6 +718,7 @@ pub(super) async fn send_response_stream_done(
             "content_index": 0,
             "text": full_text
         }),
+        cancel,
     )
     .await?;
     send_response_sse(
@@ -718,6 +731,7 @@ pub(super) async fn send_response_stream_done(
             "content_index": 0,
             "part": {"type": "output_text", "text": full_text}
         }),
+        cancel,
     )
     .await?;
     send_response_sse(
@@ -734,6 +748,7 @@ pub(super) async fn send_response_stream_done(
                 "content": [{"type": "output_text", "text": full_text}]
             }
         }),
+        cancel,
     )
     .await?;
     let mut output = vec![json!({
@@ -767,6 +782,7 @@ pub(super) async fn send_response_stream_done(
                     "output_index": output_index,
                     "input": input
                 }),
+                cancel,
             )
             .await?;
             json!({
@@ -786,6 +802,7 @@ pub(super) async fn send_response_stream_done(
                     "output_index": output_index,
                     "arguments": call.arguments
                 }),
+                cancel,
             )
             .await?;
             json!({
@@ -805,6 +822,7 @@ pub(super) async fn send_response_stream_done(
                 "output_index": output_index,
                 "item": item
             }),
+            cancel,
         )
         .await?;
         output.push(item);
@@ -824,9 +842,10 @@ pub(super) async fn send_response_stream_done(
                 "output_text": full_text
             }
         }),
+        cancel,
     )
     .await?;
-    tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await
+    send_with_cancel(tx, Ok(Bytes::from("data: [DONE]\n\n")), cancel).await
 }
 
 #[derive(Default)]
@@ -888,9 +907,14 @@ pub(super) async fn send_response_sse(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     event: &str,
     data: Value,
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
-    tx.send(Ok(Bytes::from(format!("event: {event}\ndata: {data}\n\n"))))
-        .await
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
+    send_with_cancel(
+        tx,
+        Ok(Bytes::from(format!("event: {event}\ndata: {data}\n\n"))),
+        cancel,
+    )
+    .await
 }
 
 pub(crate) fn next_sse_event(buffer: &str) -> Option<(String, usize)> {
@@ -1071,10 +1095,13 @@ where
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {
-                            if tx
-                                .send(Ok(Bytes::from(format!("{event}\n\n"))))
-                                .await
-                                .is_err()
+                            if send_with_cancel(
+                                &tx,
+                                Ok(Bytes::from(format!("{event}\n\n"))),
+                                &cancel,
+                            )
+                            .await
+                            .is_err()
                             {
                                 return;
                             }
@@ -1090,24 +1117,30 @@ where
                                         "finish_reason": null
                                     }]
                                 });
-                                if send_chat_data_sse(&tx, &value).await.is_err() {
+                                if send_chat_data_sse(&tx, &value, &cancel).await.is_err() {
                                     return;
                                 }
                             }
-                            if tx
-                                .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
-                                .await
-                                .is_err()
+                            if send_with_cancel(
+                                &tx,
+                                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                                &cancel,
+                            )
+                            .await
+                            .is_err()
                             {
                                 return;
                             }
                             continue;
                         }
                         let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
-                            if tx
-                                .send(Ok(Bytes::from(format!("{event}\n\n"))))
-                                .await
-                                .is_err()
+                            if send_with_cancel(
+                                &tx,
+                                Ok(Bytes::from(format!("{event}\n\n"))),
+                                &cancel,
+                            )
+                            .await
+                            .is_err()
                             {
                                 return;
                             }
@@ -1117,19 +1150,19 @@ where
                         if chat_stream_value_is_empty_delta(&value) {
                             continue;
                         }
-                        if send_chat_data_sse(&tx, &value).await.is_err() {
+                        if send_chat_data_sse(&tx, &value, &cancel).await.is_err() {
                             return;
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(err)).await;
+                    let _ = send_with_cancel(&tx, Err(err), &cancel).await;
                     return;
                 }
             }
         }
         if !buffer.is_empty() {
-            let _ = tx.send(Ok(Bytes::from(buffer))).await;
+            let _ = send_with_cancel(&tx, Ok(Bytes::from(buffer)), &cancel).await;
         }
     });
     ReceiverStream::new(rx)
@@ -1186,8 +1219,9 @@ pub(super) fn chat_stream_value_is_empty_delta(value: &Value) -> bool {
 pub(super) async fn send_chat_data_sse(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     value: &Value,
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
-    tx.send(Ok(Bytes::from(format!("data: {value}\n\n")))).await
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
+    send_with_cancel(tx, Ok(Bytes::from(format!("data: {value}\n\n"))), cancel).await
 }
 
 pub(super) fn chat_to_response(
@@ -1430,7 +1464,7 @@ where
                             }
                         }
                     }
-                    if tx.send(Ok(bytes)).await.is_err() {
+                    if send_with_cancel(&tx, Ok(bytes), &cancel).await.is_err() {
                         // 客户端已断开，停止解析节省上游流量
                         client_disconnected = true;
                         break;
@@ -1446,7 +1480,7 @@ where
                     let message = err.to_string();
                     finish_note = format!("stream error: {message}");
                     stream_error = Some(message.clone());
-                    let _ = tx.send(Err(io::Error::other(message))).await;
+                    let _ = send_with_cancel(&tx, Err(io::Error::other(message)), &cancel).await;
                     break;
                 }
             }

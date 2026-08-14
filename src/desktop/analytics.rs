@@ -394,6 +394,8 @@ fn status_label(status: &str) -> &'static str {
         "运行中"
     } else if status == "ok" || status == "stream_started" {
         "成功"
+    } else if status == "aborted" {
+        "已取消"
     } else if status == "-" || status == "raw" {
         "原始"
     } else {

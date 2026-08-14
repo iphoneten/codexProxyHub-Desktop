@@ -46,9 +46,15 @@ pub(super) async fn forward_responses_as_chat(
             response_json(result.response).await?
         } else {
             let client = state.client_for_provider(provider);
-            let value =
-                send_json_to_provider(&client, provider, "/chat/completions", headers, chat_body)
-                    .await?;
+            let value = send_json_to_provider(
+                &client,
+                provider,
+                "/chat/completions",
+                headers,
+                chat_body,
+                ctx,
+            )
+            .await?;
             // send_json_to_provider 只做 HTTP 层错误处理，这里作为 chat 语义调用者要自己校验结构
             // 因为该函数被复用在多种 path，不能在里面按 path 分支校验
             if let Err(msg) = validate_upstream_chat_json(&value) {
@@ -160,7 +166,7 @@ pub(super) async fn send_chat_stream_as_responses(
             .post(url.clone())
             .headers(upstream_headers(provider, request_headers, true))
             .json(&send_body);
-        match send_stream_request(req, provider.request_timeout).await {
+        match send_stream_request(req, provider.request_timeout, &ctx.cancel_token()).await {
             Ok(resp) if resp.status().is_success() => {
                 // 拦截假 SSE 响应（Content-Type 非 event-stream）
                 if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
@@ -192,21 +198,18 @@ pub(super) async fn send_chat_stream_as_responses(
                     continue;
                 }
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     attempt += 1;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
                 attempt += 1;
-                if err.retryable() {
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
 }
@@ -234,7 +237,13 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
         .json(&anthropic_body);
 
     for attempt in 0..=provider.max_retries {
-        match send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await {
+        match send_stream_request(
+            req.try_clone().unwrap(),
+            provider.request_timeout,
+            &ctx.cancel_token(),
+        )
+        .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 if let Err(msg) = validate_upstream_sse_content_type(resp.headers()) {
                     let text = resp.text().await.unwrap_or_default();
@@ -256,7 +265,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
                 {
                     Ok(streams) => streams,
                     Err(err) if attempt < provider.max_retries && err.retryable() => {
-                        tokio::time::sleep(retry_delay(attempt)).await;
+                        wait_retry(retry_delay(attempt), ctx).await?;
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -277,19 +286,16 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
-                if err.retryable() {
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
     Err(ProxyError::new(
@@ -374,7 +380,7 @@ pub(super) async fn send_to_provider(
                 .post(url.clone())
                 .headers(upstream_headers(provider, request_headers, true))
                 .json(&send_body);
-            match send_stream_request(req, provider.request_timeout).await {
+            match send_stream_request(req, provider.request_timeout, &ctx.cancel_token()).await {
                 Ok(resp) if resp.status().is_success() => {
                     let status =
                         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -398,12 +404,13 @@ pub(super) async fn send_to_provider(
                         provider.stream_idle_timeout,
                         provider.stream_max_duration,
                         probe_kind,
+                        &ctx.cancel_token(),
                     )
                     .await
                     {
                         Ok(stream) => stream,
                         Err(err) if attempt < provider.max_retries && err.retryable() => {
-                            tokio::time::sleep(retry_delay(attempt)).await;
+                            wait_retry(retry_delay(attempt), ctx).await?;
                             attempt += 1;
                             continue;
                         }
@@ -451,21 +458,18 @@ pub(super) async fn send_to_provider(
                         continue;
                     }
                     if attempt < provider.max_retries && retryable_status(status) {
-                        tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                        wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                         attempt += 1;
                         continue;
                     }
                     return Err(upstream_status_error(status, &text, retry_after));
                 }
-                Err(err) if attempt < provider.max_retries => {
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                Err(err) if attempt < provider.max_retries && err.retryable() => {
+                    wait_retry(retry_delay(attempt), ctx).await?;
                     attempt += 1;
-                    if err.retryable() {
-                        continue;
-                    }
-                    return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+                    continue;
                 }
-                Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+                Err(err) => return Err(err.into_proxy_error()),
             }
         }
     }
@@ -475,7 +479,8 @@ pub(super) async fn send_to_provider(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut value = send_json_to_provider(&client, provider, path, request_headers, body).await?;
+    let mut value =
+        send_json_to_provider(&client, provider, path, request_headers, body, ctx).await?;
     // 上游可能返回 HTTP 200 + 假 JSON（rawchat 一类跑路中转站的典型症状）
     // 结构不合规就当作该 provider 失败，抛 502 让上层 failover 到下个渠道
     let validation = match path {
@@ -524,14 +529,20 @@ pub(super) async fn send_anthropic_messages_passthrough(
 
     for attempt in 0..=provider.max_retries {
         let send_result = if stream {
-            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
+            send_stream_request(
+                req.try_clone().unwrap(),
+                provider.request_timeout,
+                &ctx.cancel_token(),
+            )
+            .await
         } else {
-            req.try_clone()
-                .unwrap()
-                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
-                .send()
-                .await
-                .map_err(UpstreamSendError::Request)
+            send_request(
+                req.try_clone()
+                    .unwrap()
+                    .timeout(Duration::from_secs(provider.request_timeout.max(1))),
+                &ctx.cancel_token(),
+            )
+            .await
         };
         match send_result {
             Ok(resp) if resp.status().is_success() => {
@@ -551,12 +562,13 @@ pub(super) async fn send_anthropic_messages_passthrough(
                         provider.stream_idle_timeout,
                         provider.stream_max_duration,
                         SseProbeKind::Anthropic,
+                        &ctx.cancel_token(),
                     )
                     .await
                     {
                         Ok(stream) => stream,
                         Err(err) if attempt < provider.max_retries && err.retryable() => {
-                            tokio::time::sleep(retry_delay(attempt)).await;
+                            wait_retry(retry_delay(attempt), ctx).await?;
                             continue;
                         }
                         Err(err) => return Err(err),
@@ -608,19 +620,16 @@ pub(super) async fn send_anthropic_messages_passthrough(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                if err.retryable() {
-                    tokio::time::sleep(retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
     Err(ProxyError::new(
@@ -657,14 +666,20 @@ pub(super) async fn send_to_anthropic_provider(
 
     for attempt in 0..=provider.max_retries {
         let send_result = if stream {
-            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
+            send_stream_request(
+                req.try_clone().unwrap(),
+                provider.request_timeout,
+                &ctx.cancel_token(),
+            )
+            .await
         } else {
-            req.try_clone()
-                .unwrap()
-                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
-                .send()
-                .await
-                .map_err(UpstreamSendError::Request)
+            send_request(
+                req.try_clone()
+                    .unwrap()
+                    .timeout(Duration::from_secs(provider.request_timeout.max(1))),
+                &ctx.cancel_token(),
+            )
+            .await
         };
         match send_result {
             Ok(resp) if resp.status().is_success() => {
@@ -691,7 +706,7 @@ pub(super) async fn send_to_anthropic_provider(
                     {
                         Ok(streams) => streams,
                         Err(err) if attempt < provider.max_retries && err.retryable() => {
-                            tokio::time::sleep(retry_delay(attempt)).await;
+                            wait_retry(retry_delay(attempt), ctx).await?;
                             continue;
                         }
                         Err(err) => return Err(err),
@@ -751,19 +766,16 @@ pub(super) async fn send_to_anthropic_provider(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
-                if err.retryable() {
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
     Err(ProxyError::new(
@@ -798,14 +810,20 @@ pub(super) async fn send_to_google_ai_provider(
 
     for attempt in 0..=provider.max_retries {
         let send_result = if stream {
-            send_stream_request(req.try_clone().unwrap(), provider.request_timeout).await
+            send_stream_request(
+                req.try_clone().unwrap(),
+                provider.request_timeout,
+                &ctx.cancel_token(),
+            )
+            .await
         } else {
-            req.try_clone()
-                .unwrap()
-                .timeout(Duration::from_secs(provider.request_timeout.max(1)))
-                .send()
-                .await
-                .map_err(UpstreamSendError::Request)
+            send_request(
+                req.try_clone()
+                    .unwrap()
+                    .timeout(Duration::from_secs(provider.request_timeout.max(1))),
+                &ctx.cancel_token(),
+            )
+            .await
         };
         match send_result {
             Ok(resp) if resp.status().is_success() => {
@@ -876,19 +894,16 @@ pub(super) async fn send_to_google_ai_provider(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
-                if err.retryable() {
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
     Err(ProxyError::new(
@@ -920,7 +935,8 @@ pub(super) async fn send_responses_stream_as_chat(
             .post(url.clone())
             .headers(upstream_headers(provider, request_headers, true))
             .json(&responses_body);
-        let result = send_stream_request(result, provider.request_timeout).await;
+        let result =
+            send_stream_request(result, provider.request_timeout, &ctx.cancel_token()).await;
         match result {
             Ok(resp) if resp.status().is_success() => {
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -937,12 +953,13 @@ pub(super) async fn send_responses_stream_as_chat(
                     provider.stream_idle_timeout,
                     provider.stream_max_duration,
                     SseProbeKind::Responses,
+                    &ctx.cancel_token(),
                 )
                 .await
                 {
                     Ok(stream) => stream,
                     Err(err) if attempt < provider.max_retries && err.retryable() => {
-                        tokio::time::sleep(retry_delay(attempt)).await;
+                        wait_retry(retry_delay(attempt), ctx).await?;
                         attempt += 1;
                         continue;
                     }
@@ -974,21 +991,18 @@ pub(super) async fn send_responses_stream_as_chat(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     attempt += 1;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
-            Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
+            Err(err) if attempt < provider.max_retries && err.retryable() => {
+                wait_retry(retry_delay(attempt), ctx).await?;
                 attempt += 1;
-                if err.retryable() {
-                    continue;
-                }
-                return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message()));
+                continue;
             }
-            Err(err) => return Err(ProxyError::new(StatusCode::BAD_GATEWAY, err.message())),
+            Err(err) => return Err(err.into_proxy_error()),
         }
     }
 }
@@ -1039,7 +1053,13 @@ pub(super) async fn send_chat_via_responses(
             .timeout(Duration::from_secs(provider.request_timeout.max(1)))
             .headers(upstream_headers(provider, request_headers, false))
             .json(&responses_body);
-        match req.send().await {
+        let cancel = ctx.cancel_token();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::aborted()),
+            result = req.send() => result,
+        };
+        match result {
             Ok(resp) if resp.status().is_success() => {
                 let value = resp.json::<Value>().await.map_err(|e| {
                     ProxyError::new(
@@ -1072,14 +1092,14 @@ pub(super) async fn send_chat_via_responses(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     attempt += 1;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
+                wait_retry(retry_delay(attempt), ctx).await?;
                 attempt += 1;
                 if err.is_timeout() || err.is_connect() || err.is_request() {
                     continue;
@@ -1097,6 +1117,7 @@ pub(super) async fn send_json_to_provider(
     path: &str,
     request_headers: &HeaderMap,
     body: Value,
+    ctx: &RequestContext,
 ) -> Result<Value, ProxyError> {
     send_json_to_provider_with_headers(
         client,
@@ -1104,6 +1125,7 @@ pub(super) async fn send_json_to_provider(
         path,
         upstream_headers(provider, request_headers, false),
         body,
+        ctx,
     )
     .await
 }
@@ -1114,16 +1136,21 @@ pub(super) async fn send_json_to_provider_with_headers(
     path: &str,
     headers: HeaderMap,
     body: Value,
+    ctx: &RequestContext,
 ) -> Result<Value, ProxyError> {
     let url = upstream_url(provider, path);
     for attempt in 0..=provider.max_retries {
-        let result = client
+        let req = client
             .post(url.clone())
             .timeout(Duration::from_secs(provider.request_timeout.max(1)))
             .headers(headers.clone())
-            .json(&body)
-            .send()
-            .await;
+            .json(&body);
+        let cancel = ctx.cancel_token();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::aborted()),
+            result = req.send() => result,
+        };
 
         match result {
             Ok(resp) if resp.status().is_success() => {
@@ -1137,13 +1164,13 @@ pub(super) async fn send_json_to_provider_with_headers(
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if attempt < provider.max_retries && retryable_status(status) {
-                    tokio::time::sleep(compute_retry_delay(attempt, retry_after)).await;
+                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
-                tokio::time::sleep(retry_delay(attempt)).await;
+                wait_retry(retry_delay(attempt), ctx).await?;
                 if err.is_timeout() || err.is_connect() || err.is_request() {
                     continue;
                 }
@@ -1427,8 +1454,17 @@ pub(crate) fn retryable_status(status: StatusCode) -> bool {
 /// 客户端访问本代理的鉴权错误在 `authorize` 阶段已经返回，不会进入 provider 循环。
 /// 进入这里的 401/407 都来自某个上游渠道，通常表示该渠道的 key / 代理不可用；
 /// 这种情况应该继续尝试下一个渠道，而不是中止整个 failover。
-pub(crate) fn should_stop_failover(_status: StatusCode) -> bool {
-    false
+pub(crate) fn should_stop_failover(status: StatusCode) -> bool {
+    status.as_u16() == 499
+}
+
+async fn wait_retry(delay: Duration, ctx: &RequestContext) -> Result<(), ProxyError> {
+    let cancel = ctx.cancel_token();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ProxyError::aborted()),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 pub(crate) fn retry_delay(attempt: usize) -> Duration {

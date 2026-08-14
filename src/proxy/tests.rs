@@ -231,6 +231,24 @@ fn provider_circuit_stale_failure_does_not_interrupt_half_open_probe() {
 }
 
 #[test]
+fn cancelled_attempt_does_not_clear_previous_failures() {
+    let state = test_state();
+    state
+        .begin_provider_attempt("cancel-neutral")
+        .unwrap()
+        .mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
+
+    let guard = state.begin_provider_attempt("cancel-neutral").unwrap();
+    assert!(record_attempt_failure(guard, &ProxyError::aborted()));
+
+    let circuits = state.provider_circuits.lock();
+    assert_eq!(
+        circuits.get("cancel-neutral").unwrap().consecutive_failures,
+        1
+    );
+}
+
+#[test]
 fn api_key_empty_allowed_models_allows_every_model() {
     let state = test_state();
     let auth = auth_access_with_models(&state, &[]);
@@ -1288,7 +1306,7 @@ async fn sse_probe_preserves_chat_prefix_after_first_delta() {
     let stream: ProxyByteStream =
         Box::pin(futures_util::stream::iter([Ok::<Bytes, io::Error>(bytes)]));
 
-    let mut prepared = prepare_sse_stream(stream, 1, SseProbeKind::Chat)
+    let mut prepared = prepare_sse_stream(stream, 1, SseProbeKind::Chat, &CancellationToken::new())
         .await
         .unwrap();
     let mut out = Vec::new();
@@ -1299,6 +1317,26 @@ async fn sse_probe_preserves_chat_prefix_after_first_delta() {
 
     assert!(text.contains("\"role\":\"assistant\""));
     assert!(text.contains("\"content\":\"hi\""));
+}
+
+#[tokio::test]
+async fn sse_probe_stops_when_context_is_cancelled() {
+    let stream: ProxyByteStream =
+        Box::pin(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+    let cancel = CancellationToken::new();
+    let future = prepare_sse_stream(stream, 30, SseProbeKind::Chat, &cancel);
+    tokio::pin!(future);
+
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(100), &mut future)
+        .await
+        .expect("取消后首帧探测应立即结束");
+    let err = match result {
+        Ok(_) => panic!("取消后的首帧探测不应成功"),
+        Err(err) => err,
+    };
+    assert!(err.aborted);
+    assert_eq!(err.status.as_u16(), 499);
 }
 
 #[tokio::test]
@@ -1884,10 +1922,11 @@ async fn sse_probe_rejects_chat_done_before_output() {
         Bytes::from("data: [DONE]\n\n"),
     )]));
 
-    let err = match prepare_sse_stream(stream, 1, SseProbeKind::Chat).await {
-        Ok(_) => panic!("expected probe error"),
-        Err(err) => err,
-    };
+    let err =
+        match prepare_sse_stream(stream, 1, SseProbeKind::Chat, &CancellationToken::new()).await {
+            Ok(_) => panic!("expected probe error"),
+            Err(err) => err,
+        };
 
     assert_eq!(err.status, StatusCode::BAD_GATEWAY);
     assert!(err.message.contains("未返回有效输出"));
@@ -1906,7 +1945,14 @@ async fn sse_probe_maps_responses_error_before_output_to_retryable_error() {
         Bytes::from(format!("data: {chunk}\n\n")),
     )]));
 
-    let err = match prepare_sse_stream(stream, 1, SseProbeKind::Responses).await {
+    let err = match prepare_sse_stream(
+        stream,
+        1,
+        SseProbeKind::Responses,
+        &CancellationToken::new(),
+    )
+    .await
+    {
         Ok(_) => panic!("expected probe error"),
         Err(err) => err,
     };

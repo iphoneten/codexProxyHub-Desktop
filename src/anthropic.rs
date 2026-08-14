@@ -6,7 +6,10 @@
 //
 // 硬编码：Anthropic max_tokens 默认 4096；anthropic-version 由 proxy 侧统一填 2023-06-01
 
-use crate::proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage};
+use crate::{
+    proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage},
+    request_ctx::send_with_cancel,
+};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -523,7 +526,10 @@ where
         let mut stream = Box::pin(stream);
         let mut first_token_ms = None;
         // 首个 chunk 先发 role=assistant，OpenAI 客户端惯例
-        if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
+        if send_json_chunk(&tx, &state.opening_delta(), &cancel)
+            .await
+            .is_err()
+        {
             let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
             return;
         }
@@ -572,8 +578,10 @@ where
                                     "type": error_type
                                 }
                             });
-                            let _ = send_json_chunk(&tx, &error).await;
-                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ = send_json_chunk(&tx, &error, &cancel).await;
+                            let _ =
+                                send_with_cancel(&tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel)
+                                    .await;
                             let _ = u_tx.send(StreamOutcome::failed(
                                 state.usage,
                                 first_token_ms,
@@ -587,7 +595,7 @@ where
                                 first_token_ms
                                     .get_or_insert_with(|| started.elapsed().as_millis() as i64);
                             }
-                            if send_json_chunk(&tx, &out).await.is_err() {
+                            if send_json_chunk(&tx, &out, &cancel).await.is_err() {
                                 let _ =
                                     u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
                                 return;
@@ -597,7 +605,8 @@ where
                 }
                 Err(err) => {
                     let message = format!("上游流错误: {err}");
-                    let _ = tx.send(Err(io::Error::other(message.clone()))).await;
+                    let _ = send_with_cancel(&tx, Err(io::Error::other(message.clone())), &cancel)
+                        .await;
                     let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
                     return;
                 }
@@ -605,11 +614,11 @@ where
         }
         if !state.finished {
             let message = "Anthropic 上游流未收到 message_stop 就已结束";
-            let _ = tx.send(Err(io::Error::other(message))).await;
+            let _ = send_with_cancel(&tx, Err(io::Error::other(message)), &cancel).await;
             let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
             return;
         }
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+        let _ = send_with_cancel(&tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel).await;
         let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
     });
     (u_rx, ReceiverStream::new(rx))
@@ -626,9 +635,10 @@ fn stream_chunk_has_client_output(value: &Value) -> bool {
 async fn send_json_chunk(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     value: &Value,
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
     let line = format!("data: {}\n\n", value);
-    tx.send(Ok(Bytes::from(line))).await
+    send_with_cancel(tx, Ok(Bytes::from(line)), cancel).await
 }
 
 struct StreamState {

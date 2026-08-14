@@ -755,8 +755,14 @@ fn begin_attempt_or_record_failure(
         .map_err(|err| AttemptFailure::new(provider, request_model, started, err))
 }
 
-fn record_attempt_failure(guard: ProviderCircuitGuard, err: &ProxyError) {
-    guard.mark_failure(err.status, &err.message, err.retry_after);
+fn record_attempt_failure(guard: ProviderCircuitGuard, err: &ProxyError) -> bool {
+    if err.aborted {
+        drop(guard);
+        true
+    } else {
+        guard.mark_failure(err.status, &err.message, err.retry_after);
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -764,6 +770,7 @@ struct ProxyError {
     status: StatusCode,
     message: String,
     retry_after: Option<Duration>,
+    aborted: bool,
 }
 
 impl ProxyError {
@@ -772,6 +779,16 @@ impl ProxyError {
             status,
             message: message.into(),
             retry_after: None,
+            aborted: false,
+        }
+    }
+
+    fn aborted() -> Self {
+        Self {
+            status: StatusCode::from_u16(499).expect("499 is a valid HTTP status"),
+            message: STREAM_ABORTED_MESSAGE.to_string(),
+            retry_after: None,
+            aborted: true,
         }
     }
 
@@ -813,6 +830,7 @@ fn upstream_status_error(
 enum UpstreamSendError {
     Request(reqwest::Error),
     HeaderTimeout(u64),
+    Cancelled,
 }
 
 impl UpstreamSendError {
@@ -820,6 +838,7 @@ impl UpstreamSendError {
         match self {
             Self::Request(err) => err.is_timeout() || err.is_connect() || err.is_request(),
             Self::HeaderTimeout(_) => true,
+            Self::Cancelled => false,
         }
     }
 
@@ -827,6 +846,14 @@ impl UpstreamSendError {
         match self {
             Self::Request(err) => err.to_string(),
             Self::HeaderTimeout(secs) => format!("上游响应头超时: {secs}s"),
+            Self::Cancelled => STREAM_ABORTED_MESSAGE.to_string(),
+        }
+    }
+
+    fn into_proxy_error(self) -> ProxyError {
+        match self {
+            Self::Cancelled => ProxyError::aborted(),
+            other => ProxyError::new(StatusCode::BAD_GATEWAY, other.message()),
         }
     }
 }
@@ -834,11 +861,29 @@ impl UpstreamSendError {
 async fn send_stream_request(
     req: reqwest::RequestBuilder,
     timeout_secs: u64,
+    cancel: &CancellationToken,
 ) -> Result<reqwest::Response, UpstreamSendError> {
-    match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), req.send()).await {
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(err)) => Err(UpstreamSendError::Request(err)),
-        Err(_) => Err(UpstreamSendError::HeaderTimeout(timeout_secs.max(1))),
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(UpstreamSendError::Cancelled),
+        result = tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), req.send()) => {
+            match result {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(err)) => Err(UpstreamSendError::Request(err)),
+                Err(_) => Err(UpstreamSendError::HeaderTimeout(timeout_secs.max(1))),
+            }
+        }
+    }
+}
+
+async fn send_request(
+    req: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Response, UpstreamSendError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(UpstreamSendError::Cancelled),
+        result = req.send() => result.map_err(UpstreamSendError::Request),
     }
 }
 

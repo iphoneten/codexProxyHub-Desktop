@@ -14,6 +14,7 @@
 //!   * 它是 server 根 token 的子 token，代理停止/退出时根 token 一取消，
 //!     在飞的流全部结束，graceful shutdown 不再干等。
 use std::fmt;
+use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use uuid::Uuid;
 
@@ -67,6 +68,19 @@ impl fmt::Debug for RequestContext {
             .field("request_id", &self.request_id)
             .field("cancelled", &self.cancel.is_cancelled())
             .finish()
+    }
+}
+
+/// 向有界 channel 写入时同时监听取消，避免下游背压让关停卡在 `send().await`。
+pub(crate) async fn send_with_cancel<T>(
+    tx: &mpsc::Sender<T>,
+    value: T,
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(()),
+        result = tx.send(value) => result.map_err(|_| ()),
     }
 }
 
@@ -138,5 +152,20 @@ mod tests {
         let root = CancellationToken::new();
         let ctx = RequestContext::child_of(&root, Some("a".repeat(300)));
         assert_eq!(ctx.request_id().len(), 128);
+    }
+
+    #[tokio::test]
+    async fn full_channel_send_is_interrupted_by_cancel() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send("first").await.unwrap();
+        let cancel = CancellationToken::new();
+        let send = send_with_cancel(&tx, "second", &cancel);
+        tokio::pin!(send);
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), &mut send)
+            .await
+            .expect("取消后发送不应继续等待 channel 容量");
+        assert!(result.is_err());
     }
 }

@@ -347,7 +347,7 @@ fn read_summary(conn: &rusqlite::Connection) -> Result<AdminSummary, String> {
         SELECT
             COUNT(*),
             COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'raw', '-') THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
@@ -381,7 +381,7 @@ fn read_usage_breakdown(
             {column},
             COUNT(*),
             COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'raw', '-') THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
             COALESCE(MAX(ts), ''),

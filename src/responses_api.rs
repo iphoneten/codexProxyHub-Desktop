@@ -6,7 +6,10 @@
 //   - responses_to_chat_response: Responses 响应 -> Chat 响应（非流式）
 //   - spawn_responses_stream_translator: Responses SSE -> Chat SSE（状态机）
 
-use crate::proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage};
+use crate::{
+    proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage},
+    request_ctx::send_with_cancel,
+};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
@@ -541,7 +544,10 @@ where
         let mut buffer = String::new();
         let mut stream = Box::pin(stream);
         let mut first_token_ms = None;
-        if send_json_chunk(&tx, &state.opening_delta()).await.is_err() {
+        if send_json_chunk(&tx, &state.opening_delta(), &cancel)
+            .await
+            .is_err()
+        {
             let _ = u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
             return;
         }
@@ -572,13 +578,15 @@ where
                         if data.trim() == "[DONE]" {
                             if !state.finished {
                                 let terminal = state.build_terminal_chunk();
-                                if send_json_chunk(&tx, &terminal).await.is_err() {
+                                if send_json_chunk(&tx, &terminal, &cancel).await.is_err() {
                                     let _ = u_tx
                                         .send(StreamOutcome::aborted(state.usage, first_token_ms));
                                     return;
                                 }
                             }
-                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ =
+                                send_with_cancel(&tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel)
+                                    .await;
                             let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
                             return;
                         }
@@ -591,7 +599,7 @@ where
                                 first_token_ms
                                     .get_or_insert_with(|| started.elapsed().as_millis() as i64);
                             }
-                            if send_json_chunk(&tx, &out).await.is_err() {
+                            if send_json_chunk(&tx, &out, &cancel).await.is_err() {
                                 let _ =
                                     u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
                                 return;
@@ -606,7 +614,9 @@ where
                             return;
                         }
                         if state.finished {
-                            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                            let _ =
+                                send_with_cancel(&tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel)
+                                    .await;
                             let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
                             return;
                         }
@@ -614,7 +624,8 @@ where
                 }
                 Err(err) => {
                     let message = format!("上游流错误: {err}");
-                    let _ = tx.send(Err(io::Error::other(message.clone()))).await;
+                    let _ = send_with_cancel(&tx, Err(io::Error::other(message.clone())), &cancel)
+                        .await;
                     let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
                     return;
                 }
@@ -622,11 +633,11 @@ where
         }
         if !state.finished {
             let message = "Responses 上游流未收到完成事件就已结束";
-            let _ = tx.send(Err(io::Error::other(message))).await;
+            let _ = send_with_cancel(&tx, Err(io::Error::other(message)), &cancel).await;
             let _ = u_tx.send(StreamOutcome::failed(state.usage, first_token_ms, message));
             return;
         }
-        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+        let _ = send_with_cancel(&tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel).await;
         let _ = u_tx.send(StreamOutcome::success(state.usage, first_token_ms));
     });
     (u_rx, ReceiverStream::new(rx))
@@ -661,9 +672,10 @@ fn responses_stream_error_message(payload: &Value) -> Option<String> {
 async fn send_json_chunk(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     value: &Value,
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
     let line = format!("data: {}\n\n", value);
-    tx.send(Ok(Bytes::from(line))).await
+    send_with_cancel(tx, Ok(Bytes::from(line)), cancel).await
 }
 
 struct StreamState {

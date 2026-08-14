@@ -63,6 +63,11 @@ pub(super) fn log_error(
     api_key_name: &str,
     request_id: &str,
 ) {
+    let status = if error == STREAM_ABORTED_MESSAGE {
+        STREAM_ABORTED_STATUS
+    } else {
+        "error"
+    };
     log_usage(
         config,
         started,
@@ -73,7 +78,7 @@ pub(super) fn log_error(
             provider,
             model,
             upstream_model: "",
-            status: "error",
+            status,
             error: Some(error),
             usage: TokenUsage::default(),
             first_token_ms,
@@ -209,6 +214,11 @@ pub(super) fn finish_failed_attempt_log_for_key(
     let Some(id) = log_id else {
         return;
     };
+    let status = if error == STREAM_ABORTED_MESSAGE {
+        STREAM_ABORTED_STATUS
+    } else {
+        "error"
+    };
     if update_usage_log(
         config,
         id,
@@ -220,7 +230,7 @@ pub(super) fn finish_failed_attempt_log_for_key(
             provider,
             model,
             upstream_model: "",
-            status: "error",
+            status,
             error: Some(error),
             usage: TokenUsage::default(),
             first_token_ms: None,

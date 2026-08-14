@@ -3,7 +3,10 @@
 // 对外仍保持 OpenAI chat/completions 形态；对上游使用
 // /models/{model}:generateContent 与 /models/{model}:streamGenerateContent?alt=sse。
 
-use crate::proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage};
+use crate::{
+    proxy::{next_sse_event, sse_data, StreamOutcome, TokenUsage},
+    request_ctx::send_with_cancel,
+};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
@@ -220,7 +223,7 @@ where
                             if first_token_ms.is_none() && chunk_has_delta(&chunk) {
                                 first_token_ms = Some(started.elapsed().as_millis() as i64);
                             }
-                            if send_sse(&tx, &chunk).await.is_err() {
+                            if send_sse(&tx, &chunk, &cancel).await.is_err() {
                                 let _ =
                                     usage_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                                 return;
@@ -239,7 +242,7 @@ where
         }
         if error.is_none() && !aborted {
             let done = Bytes::from_static(b"data: [DONE]\n\n");
-            let _ = tx.send(Ok(done)).await;
+            let _ = send_with_cancel(&tx, Ok(done), &cancel).await;
         }
         let outcome = match error {
             Some(error) => StreamOutcome::failed(usage, first_token_ms, error),
@@ -542,8 +545,9 @@ fn accumulate_google_usage(value: Option<&Value>, usage: &mut TokenUsage) {
 async fn send_sse(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     value: &Value,
-) -> Result<(), mpsc::error::SendError<Result<Bytes, io::Error>>> {
-    tx.send(Ok(Bytes::from(format!("data: {value}\n\n")))).await
+    cancel: &CancellationToken,
+) -> Result<(), ()> {
+    send_with_cancel(tx, Ok(Bytes::from(format!("data: {value}\n\n"))), cancel).await
 }
 
 fn chunk_has_delta(value: &Value) -> bool {
