@@ -122,5 +122,9 @@ pub fn activate_app() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    NSApplication::sharedApplication(mtm).activate();
+    // `-[NSApplication activate]` was added in macOS 14. Calling it on
+    // macOS 12/13 raises an Objective-C exception, which aborts across Rust's
+    // event-loop callback. Keep the older API while those systems are supported.
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }

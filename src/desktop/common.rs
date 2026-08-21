@@ -412,17 +412,50 @@ pub fn configure_style(ctx: &egui::Context) {
 
 fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let candidates = [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Songti.ttc",
-        "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
-    ];
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
+        let fonts_dir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        [
+            // Windows 10/11 默认中文字体。优先使用微软雅黑，避免中文显示为方框。
+            "msyh.ttc",
+            "msyh.ttf",
+            "msyhbd.ttc",
+            "Deng.ttf",
+            "simsun.ttc",
+            "simhei.ttf",
+        ]
+        .into_iter()
+        .map(|name| fonts_dir.join(name))
+        .collect()
+    } else if cfg!(target_os = "macos") {
+        [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    } else {
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    };
 
     for path in candidates {
-        let Ok(data) = std::fs::read(path) else {
+        let Ok(data) = std::fs::read(&path) else {
             continue;
         };
         fonts
