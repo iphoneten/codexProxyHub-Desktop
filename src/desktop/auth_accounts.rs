@@ -19,6 +19,9 @@ use std::{
 };
 use uuid::Uuid;
 mod grok;
+
+const AUTH_QUOTA_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthAvailability {
     Unknown,
@@ -61,6 +64,7 @@ impl Default for AuthAvailability {
 pub struct AuthAccountsState {
     views: HashMap<String, AccountQuotaView>,
     pending: Arc<Mutex<Vec<QuotaJobResult>>>,
+    auto_refresh_next: Option<Instant>,
     grok: grok::GrokCheckState,
     oauth_pending: Arc<Mutex<Vec<crate::oauth_login::OAuthLoginOutcome>>>,
     oauth_cancelled: Option<Arc<AtomicBool>>,
@@ -153,13 +157,53 @@ struct TokenUpdate {
 pub fn tick_background_grok_check(config: &mut AppConfig, state: &mut AuthAccountsState) {
     grok::tick_background(config, state);
 }
+
+/// 代理启动时立即刷新一次 OpenAI Auth 账号额度，之后每分钟刷新一次。
+///
+/// 这里只排队请求，实际网络操作在线程中执行，避免阻塞 egui 主线程。
+pub fn start_background_auth_quota_refresh(
+    config: &AppConfig,
+    state: &mut AuthAccountsState,
+) {
+    state.auto_refresh_next = Some(Instant::now() + AUTH_QUOTA_REFRESH_INTERVAL);
+    queue_enabled_accounts(config, state, "openai");
+}
+
+pub fn stop_background_auth_quota_refresh(state: &mut AuthAccountsState) {
+    state.auto_refresh_next = None;
+}
+
+/// 在桌面主循环中回收额度刷新结果并驱动定时刷新。
+pub fn tick_background_auth_quota(
+    config: &mut AppConfig,
+    state: &mut AuthAccountsState,
+    proxy_running: bool,
+) {
+    apply_pending(config, state);
+
+    if !proxy_running {
+        state.auto_refresh_next = None;
+        return;
+    }
+
+    let now = Instant::now();
+    let Some(next_refresh) = state.auto_refresh_next else {
+        return;
+    };
+    if now < next_refresh {
+        return;
+    }
+
+    state.auto_refresh_next = Some(now + AUTH_QUOTA_REFRESH_INTERVAL);
+    queue_enabled_accounts(config, state, "openai");
+}
+
 pub fn auth_accounts_section(
     ui: &mut egui::Ui,
     config: &mut AppConfig,
     message: &mut AppMessage,
     state: &mut AuthAccountsState,
 ) {
-    apply_pending(config, state, message);
     grok::apply_pending(config, state, Some(message), false);
     apply_oauth_pending(config, state, message);
     apply_proxy_check_pending(state, message);
@@ -703,7 +747,7 @@ fn availability_style(
     }
 }
 
-fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState, message: &mut AppMessage) {
+fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState) {
     let jobs = {
         let mut pending = state.pending.lock();
         std::mem::take(&mut *pending)
@@ -753,11 +797,6 @@ fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState, message:
             }
         }
     }
-    if !state.pending.lock().is_empty() {
-        // keep polling
-        let _ = Instant::now();
-    }
-    let _ = message;
 }
 
 fn refresh_all_accounts(
@@ -770,13 +809,7 @@ fn refresh_all_accounts(
         *message = AppMessage::new("没有可刷新的 Auth 账号", MessageKind::Error);
         return;
     }
-    let mut count = 0;
-    for account in &config.auth_accounts {
-        if account.enabled && account_type_matches(account, account_type) {
-            queue_refresh(account, state, auth_proxy_url(config));
-            count += 1;
-        }
-    }
+    let count = queue_enabled_accounts(config, state, account_type);
     if count == 0 {
         *message = AppMessage::new("没有已启用的 Auth 账号可刷新", MessageKind::Error);
     } else {
@@ -785,6 +818,22 @@ fn refresh_all_accounts(
             MessageKind::Info,
         );
     }
+}
+
+fn queue_enabled_accounts(
+    config: &AppConfig,
+    state: &mut AuthAccountsState,
+    account_type: &str,
+) -> usize {
+    let proxy_url = auth_proxy_url(config);
+    let mut count = 0;
+    for account in &config.auth_accounts {
+        if account.enabled && account_type_matches(account, account_type) {
+            queue_refresh(account, state, proxy_url.clone());
+            count += 1;
+        }
+    }
+    count
 }
 
 fn queue_refresh(

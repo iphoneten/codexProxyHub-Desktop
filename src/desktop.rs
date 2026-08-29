@@ -318,6 +318,10 @@ impl HubApp {
             server.last_error = None;
             server.started_at = Some(Instant::now());
         }
+        auth_accounts::start_background_auth_quota_refresh(
+            &config,
+            &mut self.auth_accounts_state,
+        );
         let handle: ConfigHandle = Arc::new(RwLock::new(Arc::new(config)));
         self.config_handle = Some(Arc::clone(&handle));
         let circuit_status = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -348,6 +352,7 @@ impl HubApp {
             let _ = tx.send(());
             server.running = false;
             server.started_at = None;
+            auth_accounts::stop_background_auth_quota_refresh(&mut self.auth_accounts_state);
             self.message = AppMessage::new("正在停止代理", MessageKind::Info);
             drop(server);
             self.config_handle = None;
@@ -427,6 +432,12 @@ impl eframe::App for HubApp {
         }
 
         if let Some(config) = self.config.as_mut() {
+            let proxy_running = self.server.lock().running;
+            auth_accounts::tick_background_auth_quota(
+                config,
+                &mut self.auth_accounts_state,
+                proxy_running,
+            );
             auth_accounts::tick_background_grok_check(config, &mut self.auth_accounts_state);
             // 模型同步在后台线程完成，这里不分页面地回收结果，避免切换视图丢失。
             providers::apply_model_sync_pending(config, &mut self.model_sync, &mut self.message);
