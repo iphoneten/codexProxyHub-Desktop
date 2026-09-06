@@ -438,9 +438,7 @@ pub(super) async fn responses(
                 ));
             }
             Err(err)
-                if provider.responses_mode == "auto"
-                    && (err.status == StatusCode::NOT_FOUND
-                        || err.status == StatusCode::METHOD_NOT_ALLOWED) =>
+                if should_fallback_responses_to_chat(&provider, err.status) =>
             {
                 let chat_body = upstream_body;
                 match forward_responses_as_chat(
@@ -578,6 +576,22 @@ pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool
         || is_google_openai_endpoint(&provider.base_url)
 }
 
+/// 一些 OpenAI 兼容中转不会为不支持的 Responses API 返回 404/405，
+/// 而是直接返回 400。auto 模式下这类错误也应尝试 Chat 兼容路径；
+/// 如果确实是请求参数错误，Chat 翻译同样会失败，随后仍会继续故障转移。
+pub(super) fn should_fallback_responses_to_chat(
+    provider: &ProviderConfig,
+    status: StatusCode,
+) -> bool {
+    provider.responses_mode == "auto"
+        && matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+        )
+}
+
 pub(super) fn api_key_affinity_key(model: &str, api_key_id: &str) -> String {
     if api_key_id.trim().is_empty() {
         return String::new();
@@ -609,7 +623,9 @@ pub(super) fn prefer_provider(
 
 pub(super) fn dedupe_provider_attempts(providers: &mut Vec<(ProviderConfig, String)>) {
     let mut seen = HashSet::new();
-    providers.retain(|(provider, _)| seen.insert(provider.name.clone()));
+    providers.retain(|(provider, request_model)| {
+        seen.insert((provider.name.clone(), normalize_model(request_model).to_string()))
+    });
 }
 
 pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
@@ -723,19 +739,38 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_provider_attempts_keeps_first_model_group() {
+    fn dedupe_provider_attempts_keeps_distinct_model_attempts() {
         let mut providers = vec![
             (provider_with_name("channel-a"), "gpt-primary".to_string()),
             (provider_with_name("channel-b"), "gpt-primary".to_string()),
             (provider_with_name("channel-a"), "gpt-fallback".to_string()),
+            (provider_with_name("channel-a"), "models/gpt-primary".to_string()),
         ];
 
         dedupe_provider_attempts(&mut providers);
 
-        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.len(), 3);
         assert_eq!(providers[0].0.name, "channel-a");
         assert_eq!(providers[0].1, "gpt-primary");
         assert_eq!(providers[1].0.name, "channel-b");
+        assert_eq!(providers[2].1, "gpt-fallback");
+    }
+
+    #[test]
+    fn responses_auto_falls_back_to_chat_on_bad_request() {
+        let provider = provider_with_name("compat");
+        assert!(should_fallback_responses_to_chat(
+            &provider,
+            StatusCode::BAD_REQUEST
+        ));
+        assert!(should_fallback_responses_to_chat(
+            &provider,
+            StatusCode::NOT_FOUND
+        ));
+        assert!(!should_fallback_responses_to_chat(
+            &provider,
+            StatusCode::UNAUTHORIZED
+        ));
     }
 
     #[test]
