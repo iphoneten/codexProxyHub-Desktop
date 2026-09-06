@@ -1114,7 +1114,7 @@ mod state_tests {
     }
 
     #[test]
-    fn session_affinity_only_forgets_matching_provider_and_model() {
+    fn session_affinity_only_forgets_matching_provider() {
         let state = test_state();
         let key = "api-key:key-1:gpt-test";
         state.remember_affinity_provider(key, "channel-b", "gpt-fallback");
@@ -1130,7 +1130,6 @@ mod state_tests {
             state.preferred_provider_for_affinity(key),
             Some(("channel-b".to_string(), "gpt-fallback".to_string()))
         );
-
         state.forget_affinity_provider(key, "channel-b", "gpt-fallback");
         assert_eq!(state.preferred_provider_for_affinity(key), None);
     }

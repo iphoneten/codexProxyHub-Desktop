@@ -299,6 +299,7 @@ pub(super) async fn responses(
     {
         prefer_provider(&mut providers, &preferred, &preferred_model);
     }
+    dedupe_provider_attempts(&mut providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
 
@@ -593,18 +594,22 @@ pub(super) fn prefer_provider(
     preferred: &str,
     preferred_model: &str,
 ) {
-    let Some(index) = providers.iter().position(|(provider, model)| {
-        provider.name == preferred && normalize_model(model) == normalize_model(preferred_model)
-    }) else {
+    // 上一轮成功的渠道及其逻辑模型优先；剩余候选仍保持原始模型优先于回退模型。
+    let Some(index) = providers
+        .iter()
+        .position(|(provider, model)| {
+            provider.name == preferred && normalize_model(model) == normalize_model(preferred_model)
+        })
+    else {
         return;
     };
-    let request_model = providers[index].1.clone();
     let item = providers.remove(index);
-    let insert_at = providers
-        .iter()
-        .position(|(_, model)| normalize_model(model) == normalize_model(&request_model))
-        .unwrap_or(providers.len());
-    providers.insert(insert_at, item);
+    providers.insert(0, item);
+}
+
+pub(super) fn dedupe_provider_attempts(providers: &mut Vec<(ProviderConfig, String)>) {
+    let mut seen = HashSet::new();
+    providers.retain(|(provider, _)| seen.insert(provider.name.clone()));
 }
 
 pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
@@ -699,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn prefer_provider_does_not_move_fallback_model_ahead_of_requested_model() {
+    fn prefer_provider_moves_previous_fallback_attempt_to_front() {
         let mut providers = vec![
             (provider_with_name("primary-a"), "gpt-primary".to_string()),
             (provider_with_name("primary-b"), "gpt-primary".to_string()),
@@ -709,10 +714,28 @@ mod tests {
 
         prefer_provider(&mut providers, "sticky", "gpt-fallback");
 
-        assert_eq!(providers[0].0.name, "primary-a");
-        assert_eq!(providers[1].0.name, "primary-b");
-        assert_eq!(providers[2].0.name, "sticky");
-        assert_eq!(providers[2].1, "gpt-fallback");
+        assert_eq!(providers[0].0.name, "sticky");
+        assert_eq!(providers[0].1, "gpt-fallback");
+        assert_eq!(providers[1].0.name, "primary-a");
+        assert_eq!(providers[1].1, "gpt-primary");
+        assert_eq!(providers[2].0.name, "primary-b");
+        assert_eq!(providers[2].1, "gpt-primary");
+    }
+
+    #[test]
+    fn dedupe_provider_attempts_keeps_first_model_group() {
+        let mut providers = vec![
+            (provider_with_name("channel-a"), "gpt-primary".to_string()),
+            (provider_with_name("channel-b"), "gpt-primary".to_string()),
+            (provider_with_name("channel-a"), "gpt-fallback".to_string()),
+        ];
+
+        dedupe_provider_attempts(&mut providers);
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].0.name, "channel-a");
+        assert_eq!(providers[0].1, "gpt-primary");
+        assert_eq!(providers[1].0.name, "channel-b");
     }
 
     #[test]
@@ -772,6 +795,7 @@ pub(super) async fn forward_openai(
     {
         prefer_provider(&mut providers, &preferred, &preferred_model);
     }
+    dedupe_provider_attempts(&mut providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut last_error = None;
 
