@@ -368,6 +368,19 @@ impl HubApp {
         }
     }
 
+    fn sync_auth_quota_status(&mut self) {
+        let Some(status_handle) = self.circuit_status.as_ref() else {
+            return;
+        };
+        let mut statuses = status_handle.write();
+        for (account_id, exhausted) in self.auth_accounts_state.take_quota_status_updates() {
+            statuses
+                .entry(format!("auth:{account_id}"))
+                .or_default()
+                .quota_exhausted = exhausted;
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn handle_tray(&mut self, ctx: &egui::Context) {
         let app_active = app_is_active();
@@ -591,18 +604,6 @@ impl eframe::App for HubApp {
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
 
-    fn sync_auth_quota_status(&mut self) {
-        let Some(status_handle) = self.circuit_status.as_ref() else {
-            return;
-        };
-        let mut statuses = status_handle.write();
-        for (account_id, exhausted) in self.auth_accounts_state.take_quota_status_updates() {
-            statuses
-                .entry(format!("auth:{account_id}"))
-                .or_default()
-                .quota_exhausted = exhausted;
-        }
-    }
 }
 
 fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
