@@ -80,10 +80,18 @@ pub(super) fn apply_pending(
             view.billing = job.result.billing;
         }
         match job.result.check {
-            GrokCheckResult::Available => set_available(view, &mut available),
+            GrokCheckResult::Available => {
+                set_available(view, &mut available);
+                state
+                    .quota_status_updates
+                    .push((job.account_id.clone(), false));
+            }
             GrokCheckResult::QuotaExhausted(err) => {
                 view.availability = AuthAvailability::QuotaExhausted;
                 view.error = Some(err);
+                state
+                    .quota_status_updates
+                    .push((job.account_id.clone(), true));
                 exhausted += 1;
             }
             GrokCheckResult::InvalidAuth(err) => {

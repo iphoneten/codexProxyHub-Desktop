@@ -35,7 +35,8 @@ pub(super) fn provider_attempts(
                 .filter(|account| account.enabled)
                 .map(|account| auth_account_as_provider(account, &cfg.auth))
                 .filter(|p| {
-                    api_key_allows_provider(allowed_providers, &p.name)
+                    !provider_quota_exhausted(state, &p.name)
+                        && api_key_allows_provider(allowed_providers, &p.name)
                         && provider_supports_model(p, &request_model)
                         && provider_supports_api(p, api)
                 }),
@@ -50,6 +51,14 @@ pub(super) fn provider_attempts(
         }
     }
     out
+}
+
+pub(super) fn provider_quota_exhausted(state: &AppState, provider: &str) -> bool {
+    state
+        .provider_statuses
+        .read()
+        .get(provider)
+        .is_some_and(|status| status.quota_exhausted)
 }
 
 fn order_by_priority(
@@ -742,5 +751,24 @@ mod preference_tests {
             names,
             vec!["channel-a".to_string(), "auth:acct-b".to_string()]
         );
+    }
+
+    #[test]
+    fn exhausted_auth_account_is_not_routed_even_when_enabled() {
+        let state = test_state();
+        state
+            .provider_statuses
+            .write()
+            .entry("auth:acct-b".to_string())
+            .or_default()
+            .quota_exhausted = true;
+        let cfg = sample_config("auth_first");
+
+        let names: Vec<_> = provider_attempts(&cfg, &state, "gpt-test", "responses", &[])
+            .into_iter()
+            .map(|(provider, _)| provider.name)
+            .collect();
+
+        assert_eq!(names, vec!["channel-a".to_string()]);
     }
 }

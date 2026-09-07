@@ -432,6 +432,7 @@ fn weighted_order_prefers_fully_healthy_provider_over_recent_failures() {
             inflight: 0,
             open_until: None,
             last_error: Some("temporary".to_string()),
+            quota_exhausted: false,
         },
     );
 

@@ -442,6 +442,7 @@ impl eframe::App for HubApp {
             // 模型同步在后台线程完成，这里不分页面地回收结果，避免切换视图丢失。
             providers::apply_model_sync_pending(config, &mut self.model_sync, &mut self.message);
         }
+        self.sync_auth_quota_status();
         self.sync_config_to_runtime();
 
         egui::TopBottomPanel::top("top")
@@ -588,6 +589,19 @@ impl eframe::App for HubApp {
             500
         };
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+    }
+
+    fn sync_auth_quota_status(&mut self) {
+        let Some(status_handle) = self.circuit_status.as_ref() else {
+            return;
+        };
+        let mut statuses = status_handle.write();
+        for (account_id, exhausted) in self.auth_accounts_state.take_quota_status_updates() {
+            statuses
+                .entry(format!("auth:{account_id}"))
+                .or_default()
+                .quota_exhausted = exhausted;
+        }
     }
 }
 

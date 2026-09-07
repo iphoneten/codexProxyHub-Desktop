@@ -63,6 +63,7 @@ impl Default for AuthAvailability {
 #[derive(Default)]
 pub struct AuthAccountsState {
     views: HashMap<String, AccountQuotaView>,
+    quota_status_updates: Vec<(String, bool)>,
     pending: Arc<Mutex<Vec<QuotaJobResult>>>,
     auto_refresh_next: Option<Instant>,
     grok: grok::GrokCheckState,
@@ -77,6 +78,11 @@ pub struct AuthAccountsState {
     active_account_type: String,
 }
 impl AuthAccountsState {
+    /// 只返回新完成的额度检查结果，避免旧的“可用”缓存覆盖代理刚记录的耗尽状态。
+    pub fn take_quota_status_updates(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.quota_status_updates)
+    }
+
     pub fn has_refreshing(&self) -> bool {
         self.views.values().any(|view| view.refreshing)
             || !self.pending.lock().is_empty()
@@ -788,6 +794,10 @@ fn apply_pending(config: &mut AppConfig, state: &mut AuthAccountsState) {
                 } else {
                     AuthAvailability::Available
                 };
+                state.quota_status_updates.push((
+                    job.account_id.clone(),
+                    view.availability == AuthAvailability::QuotaExhausted,
+                ));
             }
             Err(err) => {
                 view.error = Some(err);

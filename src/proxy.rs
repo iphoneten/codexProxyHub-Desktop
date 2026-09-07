@@ -169,6 +169,9 @@ pub struct ProviderCircuitSnapshot {
     pub inflight: usize,
     pub open_until: Option<Instant>,
     pub last_error: Option<String>,
+    /// 额度已耗尽时，即使配置中的账号仍启用，也不得继续参与路由。
+    /// 该状态由额度刷新结果或实际请求错误设置，额度刷新确认恢复后清除。
+    pub quota_exhausted: bool,
 }
 
 pub type ProviderCircuitStatusHandle = Arc<RwLock<HashMap<String, ProviderCircuitSnapshot>>>;
@@ -238,11 +241,16 @@ impl ProviderCircuitGuard {
         status.failures = 0;
         status.open_until = None;
         status.last_error = None;
+        status.quota_exhausted = false;
         self.completed = true;
     }
 
     fn mark_failure(mut self, status: StatusCode, message: &str, retry_after: Option<Duration>) {
-        let quota_exhausted = quota_exhausted_error(message);
+        // Auth 账号收到 429 时通常表示该账号的额度/速率窗口已耗尽。
+        // 记录为账号级耗尽，避免短暂熔断结束后再次请求同一账号；
+        // 后台额度刷新确认恢复后会清除该标记。
+        let quota_exhausted = quota_exhausted_error(message)
+            || (self.provider.starts_with("auth:") && status == StatusCode::TOO_MANY_REQUESTS);
         if !circuit_breaker_failure(status, message) {
             self.mark_success();
             return;
@@ -273,6 +281,7 @@ impl ProviderCircuitGuard {
                         failures,
                         Some(until),
                         message,
+                        quota_exhausted,
                     );
                     self.completed = true;
                     return;
@@ -286,6 +295,7 @@ impl ProviderCircuitGuard {
                         failures,
                         None,
                         message,
+                        quota_exhausted,
                     );
                     self.completed = true;
                     return;
@@ -300,7 +310,13 @@ impl ProviderCircuitGuard {
             circuit.phase = ProviderCircuitPhase::Open { until };
             let failures = circuit.consecutive_failures;
             drop(circuits);
-            self.update_failure_status(ProviderCircuitStatus::Open, failures, Some(until), message);
+            self.update_failure_status(
+                ProviderCircuitStatus::Open,
+                failures,
+                Some(until),
+                message,
+                quota_exhausted,
+            );
             self.completed = true;
             return;
         }
@@ -325,6 +341,7 @@ impl ProviderCircuitGuard {
             failures,
             until,
             message,
+            quota_exhausted,
         );
         self.completed = true;
     }
@@ -335,6 +352,7 @@ impl ProviderCircuitGuard {
         failures: usize,
         open_until: Option<Instant>,
         message: &str,
+        quota_exhausted: bool,
     ) {
         let mut statuses = self.statuses.write();
         let status = statuses.entry(self.provider.clone()).or_default();
@@ -342,6 +360,9 @@ impl ProviderCircuitGuard {
         status.failures = failures;
         status.open_until = open_until;
         status.last_error = Some(message.to_string());
+        if quota_exhausted {
+            status.quota_exhausted = true;
+        }
     }
 }
 
@@ -365,6 +386,7 @@ impl Drop for ProviderCircuitGuard {
                 failures,
                 Some(until),
                 "半开探测请求中断",
+                false,
             );
         }
 
@@ -1151,5 +1173,10 @@ mod state_tests {
             .unwrap_err();
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.message.contains("熔断冷却中"));
+        assert!(state
+            .provider_statuses
+            .read()
+            .get("quota-text-limited")
+            .is_some_and(|status| status.quota_exhausted));
     }
 }
