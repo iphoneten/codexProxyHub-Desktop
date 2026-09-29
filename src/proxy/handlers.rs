@@ -862,6 +862,7 @@ pub(super) async fn forward_openai(
             let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
             if path == "/chat/completions" {
                 apply_system_prompt_override(&provider, &mut upstream_body);
+                normalize_chat_message_content_types(&mut upstream_body);
             } else if path == "/messages" {
                 apply_anthropic_system_prompt_override(&provider, &mut upstream_body);
             }

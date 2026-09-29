@@ -1088,6 +1088,35 @@ fn responses_to_chat_preserves_function_calls_and_outputs() {
 }
 
 #[test]
+fn chat_request_normalizes_responses_text_content_types() {
+    let mut body = json!({
+        "model": "gpt-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "world"}]
+            }
+        ]
+    });
+
+    normalize_chat_message_content_types(&mut body);
+
+    assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+    assert_eq!(
+        body["messages"][0]["content"][1]["type"],
+        "image_url"
+    );
+}
+
+#[test]
 fn chat_to_response_preserves_tool_calls() {
     let chat = json!({
         "model": "gpt-test",

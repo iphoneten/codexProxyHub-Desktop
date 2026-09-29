@@ -314,6 +314,34 @@ pub(super) fn apply_system_prompt_override(provider: &ProviderConfig, body: &mut
     obj.insert("messages".to_string(), Value::Array(next));
 }
 
+/// 部分 OpenAI 兼容客户端会在 Chat Completions 的 messages 中混用
+/// Responses API 的 input_text/output_text 类型。严格上游只接受 text，
+/// 因此在发往 Chat 端点前统一文本块类型；其它多模态块保持原样。
+pub(super) fn normalize_chat_message_content_types(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(parts) = message
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(obj) = part.as_object_mut() else {
+                continue;
+            };
+            if matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("input_text") | Some("output_text")
+            ) {
+                obj.insert("type".to_string(), Value::String("text".to_string()));
+            }
+        }
+    }
+}
+
 /// Anthropic Messages 协议的 system 提示在**顶层 `system` 字段**，不是 messages 里的一条。
 /// 复用 OpenAI 版会静默无效，所以单独实现一份。
 pub(super) fn apply_anthropic_system_prompt_override(provider: &ProviderConfig, body: &mut Value) {
