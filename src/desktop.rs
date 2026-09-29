@@ -334,6 +334,7 @@ impl HubApp {
             server.shutdown = None;
             server.started_at = None;
             if let Err(err) = result {
+                crate::runtime_log::record("ERROR", "代理启动或运行失败，请查看服务错误提示");
                 server.last_error = Some(err.to_string());
             }
         });

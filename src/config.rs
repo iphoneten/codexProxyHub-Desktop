@@ -257,6 +257,18 @@ pub struct ProviderConfig {
     pub debug_sse_max_events: usize,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    /// 持续重试上游限流和暂时性服务错误，直到成功或请求取消，同时停用渠道熔断冷却。
+    #[serde(default)]
+    pub persistent_retry: bool,
+    /// 空闲时发送上游短对话保活，真实请求优先。
+    #[serde(default)]
+    pub heartbeat_enabled: bool,
+    /// 心跳间隔，单位为秒。
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// 保活模型；留空兼容旧配置，使用渠道第一个有效模型。
+    #[serde(default)]
+    pub heartbeat_model: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default = "default_priority")]
@@ -491,6 +503,10 @@ fn default_connect_timeout() -> u64 {
 fn default_request_timeout() -> u64 {
     60
 }
+fn default_heartbeat_interval_secs() -> u64 {
+    10
+}
+
 fn default_max_retries() -> usize {
     3
 }
@@ -614,6 +630,8 @@ providers:
         .unwrap();
 
         assert_eq!(cfg.providers[0].max_retries, 3);
+        assert!(!cfg.providers[0].heartbeat_enabled);
+        assert_eq!(cfg.providers[0].heartbeat_interval_secs, 10);
     }
 
     #[test]

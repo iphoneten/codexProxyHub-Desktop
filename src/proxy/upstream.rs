@@ -197,16 +197,16 @@ pub(super) async fn send_chat_stream_as_responses(
                     send_body = body.clone();
                     continue;
                 }
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
-                    attempt += 1;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries && err.retryable() => {
                 wait_retry(retry_delay(attempt), ctx).await?;
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
             Err(err) => return Err(err.into_proxy_error()),
@@ -236,7 +236,7 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
         .headers(upstream_headers(provider, request_headers, true))
         .json(&anthropic_body);
 
-    for attempt in 0..=provider.max_retries {
+    for attempt in retry_attempts(provider) {
         match send_stream_request(
             req.try_clone().unwrap(),
             provider.request_timeout,
@@ -285,8 +285,8 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
@@ -306,6 +306,32 @@ pub(super) async fn send_anthropic_chat_stream_as_responses(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_to_provider(
+    state: &AppState,
+    provider: &ProviderConfig,
+    path: &str,
+    request_headers: &HeaderMap,
+    body: Value,
+    stream: bool,
+    started: Instant,
+    ctx: &RequestContext,
+) -> Result<ProviderResult, ProxyError> {
+    // 先构造仅含保活输入的模板，但只有真实请求通过上游校验后才发布。
+    // 与 Python 版一致：开关只控制发送保活，不控制成功请求模板的捕获。
+    let template = (path == "/responses" && provider.auth_account_id.is_none())
+        .then(|| super::keepalive::NativeKeepaliveTemplate::from_request(&body, request_headers));
+    let result = send_to_provider_inner(
+        state, provider, path, request_headers, body, stream, started, ctx,
+    ).await;
+    if result.is_ok() {
+        if let Some(template) = template {
+            super::keepalive::remember_native_template(state, provider, template).await;
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_to_provider_inner(
     state: &AppState,
     provider: &ProviderConfig,
     path: &str,
@@ -411,7 +437,7 @@ pub(super) async fn send_to_provider(
                         Ok(stream) => stream,
                         Err(err) if attempt < provider.max_retries && err.retryable() => {
                             wait_retry(retry_delay(attempt), ctx).await?;
-                            attempt += 1;
+                            attempt = attempt.saturating_add(1);
                             continue;
                         }
                         Err(err) => return Err(err),
@@ -457,16 +483,16 @@ pub(super) async fn send_to_provider(
                         send_body = body.clone();
                         continue;
                     }
-                    if attempt < provider.max_retries && retryable_status(status) {
-                        wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
-                        attempt += 1;
+                    if should_retry_status(provider, attempt, status) {
+                        wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     return Err(upstream_status_error(status, &text, retry_after));
                 }
                 Err(err) if attempt < provider.max_retries && err.retryable() => {
                     wait_retry(retry_delay(attempt), ctx).await?;
-                    attempt += 1;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(err) => return Err(err.into_proxy_error()),
@@ -527,7 +553,7 @@ pub(super) async fn send_anthropic_messages_passthrough(
         .headers(upstream_headers(provider, request_headers, stream))
         .json(&body);
 
-    for attempt in 0..=provider.max_retries {
+    for attempt in retry_attempts(provider) {
         let send_result = if stream {
             send_stream_request(
                 req.try_clone().unwrap(),
@@ -619,8 +645,8 @@ pub(super) async fn send_anthropic_messages_passthrough(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
@@ -664,7 +690,7 @@ pub(super) async fn send_to_anthropic_provider(
         .headers(upstream_headers(provider, request_headers, stream))
         .json(&anthropic_body);
 
-    for attempt in 0..=provider.max_retries {
+    for attempt in retry_attempts(provider) {
         let send_result = if stream {
             send_stream_request(
                 req.try_clone().unwrap(),
@@ -765,8 +791,8 @@ pub(super) async fn send_to_anthropic_provider(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
@@ -808,7 +834,7 @@ pub(super) async fn send_to_google_ai_provider(
         .headers(google_ai_headers(provider, request_headers, stream))
         .json(&google_body);
 
-    for attempt in 0..=provider.max_retries {
+    for attempt in retry_attempts(provider) {
         let send_result = if stream {
             send_stream_request(
                 req.try_clone().unwrap(),
@@ -893,8 +919,8 @@ pub(super) async fn send_to_google_ai_provider(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
@@ -960,7 +986,7 @@ pub(super) async fn send_responses_stream_as_chat(
                     Ok(stream) => stream,
                     Err(err) if attempt < provider.max_retries && err.retryable() => {
                         wait_retry(retry_delay(attempt), ctx).await?;
-                        attempt += 1;
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -990,16 +1016,16 @@ pub(super) async fn send_responses_stream_as_chat(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
-                    attempt += 1;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries && err.retryable() => {
                 wait_retry(retry_delay(attempt), ctx).await?;
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
             Err(err) => return Err(err.into_proxy_error()),
@@ -1091,16 +1117,16 @@ pub(super) async fn send_chat_via_responses(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
-                    attempt += 1;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
             }
             Err(err) if attempt < provider.max_retries => {
                 wait_retry(retry_delay(attempt), ctx).await?;
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 if err.is_timeout() || err.is_connect() || err.is_request() {
                     continue;
                 }
@@ -1139,7 +1165,7 @@ pub(super) async fn send_json_to_provider_with_headers(
     ctx: &RequestContext,
 ) -> Result<Value, ProxyError> {
     let url = upstream_url(provider, path);
-    for attempt in 0..=provider.max_retries {
+    for attempt in retry_attempts(provider) {
         let req = client
             .post(url.clone())
             .timeout(Duration::from_secs(provider.request_timeout.max(1)))
@@ -1163,8 +1189,8 @@ pub(super) async fn send_json_to_provider_with_headers(
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                if attempt < provider.max_retries && retryable_status(status) {
-                    wait_retry(compute_retry_delay(attempt, retry_after), ctx).await?;
+                if should_retry_status(provider, attempt, status) {
+                    wait_status_retry(provider, attempt, status, retry_after, ctx).await?;
                     continue;
                 }
                 return Err(upstream_status_error(status, &text, retry_after));
@@ -1470,7 +1496,7 @@ async fn wait_retry(delay: Duration, ctx: &RequestContext) -> Result<(), ProxyEr
 pub(crate) fn retry_delay(attempt: usize) -> Duration {
     // 指数退避：200ms * 2^attempt，封顶 2s
     let base = (200_u64)
-        .saturating_mul(2_u64.saturating_pow(attempt as u32))
+        .saturating_mul(2_u64.saturating_pow(attempt.min(4) as u32))
         .min(2_000);
     // ±50% jitter，避免多客户端同步重试放大风暴
     let jitter_factor = rand::random::<f64>() - 0.5; // -0.5 ~ +0.5
@@ -1488,17 +1514,15 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     if raw.is_empty() {
         return None;
     }
-    // 兜住上游给出离谱大值的情况
-    const CAP: Duration = Duration::from_secs(60);
     if let Ok(secs) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(secs).min(CAP));
+        return Some(Duration::from_secs(secs));
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(raw) {
         let delta = dt
             .with_timezone(&chrono::Utc)
             .signed_duration_since(chrono::Utc::now());
         if let Ok(d) = delta.to_std() {
-            return Some(d.min(CAP));
+            return Some(d);
         }
     }
     None
@@ -1509,7 +1533,7 @@ pub(crate) fn compute_retry_delay(attempt: usize, retry_after: Option<Duration>)
     if let Some(hint) = retry_after {
         // 加一点点抖动避免同一秒集中撞击
         let extra = (rand::random::<f64>() * 250.0) as u64;
-        return hint + Duration::from_millis(extra);
+        return hint.saturating_add(Duration::from_millis(extra)).max(Duration::from_millis(100));
     }
     retry_delay(attempt)
 }
@@ -1654,4 +1678,120 @@ pub(crate) fn validate_upstream_sse_content_type(
             truncate(&value)
         ))
     }
+}
+
+// 有限模式保留原有次数；持续模式使用饱和计数，避免长期运行溢出。
+fn retry_attempts(provider: &ProviderConfig) -> impl Iterator<Item = usize> {
+    let limit = (!provider.persistent_retry).then_some(provider.max_retries);
+    std::iter::successors(Some(0usize), move |attempt| {
+        if limit.is_some_and(|limit| *attempt >= limit) {
+            None
+        } else {
+            Some(attempt.saturating_add(1))
+        }
+    })
+}
+
+fn should_retry_status(provider: &ProviderConfig, attempt: usize, status: StatusCode) -> bool {
+    (attempt < provider.max_retries && retryable_status(status))
+        || (provider.persistent_retry && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504))
+}
+
+#[cfg(test)]
+mod persistent_retry_tests {
+    use super::*;
+
+    fn provider() -> ProviderConfig {
+        serde_json::from_value(json!({
+            "name": "retry-test", "base_url": "http://127.0.0.1:1/v1",
+            "api_key": "test", "max_retries": 0, "persistent_retry": true
+        })).unwrap()
+    }
+
+    #[test]
+    fn persistent_retry_is_opt_in_and_only_for_transient_statuses() {
+        let mut p = provider();
+        for code in [429, 500, 502, 503, 504] {
+            assert!(should_retry_status(&p, usize::MAX, StatusCode::from_u16(code).unwrap()));
+        }
+        for code in [400, 401, 403, 404, 501, 505] {
+            assert!(!should_retry_status(&p, 0, StatusCode::from_u16(code).unwrap()));
+        }
+        assert_eq!(retry_attempts(&p).take(5).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        p.persistent_retry = false;
+        assert!(!should_retry_status(&p, 0, StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(retry_attempts(&p).collect::<Vec<_>>(), vec![0]);
+        let value = serde_json::to_value(&p).unwrap();
+        let mut legacy = value.clone();
+        legacy.as_object_mut().unwrap().remove("persistent_retry");
+        assert!(!serde_json::from_value::<ProviderConfig>(legacy).unwrap().persistent_retry);
+        assert_eq!(serde_json::to_value(serde_json::from_value::<ProviderConfig>(value.clone()).unwrap()).unwrap(), value);
+    }
+
+    #[test]
+    fn retry_after_is_not_shortened() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(120)));
+        assert!(compute_retry_delay(0, parse_retry_after(&headers)) >= Duration::from_secs(120));
+        assert!(retry_delay(usize::MAX) >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn repeated_429_succeeds_beyond_retry_limit() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move || {
+            let seen = seen.clone();
+            async move {
+                if seen.fetch_add(1, Ordering::SeqCst) < 3 {
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "0")], "busy").into_response()
+                } else {
+                    Json(json!({"ok": true})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut p = provider();
+        p.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(Duration::from_secs(5), send_json_to_provider(
+            &Client::new(), &p, "/chat/completions", &HeaderMap::new(),
+            json!({}), &RequestContext::detached(),
+        )).await;
+        server.abort();
+        assert_eq!(result.unwrap().unwrap()["ok"], true);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_interrupts_retry_after_wait() {
+        let ctx = RequestContext::detached();
+        let cancel = ctx.cancel_token();
+        let task = tokio::spawn(async move { wait_retry(Duration::from_secs(120), &ctx).await });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let err = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap_err();
+        assert!(err.aborted);
+    }
+}
+
+async fn wait_status_retry(
+    provider: &ProviderConfig,
+    attempt: usize,
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    ctx: &RequestContext,
+) -> Result<(), ProxyError> {
+    let delay = compute_retry_delay(attempt, retry_after);
+    let number = attempt.saturating_add(1);
+    // 长时间限流时按 1、2、4、8… 次采样，避免运行日志被重试刷满。
+    if number.is_power_of_two() {
+        crate::runtime_log::record("WARN", format!(
+            "渠道 {}：上游 HTTP {}，第 {} 次重试，等待 {:.2} 秒{}",
+            provider.name, status.as_u16(), number, delay.as_secs_f64(),
+            if provider.persistent_retry { "（持续重试）" } else { "" },
+        ));
+    }
+    wait_retry(delay, ctx).await
 }

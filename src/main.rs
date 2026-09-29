@@ -14,6 +14,7 @@ mod macos_tray;
 mod oauth_login;
 mod proxy;
 mod request_ctx;
+mod runtime_log;
 mod responses_api;
 mod web;
 

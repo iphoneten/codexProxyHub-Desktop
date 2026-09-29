@@ -1,0 +1,113 @@
+{
+  "source_request": {
+    "model": "client-model",
+    "instructions": "synthetic-private-instructions",
+    "input": [
+      {
+        "role": "developer",
+        "content": "synthetic-private-history"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "synthetic-codex-context"
+          },
+          {
+            "type": "input_image",
+            "image_url": "https://example.test/synthetic.png"
+          },
+          {
+            "type": "input_text",
+            "text": "synthetic-private-question"
+          }
+        ]
+      }
+    ],
+    "previous_response_id": "resp_synthetic_previous",
+    "stream": false,
+    "max_output_tokens": 4096,
+    "reasoning": {
+      "effort": "low",
+      "summary": "auto"
+    },
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "function",
+        "name": "synthetic_tool",
+        "description": "A synthetic test tool",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ],
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "store": false
+  },
+  "expected_body": {
+    "model": "heartbeat-model",
+    "instructions": "You are Codex. Reply briefly.",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "synthetic-codex-context"
+          },
+          {
+            "type": "input_image",
+            "image_url": "https://example.test/synthetic.png"
+          },
+          {
+            "type": "input_text",
+            "text": "Hi"
+          }
+        ]
+      }
+    ],
+    "stream": true,
+    "max_output_tokens": 1,
+    "reasoning": {
+      "effort": "low",
+      "summary": "auto"
+    },
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "function",
+        "name": "synthetic_tool",
+        "description": "A synthetic test tool",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ],
+    "text": {
+      "format": {
+        "type": "text"
+      }
+    },
+    "store": false
+  }
+}

@@ -40,6 +40,7 @@ mod auth;
 mod handlers;
 mod oauth;
 mod request_layer;
+mod keepalive;
 mod routing;
 mod streaming;
 mod upstream;
@@ -205,6 +206,7 @@ impl Default for ProviderCircuit {
 #[derive(Debug)]
 struct ProviderCircuitGuard {
     provider: String,
+    config: ConfigHandle,
     circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
     statuses: ProviderCircuitStatusHandle,
     inflight: Arc<AtomicUsize>,
@@ -214,9 +216,10 @@ struct ProviderCircuitGuard {
 
 impl ProviderCircuitGuard {
     fn mark_success(mut self) {
+        let persistent_retry = persistent_retry_enabled(&self.config, &self.provider);
         let mut circuits = self.circuits.lock();
         let circuit = circuits.entry(self.provider.clone()).or_default();
-        if !self.half_open_probe
+        if !persistent_retry && !self.half_open_probe
             && matches!(
                 circuit.phase,
                 ProviderCircuitPhase::Open { .. } | ProviderCircuitPhase::HalfOpen { .. }
@@ -251,6 +254,15 @@ impl ProviderCircuitGuard {
         // 后台额度刷新确认恢复后会清除该标记。
         let quota_exhausted = quota_exhausted_error(message)
             || (self.provider.starts_with("auth:") && status == StatusCode::TOO_MANY_REQUESTS);
+        // 读取当前配置，让开关生效前已经在飞的请求也不能重新触发熔断。
+        if persistent_retry_enabled(&self.config, &self.provider) {
+            clear_provider_cooldown(&self.circuits, &self.statuses, &self.provider);
+            self.update_failure_status(
+                ProviderCircuitStatus::Healthy, 0, None, message, quota_exhausted,
+            );
+            self.completed = true;
+            return;
+        }
         if !circuit_breaker_failure(status, message) {
             self.mark_success();
             return;
@@ -368,7 +380,10 @@ impl ProviderCircuitGuard {
 
 impl Drop for ProviderCircuitGuard {
     fn drop(&mut self) {
-        if !self.completed && self.half_open_probe {
+        let persistent_retry = persistent_retry_enabled(&self.config, &self.provider);
+        if !self.completed && persistent_retry {
+            clear_provider_cooldown(&self.circuits, &self.statuses, &self.provider);
+        } else if !self.completed && self.half_open_probe {
             let until = Instant::now() + PROVIDER_CIRCUIT_DEFAULT_COOLDOWN;
             let failures = {
                 let mut circuits = self.circuits.lock();
@@ -394,6 +409,26 @@ impl Drop for ProviderCircuitGuard {
         let mut statuses = self.statuses.write();
         statuses.entry(self.provider.clone()).or_default().inflight = remaining;
     }
+}
+
+fn persistent_retry_enabled(config: &ConfigHandle, provider: &str) -> bool {
+    config.read().providers.iter()
+        .any(|item| item.name == provider && item.persistent_retry)
+}
+
+fn clear_provider_cooldown(
+    circuits: &Mutex<HashMap<String, ProviderCircuit>>,
+    statuses: &ProviderCircuitStatusHandle,
+    provider: &str,
+) {
+    let mut circuits = circuits.lock();
+    circuits.insert(provider.to_string(), ProviderCircuit::default());
+    let mut statuses = statuses.write();
+    let status = statuses.entry(provider.to_string()).or_default();
+    status.status = ProviderCircuitStatus::Healthy;
+    status.failures = 0;
+    status.open_until = None;
+    // 解除熔断不等于请求成功，保留最近错误、在飞数和独立的额度状态。
 }
 
 fn circuit_breaker_failure(status: StatusCode, message: &str) -> bool {
@@ -445,6 +480,9 @@ struct AppState {
     api_key_limiters: Arc<Mutex<HashMap<String, ApiKeyLimiter>>>,
     provider_circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
     provider_loads: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
+    keepalive_requests: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    keepalive_templates: Arc<Mutex<HashMap<String, keepalive::NativeKeepaliveTemplate>>>,
+    keepalive_template_store: Arc<keepalive::TemplateStore>,
     provider_statuses: ProviderCircuitStatusHandle,
     session_affinity: Arc<Mutex<HashMap<String, SessionAffinity>>>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
@@ -598,6 +636,9 @@ impl AppState {
     }
 
     fn begin_provider_attempt(&self, provider: &str) -> Result<ProviderCircuitGuard, ProxyError> {
+        if persistent_retry_enabled(&self.config, provider) {
+            clear_provider_cooldown(&self.provider_circuits, &self.provider_statuses, provider);
+        }
         let now = Instant::now();
         let mut circuits = self.provider_circuits.lock();
         let circuit = circuits.entry(provider.to_string()).or_default();
@@ -645,6 +686,9 @@ impl AppState {
                 .clone()
         };
         let current_inflight = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(cancel) = self.keepalive_requests.lock().get(provider) {
+            cancel.cancel();
+        }
         self.provider_statuses
             .write()
             .entry(provider.to_string())
@@ -653,6 +697,7 @@ impl AppState {
 
         Ok(ProviderCircuitGuard {
             provider: provider.to_string(),
+            config: Arc::clone(&self.config),
             circuits: Arc::clone(&self.provider_circuits),
             statuses: Arc::clone(&self.provider_statuses),
             inflight,
@@ -665,6 +710,8 @@ impl AppState {
 fn build_http_client(connect_timeout: u64, proxy_url: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(connect_timeout.max(1)))
         .danger_accept_invalid_certs(false);
     if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
@@ -923,6 +970,7 @@ pub async fn run_server(
     };
     let addr: SocketAddr = format!("{}:{}", bind_host, initial.server.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    crate::runtime_log::record("INFO", "代理监听已就绪");
     recover_interrupted_usage_logs(initial.usage_log_sqlite_path());
     let root_cancel = CancellationToken::new();
     let state = AppState {
@@ -932,6 +980,11 @@ pub async fn run_server(
         api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
         provider_circuits: Arc::new(Mutex::new(HashMap::new())),
         provider_loads: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_requests: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_templates: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_template_store: Arc::new(keepalive::TemplateStore::new(
+            initial.resolve_runtime_path("keepalive-templates"),
+        )),
         provider_statuses: circuit_status,
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
@@ -939,6 +992,8 @@ pub async fn run_server(
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         root_cancel: root_cancel.clone(),
     };
+    keepalive::restore_native_templates(&state).await;
+    let keepalive_task = tokio::spawn(keepalive::run_idle_keepalive(state.clone()));
     let mut app = Router::new()
         .route("/", get(index))
         .route("/v1", get(index))
@@ -985,10 +1040,14 @@ pub async fn run_server(
             // 先取消在飞请求再让 graceful shutdown 收尾：
             // 流式响应体不会自己结束，不取消的话 axum 会一直等着它们，
             // 桌面端「停止」按钮看起来就像卡住了。
+            crate::runtime_log::record("INFO", "代理正在停止，取消运行中的请求");
             root_cancel.cancel();
         })
         .await;
+    keepalive_task.abort();
+    let _ = keepalive_task.await;
     result?;
+    crate::runtime_log::record("INFO", "代理已停止");
     Ok(())
 }
 
@@ -1063,6 +1122,69 @@ mod validate_config_tests {
 mod state_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn idle_keepalive_skips_busy_channel_then_sends_when_idle() {
+        let state = test_state();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["max_tokens"], 1);
+                assert_eq!(body["temperature"], 0);
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                } else {
+                    Response::builder().header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ))).unwrap()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider: ProviderConfig = serde_json::from_value(json!({
+            "name": "idle-test", "base_url": format!("http://{}/v1", listener.local_addr().unwrap()),
+            "api_key": "test", "models": ["test"], "heartbeat_enabled": true,
+            "heartbeat_interval_secs": 1, "max_retries": 0
+        })).unwrap();
+        let mut cfg = (*state.snapshot()).clone();
+        cfg.providers = vec![provider];
+        *state.config.write() = Arc::new(cfg);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let guard = state.begin_provider_attempt("idle-test").unwrap();
+        let worker = tokio::spawn(keepalive::run_idle_keepalive(state.clone()));
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        let busy_count = count.load(Ordering::SeqCst);
+        drop(guard);
+        let received = tokio::time::timeout(Duration::from_secs(4), async {
+            while count.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await;
+        state.root_cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), worker).await;
+        server.abort();
+        assert_eq!(busy_count, 0);
+        assert!(received.is_ok());
+        assert!(stopped.unwrap().is_ok());
+    }
+
+    #[test]
+    fn real_request_cancels_idle_keepalive_and_releases_load() {
+        let state = test_state();
+        let cancel = CancellationToken::new();
+        state.keepalive_requests.lock().insert("test".to_string(), cancel.clone());
+        let guard = state.begin_provider_attempt("test").unwrap();
+        assert!(cancel.is_cancelled());
+        assert_eq!(state.provider_loads.lock()["test"].load(Ordering::Acquire), 1);
+        drop(guard);
+        assert_eq!(state.provider_loads.lock()["test"].load(Ordering::Acquire), 0);
+    }
+
     fn test_state() -> AppState {
         AppState {
             config: Arc::new(RwLock::new(Arc::new(
@@ -1073,6 +1195,9 @@ mod state_tests {
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             provider_circuits: Arc::new(Mutex::new(HashMap::new())),
             provider_loads: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_requests: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_templates: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_template_store: Arc::new(keepalive::TemplateStore::default()),
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),

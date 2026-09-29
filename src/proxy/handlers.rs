@@ -301,61 +301,119 @@ pub(super) async fn responses(
     }
     dedupe_provider_attempts(&mut providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut last_error = None;
+    let heartbeat = stream && providers.iter().any(|(provider, _)| provider.persistent_retry);
+    let heartbeat_ctx = ctx.clone();
+    let operation = async move {
+        let mut last_error = None;
 
-    for (provider, request_model) in providers {
-        let started = Instant::now();
-        let provider = match state.provider_with_fresh_oauth(&provider).await {
-            Ok(provider) => provider,
-            Err(err) => {
-                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
-                continue;
-            }
-        };
-        let circuit_guard =
-            match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    last_error = Some(failure);
+        for (provider, request_model) in providers {
+            let started = Instant::now();
+            let provider = match state.provider_with_fresh_oauth(&provider).await {
+                Ok(provider) => provider,
+                Err(err) => {
+                    last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                     continue;
                 }
             };
-        let upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
-        let upstream_attempt_model = upstream_body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(&request_model);
-        let mut early_log_id = start_stream_attempt_log_for_key(
-            &cfg,
-            stream,
-            "responses",
-            &provider.name,
-            &model,
-            upstream_attempt_model,
-            started,
-            &api_key_id,
-            &api_key_name,
-            ctx.request_id(),
-        );
+            let circuit_guard =
+                match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
+                    Ok(guard) => guard,
+                    Err(failure) => {
+                        last_error = Some(failure);
+                        continue;
+                    }
+                };
+            let upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
+            let upstream_attempt_model = upstream_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&request_model);
+            let mut early_log_id = start_stream_attempt_log_for_key(
+                &cfg,
+                stream,
+                "responses",
+                &provider.name,
+                &model,
+                upstream_attempt_model,
+                started,
+                &api_key_id,
+                &api_key_name,
+                ctx.request_id(),
+            );
 
-        // force_chat：判断本次 /responses 请求是否**从一开始就走 chat 翻译**。
-        //
-        // 之前这里还多加了一条 `supports_responses == Some(false) → force_chat`，
-        // 结果对像 rawchat 这类 "配置写着 supports_responses:false，但实际 /responses
-        // 端点才是活的、/chat/completions 反而是死链路" 的上游，直接被打进了死路径。
-        //
-        // 现在与 codeProxyHub 的 `_provider_prefers_chat_responses` 规则对齐：
-        //   1. responses_mode == "chat"：显式指定走 chat（用户强制）
-        //   2. provider_type == "anthropic"：Anthropic 上游走 /messages（chat 翻译层再桥接）
-        //   3. Google Gemini 的 OpenAI 端点：只支持 chat，不支持 /responses
-        // 其它一律先尝试 native /responses；失败时下面的 auto-fallback 分支会自动降级 chat。
-        let force_chat = provider_prefers_chat_responses(&provider);
-        if force_chat {
-            match forward_responses_as_chat(
+            // force_chat：判断本次 /responses 请求是否**从一开始就走 chat 翻译**。
+            //
+            // 之前这里还多加了一条 `supports_responses == Some(false) → force_chat`，
+            // 结果对像 rawchat 这类 "配置写着 supports_responses:false，但实际 /responses
+            // 端点才是活的、/chat/completions 反而是死链路" 的上游，直接被打进了死路径。
+            //
+            // 现在与 codeProxyHub 的 `_provider_prefers_chat_responses` 规则对齐：
+            //   1. responses_mode == "chat"：显式指定走 chat（用户强制）
+            //   2. provider_type == "anthropic"：Anthropic 上游走 /messages（chat 翻译层再桥接）
+            //   3. Google Gemini 的 OpenAI 端点：只支持 chat，不支持 /responses
+            // 其它一律先尝试 native /responses；失败时下面的 auto-fallback 分支会自动降级 chat。
+            let force_chat = provider_prefers_chat_responses(&provider);
+            if force_chat {
+                match forward_responses_as_chat(
+                    &state,
+                    &provider,
+                    &headers,
+                    upstream_body,
+                    stream,
+                    started,
+                    &ctx,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        return Ok(commit_result(
+                            state.snapshot(),
+                            state,
+                            "responses",
+                            &provider.name,
+                            &model,
+                            &affinity_key,
+                            &request_model,
+                            result,
+                            started,
+                            stream,
+                            early_log_id.take(),
+                            permit.take(),
+                            &api_key_id,
+                            &api_key_name,
+                            &ctx,
+                            Some(circuit_guard),
+                        ));
+                    }
+                    Err(err) => {
+                        let aborted = record_attempt_failure(circuit_guard, &err);
+                        finish_failed_attempt_log_for_key(
+                            &cfg,
+                            early_log_id.take(),
+                            "responses",
+                            &provider.name,
+                            &model,
+                            started,
+                            &err.message,
+                            &api_key_id,
+                            &api_key_name,
+                            ctx.request_id(),
+                        );
+                        if aborted {
+                            return Err(err);
+                        }
+                        last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
+                    }
+                }
+                continue;
+            }
+
+            match send_to_provider(
                 &state,
                 &provider,
+                "/responses",
                 &headers,
-                upstream_body,
+                upstream_body.clone(),
                 stream,
                 started,
                 &ctx,
@@ -382,121 +440,94 @@ pub(super) async fn responses(
                         Some(circuit_guard),
                     ));
                 }
-                Err(err) => {
-                    let aborted = record_attempt_failure(circuit_guard, &err);
-                    finish_failed_attempt_log_for_key(
-                        &cfg,
-                        early_log_id.take(),
-                        "responses",
-                        &provider.name,
-                        &model,
-                        started,
-                        &err.message,
-                        &api_key_id,
-                        &api_key_name,
-                        ctx.request_id(),
-                    );
-                    if aborted {
-                        return Err(err);
-                    }
-                    last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
-                }
-            }
-            continue;
-        }
-
-        match send_to_provider(
-            &state,
-            &provider,
-            "/responses",
-            &headers,
-            upstream_body.clone(),
-            stream,
-            started,
-            &ctx,
-        )
-        .await
-        {
-            Ok(result) => {
-                return Ok(commit_result(
-                    state.snapshot(),
-                    state,
-                    "responses",
-                    &provider.name,
-                    &model,
-                    &affinity_key,
-                    &request_model,
-                    result,
-                    started,
-                    stream,
-                    early_log_id.take(),
-                    permit.take(),
-                    &api_key_id,
-                    &api_key_name,
-                    &ctx,
-                    Some(circuit_guard),
-                ));
-            }
-            Err(err)
-                if should_fallback_responses_to_chat(&provider, err.status) =>
-            {
-                let chat_body = upstream_body;
-                match forward_responses_as_chat(
-                    &state, &provider, &headers, chat_body, stream, started, &ctx,
-                )
-                .await
+                Err(err)
+                    if should_fallback_responses_to_chat(&provider, err.status) =>
                 {
-                    Ok(result) => {
-                        return Ok(commit_result(
-                            state.snapshot(),
-                            state,
-                            "responses",
-                            &provider.name,
-                            &model,
-                            &affinity_key,
-                            &request_model,
-                            result,
-                            started,
-                            stream,
-                            early_log_id.take(),
-                            permit.take(),
-                            &api_key_id,
-                            &api_key_name,
-                            &ctx,
-                            Some(circuit_guard),
-                        ));
+                    let chat_body = upstream_body;
+                    match forward_responses_as_chat(
+                        &state, &provider, &headers, chat_body, stream, started, &ctx,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            return Ok(commit_result(
+                                state.snapshot(),
+                                state,
+                                "responses",
+                                &provider.name,
+                                &model,
+                                &affinity_key,
+                                &request_model,
+                                result,
+                                started,
+                                stream,
+                                early_log_id.take(),
+                                permit.take(),
+                                &api_key_id,
+                                &api_key_name,
+                                &ctx,
+                                Some(circuit_guard),
+                            ));
+                        }
+                        Err(chat_err) => {
+                            let aborted = record_attempt_failure(circuit_guard, &chat_err);
+                            finish_failed_attempt_log_for_key(
+                                &cfg,
+                                early_log_id.take(),
+                                "responses",
+                                &provider.name,
+                                &model,
+                                started,
+                                &chat_err.message,
+                                &api_key_id,
+                                &api_key_name,
+                                ctx.request_id(),
+                            );
+                            if aborted {
+                                return Err(chat_err);
+                            }
+                            last_error = Some(AttemptFailure::new(
+                                &provider,
+                                &request_model,
+                                started,
+                                chat_err,
+                            ));
+                        }
                     }
-                    Err(chat_err) => {
-                        let aborted = record_attempt_failure(circuit_guard, &chat_err);
+                }
+                Err(err) => {
+                    let _ = record_attempt_failure(circuit_guard, &err);
+                    let failure = AttemptFailure::new(&provider, &request_model, started, err);
+                    // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
+                    if should_stop_failover(failure.status) {
                         finish_failed_attempt_log_for_key(
                             &cfg,
                             early_log_id.take(),
                             "responses",
-                            &provider.name,
+                            &failure.provider,
                             &model,
-                            started,
-                            &chat_err.message,
+                            failure.started,
+                            &failure.message,
                             &api_key_id,
                             &api_key_name,
                             ctx.request_id(),
                         );
-                        if aborted {
-                            return Err(chat_err);
+                        if !stream {
+                            log_error(
+                                &cfg,
+                                "responses",
+                                &failure.provider,
+                                &failure.request_model,
+                                failure.started,
+                                None,
+                                &failure.message,
+                                &api_key_id,
+                                &api_key_name,
+                                ctx.request_id(),
+                            );
                         }
-                        last_error = Some(AttemptFailure::new(
-                            &provider,
-                            &request_model,
-                            started,
-                            chat_err,
-                        ));
+                        return Err(ProxyError::new(failure.status, failure.message));
                     }
-                }
-            }
-            Err(err) => {
-                let _ = record_attempt_failure(circuit_guard, &err);
-                let failure = AttemptFailure::new(&provider, &request_model, started, err);
-                // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
-                if should_stop_failover(failure.status) {
                     finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
@@ -509,64 +540,38 @@ pub(super) async fn responses(
                         &api_key_name,
                         ctx.request_id(),
                     );
-                    if !stream {
-                        log_error(
-                            &cfg,
-                            "responses",
-                            &failure.provider,
-                            &failure.request_model,
-                            failure.started,
-                            None,
-                            &failure.message,
-                            &api_key_id,
-                            &api_key_name,
-                            ctx.request_id(),
-                        );
-                    }
-                    return Err(ProxyError::new(failure.status, failure.message));
+                    last_error = Some(failure);
                 }
-                finish_failed_attempt_log_for_key(
+            }
+        }
+
+        if let Some(failure) = last_error {
+            if !stream {
+                log_error(
                     &cfg,
-                    early_log_id.take(),
                     "responses",
                     &failure.provider,
-                    &model,
+                    &failure.request_model,
                     failure.started,
+                    None,
                     &failure.message,
                     &api_key_id,
                     &api_key_name,
                     ctx.request_id(),
                 );
-                last_error = Some(failure);
             }
+            return Err(ProxyError::new(
+                final_failover_status(failure.status),
+                failure.message,
+            ));
         }
-    }
 
-    if let Some(failure) = last_error {
-        if !stream {
-            log_error(
-                &cfg,
-                "responses",
-                &failure.provider,
-                &failure.request_model,
-                failure.started,
-                None,
-                &failure.message,
-                &api_key_id,
-                &api_key_name,
-                ctx.request_id(),
-            );
-        }
-        return Err(ProxyError::new(
-            final_failover_status(failure.status),
-            failure.message,
-        ));
-    }
-
-    Err(ProxyError::new(
-        StatusCode::BAD_GATEWAY,
-        format!("模型 '{}' 没有可用渠道", model),
-    ))
+        Err(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("模型 '{}' 没有可用渠道", model),
+        ))
+    };
+    super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, "responses").await
 }
 
 pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool {
@@ -832,149 +837,180 @@ pub(super) async fn forward_openai(
     }
     dedupe_provider_attempts(&mut providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut last_error = None;
+    let heartbeat = stream && providers.iter().any(|(provider, _)| provider.persistent_retry);
+    let heartbeat_ctx = ctx.clone();
+    let operation = async move {
+        let mut last_error = None;
 
-    for (provider, request_model) in providers {
-        let started = Instant::now();
-        let provider = match state.provider_with_fresh_oauth(&provider).await {
-            Ok(provider) => provider,
-            Err(err) => {
-                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
-                continue;
-            }
-        };
-        let circuit_guard =
-            match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    last_error = Some(failure);
+        for (provider, request_model) in providers {
+            let started = Instant::now();
+            let provider = match state.provider_with_fresh_oauth(&provider).await {
+                Ok(provider) => provider,
+                Err(err) => {
+                    last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                     continue;
                 }
             };
-        let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
-        if path == "/chat/completions" {
-            apply_system_prompt_override(&provider, &mut upstream_body);
-        } else if path == "/messages" {
-            apply_anthropic_system_prompt_override(&provider, &mut upstream_body);
-        }
-        let upstream_attempt_model = upstream_body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(&request_model);
-        let mut early_log_id = start_stream_attempt_log_for_key(
-            &cfg,
-            stream,
-            api,
-            &provider.name,
-            &model,
-            upstream_attempt_model,
-            started,
-            &api_key_id,
-            &api_key_name,
-            ctx.request_id(),
-        );
-        // chat/completions 路径下预留一份 body 用于 responses fallback
-        let fallback_body = if path == "/chat/completions" {
-            Some(upstream_body.clone())
-        } else {
-            None
-        };
-        match send_to_provider(
-            &state,
-            &provider,
-            path,
-            &headers,
-            upstream_body,
-            stream,
-            started,
-            &ctx,
-        )
-        .await
-        {
-            Ok(result) => {
-                return Ok(commit_result(
-                    state.snapshot(),
-                    state,
-                    api,
-                    &provider.name,
-                    &model,
-                    &affinity_key,
-                    &request_model,
-                    result,
-                    started,
-                    stream,
-                    early_log_id.take(),
-                    permit.take(),
-                    &api_key_id,
-                    &api_key_name,
-                    &ctx,
-                    Some(circuit_guard),
-                ));
+            let circuit_guard =
+                match begin_attempt_or_record_failure(&state, &provider, &request_model, started) {
+                    Ok(guard) => guard,
+                    Err(failure) => {
+                        last_error = Some(failure);
+                        continue;
+                    }
+                };
+            let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
+            if path == "/chat/completions" {
+                apply_system_prompt_override(&provider, &mut upstream_body);
+            } else if path == "/messages" {
+                apply_anthropic_system_prompt_override(&provider, &mut upstream_body);
             }
-            Err(err) => {
-                // 上游不支持 /chat/completions 时（404/405），自动降级到 /responses 反向翻译
-                if let (Some(fb), true) = (
-                    fallback_body,
-                    err.status == StatusCode::NOT_FOUND
-                        || err.status == StatusCode::METHOD_NOT_ALLOWED,
-                ) {
-                    match send_chat_via_responses(
-                        &state, &provider, &headers, fb, stream, started, &ctx,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            return Ok(commit_result(
-                                state.snapshot(),
-                                state,
-                                api,
-                                &provider.name,
-                                &model,
-                                &affinity_key,
-                                &request_model,
-                                result,
-                                started,
-                                stream,
-                                early_log_id.take(),
-                                permit.take(),
-                                &api_key_id,
-                                &api_key_name,
-                                &ctx,
-                                Some(circuit_guard),
-                            ));
+            let upstream_attempt_model = upstream_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&request_model);
+            let mut early_log_id = start_stream_attempt_log_for_key(
+                &cfg,
+                stream,
+                api,
+                &provider.name,
+                &model,
+                upstream_attempt_model,
+                started,
+                &api_key_id,
+                &api_key_name,
+                ctx.request_id(),
+            );
+            // chat/completions 路径下预留一份 body 用于 responses fallback
+            let fallback_body = if path == "/chat/completions" {
+                Some(upstream_body.clone())
+            } else {
+                None
+            };
+            match send_to_provider(
+                &state,
+                &provider,
+                path,
+                &headers,
+                upstream_body,
+                stream,
+                started,
+                &ctx,
+            )
+            .await
+            {
+                Ok(result) => {
+                    return Ok(commit_result(
+                        state.snapshot(),
+                        state,
+                        api,
+                        &provider.name,
+                        &model,
+                        &affinity_key,
+                        &request_model,
+                        result,
+                        started,
+                        stream,
+                        early_log_id.take(),
+                        permit.take(),
+                        &api_key_id,
+                        &api_key_name,
+                        &ctx,
+                        Some(circuit_guard),
+                    ));
+                }
+                Err(err) => {
+                    // 上游不支持 /chat/completions 时（404/405），自动降级到 /responses 反向翻译
+                    if let (Some(fb), true) = (
+                        fallback_body,
+                        err.status == StatusCode::NOT_FOUND
+                            || err.status == StatusCode::METHOD_NOT_ALLOWED,
+                    ) {
+                        match send_chat_via_responses(
+                            &state, &provider, &headers, fb, stream, started, &ctx,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                return Ok(commit_result(
+                                    state.snapshot(),
+                                    state,
+                                    api,
+                                    &provider.name,
+                                    &model,
+                                    &affinity_key,
+                                    &request_model,
+                                    result,
+                                    started,
+                                    stream,
+                                    early_log_id.take(),
+                                    permit.take(),
+                                    &api_key_id,
+                                    &api_key_name,
+                                    &ctx,
+                                    Some(circuit_guard),
+                                ));
+                            }
+                            Err(fb_err) => {
+                                let aborted = record_attempt_failure(circuit_guard, &fb_err);
+                                finish_failed_attempt_log_for_key(
+                                    &cfg,
+                                    early_log_id.take(),
+                                    api,
+                                    &provider.name,
+                                    &model,
+                                    started,
+                                    &fb_err.message,
+                                    &api_key_id,
+                                    &api_key_name,
+                                    ctx.request_id(),
+                                );
+                                if aborted {
+                                    return Err(fb_err);
+                                }
+                                last_error = Some(AttemptFailure::new(
+                                    &provider,
+                                    &request_model,
+                                    started,
+                                    fb_err,
+                                ));
+                                continue;
+                            }
                         }
-                        Err(fb_err) => {
-                            let aborted = record_attempt_failure(circuit_guard, &fb_err);
-                            finish_failed_attempt_log_for_key(
+                    }
+                    let _ = record_attempt_failure(circuit_guard, &err);
+                    let failure = AttemptFailure::new(&provider, &request_model, started, err);
+                    // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
+                    // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
+                    if should_stop_failover(failure.status) {
+                        finish_failed_attempt_log_for_key(
+                            &cfg,
+                            early_log_id.take(),
+                            api,
+                            &failure.provider,
+                            &model,
+                            failure.started,
+                            &failure.message,
+                            &api_key_id,
+                            &api_key_name,
+                            ctx.request_id(),
+                        );
+                        if !stream {
+                            log_error(
                                 &cfg,
-                                early_log_id.take(),
                                 api,
-                                &provider.name,
-                                &model,
-                                started,
-                                &fb_err.message,
+                                &failure.provider,
+                                &failure.request_model,
+                                failure.started,
+                                None,
+                                &failure.message,
                                 &api_key_id,
                                 &api_key_name,
                                 ctx.request_id(),
                             );
-                            if aborted {
-                                return Err(fb_err);
-                            }
-                            last_error = Some(AttemptFailure::new(
-                                &provider,
-                                &request_model,
-                                started,
-                                fb_err,
-                            ));
-                            continue;
                         }
+                        return Err(ProxyError::new(failure.status, failure.message));
                     }
-                }
-                let _ = record_attempt_failure(circuit_guard, &err);
-                let failure = AttemptFailure::new(&provider, &request_model, started, err);
-                // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
-                // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
-                if should_stop_failover(failure.status) {
                     finish_failed_attempt_log_for_key(
                         &cfg,
                         early_log_id.take(),
@@ -987,64 +1023,38 @@ pub(super) async fn forward_openai(
                         &api_key_name,
                         ctx.request_id(),
                     );
-                    if !stream {
-                        log_error(
-                            &cfg,
-                            api,
-                            &failure.provider,
-                            &failure.request_model,
-                            failure.started,
-                            None,
-                            &failure.message,
-                            &api_key_id,
-                            &api_key_name,
-                            ctx.request_id(),
-                        );
-                    }
-                    return Err(ProxyError::new(failure.status, failure.message));
+                    last_error = Some(failure);
                 }
-                finish_failed_attempt_log_for_key(
+            }
+        }
+
+        if let Some(failure) = last_error {
+            if !stream {
+                log_error(
                     &cfg,
-                    early_log_id.take(),
                     api,
                     &failure.provider,
-                    &model,
+                    &failure.request_model,
                     failure.started,
+                    None,
                     &failure.message,
                     &api_key_id,
                     &api_key_name,
                     ctx.request_id(),
                 );
-                last_error = Some(failure);
             }
+            return Err(ProxyError::new(
+                final_failover_status(failure.status),
+                failure.message,
+            ));
         }
-    }
 
-    if let Some(failure) = last_error {
-        if !stream {
-            log_error(
-                &cfg,
-                api,
-                &failure.provider,
-                &failure.request_model,
-                failure.started,
-                None,
-                &failure.message,
-                &api_key_id,
-                &api_key_name,
-                ctx.request_id(),
-            );
-        }
-        return Err(ProxyError::new(
-            final_failover_status(failure.status),
-            failure.message,
-        ));
-    }
-
-    Err(ProxyError::new(
-        StatusCode::BAD_GATEWAY,
-        format!("模型 '{}' 没有可用渠道", model),
-    ))
+        Err(ProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("模型 '{}' 没有可用渠道", model),
+        ))
+    };
+    super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, api).await
 }
 
 pub(super) fn commit_result(

@@ -97,6 +97,7 @@ impl LogStatusFilter {
 }
 
 pub struct LogViewState {
+    runtime_tab: bool,
     pub(crate) rows: Vec<LogRow>,
     pub(crate) loaded_path: String,
     loaded_range: LogRange,
@@ -115,6 +116,7 @@ pub struct LogViewState {
 impl Default for LogViewState {
     fn default() -> Self {
         Self {
+            runtime_tab: false,
             rows: Vec::new(),
             loaded_path: String::new(),
             loaded_range: LogRange::default(),
@@ -163,6 +165,15 @@ pub fn logs_section(
     message: &mut AppMessage,
     loading_gif: Option<&AnimatedGif>,
 ) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut log_view.runtime_tab, false, "请求日志");
+        ui.selectable_value(&mut log_view.runtime_tab, true, "运行时日志");
+    });
+    ui.add_space(8.0);
+    if log_view.runtime_tab {
+        runtime_logs_section(ui);
+        return;
+    }
     const LOG_PAGE_SIZE: usize = 20;
     let path = config.usage_log_sqlite_path();
     let source_key = format!("sqlite:{}", path.display());
@@ -1082,4 +1093,27 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
     }
+}
+
+fn runtime_logs_section(ui: &mut egui::Ui) {
+    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    section(ui, "运行时日志", |ui| {
+        ui.horizontal(|ui| {
+            if soft_button(ui, "清空运行时日志").clicked() {
+                crate::runtime_log::clear();
+            }
+            ui.label("仅保留本次运行最近 1000 条；包含上游保活状态，不计入请求统计");
+        });
+        let entries = crate::runtime_log::snapshot();
+        if entries.is_empty() {
+            ui.label(egui::RichText::new("暂无运行时日志").color(muteds()));
+        }
+        for entry in entries {
+            ui.horizontal_wrapped(|ui| {
+                ui.monospace(entry.time);
+                ui.label(entry.level);
+                ui.label(entry.message);
+            });
+        }
+    });
 }

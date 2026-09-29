@@ -472,7 +472,7 @@ fn provider_detail_panel(
                 });
             ui.horizontal_wrapped(|ui| {
                 form_label(ui, "熔断状态");
-                provider_circuit_detail(ui, circuit_status, &provider.name);
+                provider_circuit_detail(ui, circuit_status, &provider.name, provider.persistent_retry);
             });
         });
 
@@ -507,6 +507,34 @@ fn provider_detail_panel(
                     ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
                     form_label(ui, "Stream Idle");
                     ui.add(egui::DragValue::new(&mut provider.stream_idle_timeout).range(0..=3600));
+                    ui.end_row();
+
+                    form_label(ui, "开启心跳");
+                    switch(ui, &mut provider.heartbeat_enabled)
+                        .on_hover_text("空闲时向上游发送短请求；Responses 使用成功真实请求的模板，无模板或模板被拒绝时等待新请求；保活失败不阻断客户端，会产生上游用量");
+                    form_label(ui, "开启无限重试");
+                    switch(ui, &mut provider.persistent_retry)
+                        .on_hover_text("对 HTTP 429 / 500 / 502 / 503 / 504 持续重试，并停用渠道熔断冷却；直到成功、客户端断开或服务关闭，仍遵守重试间隔");
+                    ui.end_row();
+
+                    form_label(ui, "心跳间隔（秒）");
+                    ui.add_enabled(
+                        provider.heartbeat_enabled,
+                        egui::DragValue::new(&mut provider.heartbeat_interval_secs).range(1..=3600),
+                    );
+                    form_label(ui, "心跳模型");
+                    egui::ComboBox::from_id_source("heartbeat_model")
+                        .selected_text(if provider.heartbeat_model.is_empty() {
+                            "自动（首个模型）"
+                        } else {
+                            &provider.heartbeat_model
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut provider.heartbeat_model, String::new(), "自动（首个模型）");
+                            for model in provider.models.iter().filter(|model| !model.trim().is_empty()) {
+                                ui.selectable_value(&mut provider.heartbeat_model, model.clone(), model);
+                            }
+                        });
                     ui.end_row();
 
                     form_label(ui, "Stream Max");
@@ -682,12 +710,26 @@ fn provider_circuit_detail(
     ui: &mut egui::Ui,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
     provider_name: &str,
+    persistent_retry: bool,
 ) {
     let Some(status_handle) = circuit_status else {
         ui.label(egui::RichText::new("代理未启动").color(muteds()));
         return;
     };
     let status = status_handle.read().get(provider_name).cloned();
+    if persistent_retry {
+        ui.label(egui::RichText::new("无限重试：配置生效后不使用熔断冷却").color(muteds()));
+        if let Some(status) = status {
+            ui.label(format!("当前并发 {}", status.inflight));
+            if let Some(error) = status.last_error {
+                ui.colored_label(
+                    egui::Color32::from_rgb(176, 54, 64),
+                    format!("最近请求失败: {}", error),
+                );
+            }
+        }
+        return;
+    }
     let Some(status) = status else {
         ui.label(egui::RichText::new("等待首次请求").color(muteds()));
         return;
@@ -914,6 +956,10 @@ pub fn default_provider() -> ProviderConfig {
         debug_sse_path: "logs/raw_sse".to_string(),
         debug_sse_max_events: 80,
         max_retries: 3,
+        persistent_retry: false,
+        heartbeat_enabled: false,
+        heartbeat_interval_secs: 10,
+        heartbeat_model: String::new(),
         weight: 1,
         priority: 1,
         description: None,

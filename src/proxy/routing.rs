@@ -134,6 +134,10 @@ pub(super) fn weighted_order(
 }
 
 pub(super) fn provider_health_rank(state: &AppState, provider: &str) -> u8 {
+    // 开启无限重试后，旧的熔断快照不能继续影响同优先级渠道排序。
+    if persistent_retry_enabled(&state.config, provider) {
+        return 0;
+    }
     state
         .provider_statuses
         .read()
@@ -643,6 +647,9 @@ mod preference_tests {
             api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
             provider_circuits: Arc::new(Mutex::new(HashMap::new())),
             provider_loads: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_requests: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_templates: Arc::new(Mutex::new(HashMap::new())),
+            keepalive_template_store: Arc::new(super::keepalive::TemplateStore::default()),
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
@@ -680,6 +687,10 @@ mod preference_tests {
             debug_sse_path: "logs/raw_sse".to_string(),
             debug_sse_max_events: 80,
             max_retries: 1,
+            persistent_retry: false,
+            heartbeat_enabled: false,
+            heartbeat_interval_secs: 10,
+            heartbeat_model: String::new(),
             weight: 1,
             priority,
             description: None,
@@ -688,6 +699,24 @@ mod preference_tests {
             extra: Default::default(),
             auth_account_id: None,
         }
+    }
+
+    #[test]
+    fn background_keepalive_never_excludes_a_channel() {
+        let state = test_state();
+        let mut cfg = sample_config("auth_first");
+        cfg.auth_accounts.clear();
+        let mut primary = sample_provider("primary", 0);
+        primary.heartbeat_enabled = true;
+        primary.persistent_retry = true;
+        cfg.providers = vec![primary, sample_provider("backup", 1)];
+        let cancel = CancellationToken::new();
+        state.keepalive_requests.lock().insert("primary".to_string(), cancel.clone());
+        let candidates = provider_attempts(&cfg, &state, "gpt-test", "chat", &[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0.name, "primary");
+        assert!(state.begin_provider_attempt("primary").is_ok());
+        assert!(cancel.is_cancelled());
     }
 
     fn sample_account(id: &str, priority: i32) -> AuthAccountConfig {

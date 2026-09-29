@@ -28,7 +28,7 @@ fn provider_with_name(name: &str, weight: u32, priority: i32) -> ProviderConfig 
     .unwrap()
 }
 
-fn test_state() -> AppState {
+pub(super) fn test_state() -> AppState {
     AppState {
         config: Arc::new(RwLock::new(Arc::new(
             AppConfig::load("config.example.yaml").unwrap(),
@@ -38,6 +38,9 @@ fn test_state() -> AppState {
         api_key_limiters: Arc::new(Mutex::new(HashMap::new())),
         provider_circuits: Arc::new(Mutex::new(HashMap::new())),
         provider_loads: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_requests: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_templates: Arc::new(Mutex::new(HashMap::new())),
+        keepalive_template_store: Arc::new(keepalive::TemplateStore::default()),
         provider_statuses: Arc::new(RwLock::new(HashMap::new())),
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
@@ -99,6 +102,89 @@ fn provider_circuit_429_opens_immediately_with_retry_after() {
         panic!("429 应立即打开熔断器");
     };
     assert!(until.saturating_duration_since(Instant::now()) >= Duration::from_secs(11));
+}
+
+fn set_persistent_retry(state: &AppState, name: &str, enabled: bool) {
+    let mut cfg = (*state.snapshot()).clone();
+    let mut provider = provider_with_name(name, 1, 0);
+    provider.persistent_retry = enabled;
+    cfg.providers = vec![provider];
+    *state.config.write() = Arc::new(cfg);
+}
+
+#[test]
+fn persistent_retry_bypasses_cooldown_without_clearing_quota_or_losing_inflight() {
+    let state = test_state();
+    let stale = state.begin_provider_attempt("persistent").unwrap();
+    state.begin_provider_attempt("persistent").unwrap().mark_failure(
+        StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", Some(Duration::from_secs(120)),
+    );
+    assert!(state.begin_provider_attempt("persistent").is_err());
+
+    set_persistent_retry(&state, "persistent", true);
+    assert_eq!(provider_health_rank(&state, "persistent"), 0);
+    let cfg = state.snapshot();
+    let guard = begin_attempt_or_record_failure(
+        &state, &cfg.providers[0], "gpt-test", Instant::now(),
+    ).unwrap_or_else(|failure| panic!("{}", failure.message));
+    assert_eq!(state.provider_statuses.read()["persistent"].inflight, 2);
+    assert!(state.provider_statuses.read()["persistent"].quota_exhausted);
+    assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
+    drop(guard);
+    // 在开关启用前开始的请求，其迟到失败也不得重新熔断。
+    stale.mark_failure(StatusCode::BAD_GATEWAY, "late failure", None);
+    let statuses = state.provider_statuses.read();
+    let status = &statuses["persistent"];
+    assert_eq!(status.status, ProviderCircuitStatus::Healthy);
+    assert_eq!(status.inflight, 0);
+    assert!(status.open_until.is_none());
+    assert_eq!(status.last_error.as_deref(), Some("late failure"));
+    assert!(status.quota_exhausted);
+}
+
+#[test]
+fn persistent_retry_failures_never_open_circuit_and_disabling_restores_it() {
+    let state = test_state();
+    set_persistent_retry(&state, "persistent", true);
+    for code in [429, 500, 502, 503, 504, 401, 403, 408] {
+        for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD + 1 {
+            state.begin_provider_attempt("persistent").unwrap().mark_failure(
+                StatusCode::from_u16(code).unwrap(), "upstream failed", None,
+            );
+            assert!(matches!(state.provider_circuits.lock()["persistent"].phase, ProviderCircuitPhase::Closed));
+            assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
+        }
+    }
+    set_persistent_retry(&state, "persistent", false);
+    for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
+        state.begin_provider_attempt("persistent").unwrap().mark_failure(
+            StatusCode::BAD_GATEWAY, "upstream failed", None,
+        );
+    }
+    assert!(state.begin_provider_attempt("persistent").unwrap_err().message.contains("熔断冷却中"));
+}
+
+#[test]
+fn persistent_retry_allows_concurrency_and_cancelling_old_half_open_probe() {
+    let state = test_state();
+    state.begin_provider_attempt("persistent").unwrap().mark_failure(
+        StatusCode::TOO_MANY_REQUESTS, "busy", None,
+    );
+    state.provider_circuits.lock().get_mut("persistent").unwrap().phase =
+        ProviderCircuitPhase::Open { until: Instant::now() - Duration::from_millis(1) };
+    let probe = state.begin_provider_attempt("persistent").unwrap();
+    assert!(state.begin_provider_attempt("persistent").is_err());
+
+    set_persistent_retry(&state, "persistent", true);
+    let first = state.begin_provider_attempt("persistent").unwrap();
+    let second = state.begin_provider_attempt("persistent").unwrap();
+    assert_eq!(state.provider_statuses.read()["persistent"].inflight, 3);
+    drop(probe);
+    first.mark_success();
+    drop(second);
+    assert!(matches!(state.provider_circuits.lock()["persistent"].phase, ProviderCircuitPhase::Closed));
+    assert_eq!(state.provider_statuses.read()["persistent"].inflight, 0);
+    assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
 }
 
 #[test]

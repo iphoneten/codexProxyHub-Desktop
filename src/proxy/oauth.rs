@@ -91,6 +91,10 @@ pub(super) fn auth_account_as_provider(
         debug_sse_path: "logs/raw_sse".to_string(),
         debug_sse_max_events: 80,
         max_retries: 2,
+        persistent_retry: false,
+        heartbeat_enabled: false,
+        heartbeat_interval_secs: 10,
+        heartbeat_model: String::new(),
         weight: account.weight.max(1),
         priority: account.priority,
         description: account.description.clone().or_else(|| {
