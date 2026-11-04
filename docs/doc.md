@@ -107,7 +107,7 @@ Authorization: Bearer sk-proxy-xxx
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `model_fallbacks` | map<string,array<string>> | `{}` | 模型 fallback 列表。请求模型不可用或对应渠道失败时，会按列表尝试替代模型。 |
-| `auth_preference` | string | `provider_first` | 请求来源优先级。`provider_first` 先普通渠道后 Auth 账号；`auth_first` 先 Auth 账号后普通渠道。各自内部仍按 `priority`/`weight` 排序。 |
+| `auth_preference` | string | `provider_first` | 同优先级的来源偏好。`provider_first` 先普通渠道，`auth_first` 先 Auth 账号；不能越过更小的 `priority`。同级成功渠道偏好可优先于默认来源顺序。 |
 | `auth_proxy` | string | `""` | 统一上游代理。用于 OAuth、Auth 账号请求，以及显式开启 `use_proxy` 的普通渠道。支持 `http://`/`https://`/`socks5h://`。留空不强制代理。 |
 
 示例：
@@ -194,9 +194,10 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `priority` | number | `1` | 优先级，数字越小越优先。只有低数字优先级全部失败后，才会尝试更大数字优先级。 |
-| `weight` | number | `1` | 同一优先级内的轮询权重。当前同一次请求内每个 provider 只尝试一次，权重只影响不同请求的起始顺序。 |
-| `max_retries` | number | `3` | 单个渠道内部最大重试次数。重试耗尽后才切换下一个渠道。 |
+| `priority` | number | `1` | 同一候选模型内数字越小越优先。较小数字的候选用完本轮次数后，才尝试更大数字；成功渠道及来源偏好均不能跨优先级。原模型仍先于回退模型。 |
+| `weight` | number | `1` | 同优先级候选的起始排序权重；每个候选的尝试次数仍由 `max_retries` 决定，不将权重乘入次数。 |
+| `max_retries` | number | `3` | 每轮在该渠道上的业务尝试次数，包含首次；0 按 1 次兼容。用完后切换下一个候选，一轮全失败则继续下一轮。 |
+| `persistent_retry` | bool | `false` | 旧版兼容字段，仍读写保存；业务请求统一持续轮询，不再由该开关控制。 |
 | `responses_mode` | string | `auto` | Responses API 路由模式：`auto`、`native`、`chat`。 |
 
 `responses_mode` 说明：
@@ -204,7 +205,7 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | 值 | 说明 |
 | --- | --- |
 | `auto` | 优先尝试原生 `/responses`，必要时按错误自动 fallback 到 chat 兼容路径。 |
-| `native` | 只按原生 `/responses` 能力判断。 |
+| `native` | 显式尝试原生 `/responses`，不被旧 `supports_responses: false` 提前过滤；保留 Anthropic / Google 的现有协议特例。 |
 | `chat` | 强制将 `/responses` 请求转换为 chat 路径处理。Anthropic 渠道通常使用该模式。 |
 
 ### 超时字段
@@ -212,7 +213,7 @@ Anthropic 渠道会通过 `/messages` 协议翻译，因此即使 `supports_chat
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `connect_timeout` | number | `10` | 连接超时秒数，限制 DNS/TCP/TLS/连接建立阶段。代理会按该值缓存 reqwest Client。 |
-| `request_timeout` | number | `60` | 请求超时秒数。非流式请求限制整个请求；流式请求分别限制等待响应头和等待首个有效输出，SSE 已开始正常输出后不限制总时长。 |
+| `request_timeout` | number | `60` | 单次上游尝试的超时秒数，不是持续轮询整个请求的总时限；流式分别限制等待响应头和首个有效输出。正常输出后使用以下流式超时字段。 |
 | `stream_idle_timeout` | number | `0` | 流式响应开始后，连续多少秒没有收到上游新数据就主动中断。`0` 表示关闭，本地会继续等待上游返回完成事件。 |
 | `stream_max_duration` | number | `0` | 流式响应开始后允许持续的最大秒数。`0` 表示关闭。设置过短会误杀长输出或工具任务。 |
 | `timeout` | number | 无 | 旧字段。仍可读取，会映射到 `request_timeout`；保存新配置时建议使用 `request_timeout`。 |
@@ -262,12 +263,16 @@ debug_sse_max_events: 120
 
 1. 根据请求模型生成候选模型列表：原模型优先，然后追加 `routing.model_fallbacks`。
 2. 对每个候选模型过滤 provider：必须 `enabled: true`，且 `models` 或 `model_mapping` 能匹配模型。
-3. 按 `routing.auth_preference` 决定先尝试 Auth 账号还是普通渠道。Auth 账号使用 `routing.auth_proxy`；普通渠道仅在 `use_proxy: true` 时使用。
-4. 在同一来源内按 `priority` 从小到大尝试，同一 `priority` 内按 `weight` 做轮询排序。
-5. 单个 provider 失败后，先按 `max_retries` 在该 provider 内重试。
-6. 重试耗尽后继续尝试下一个 provider。
-7. 流式请求只有拿到首个有效文本或工具调用事件后才判定 provider 成功；在此之前超时、报错或断流会继续故障转移。
-8. 一旦某个 provider 成功，立即返回，不再尝试后续 provider。
+3. 同一候选模型内，所有普通渠道和 Auth 账号先统一按 `priority` 从小到大排序。
+4. 优先级相同时使用 `routing.auth_preference`，同一来源内保留权重和负载排序。普通请求的已有成功渠道偏好只能在同一模型、同一优先级内调整顺序；携带稳定会话标识的 Responses 请求例外，会优先回到生成其加密状态的账号、项目和实际模型。Auth 账号使用 `routing.auth_proxy`；普通渠道仅在 `use_proxy: true` 时使用。
+5. 每个 provider 按 `max_retries.max(1)` 尝试，包含首次；业务重试由统一调度层控制，底层不再额外叠加次数。
+6. 本候选次数用完后切换下一个候选；所有候选失败后，重新获取当前配置开始下一轮。取消熔断、冷却和半开状态对请求的阻挡。
+7. 流式请求拿到首个有效文本或工具调用事件后交付；Chat 提供合法结束原因但无正文时，也返回其结束/截断状态，不判为网络故障。首个输出或合法结束之前的超时、报错或断流仍继续故障转移。
+8. 一旦某个 provider 成功，立即返回，不再尝试后续 provider。普通请求下一次仍先尝试更高优先级渠道；“本地 API Key＋模型”的成功渠道偏好只在同一模型、同一优先级内生效。Responses 会话优先使用 `prompt_cache_key`、`session_id`、`conversation_id` 建立独立绑定；缺少这些字段时，再按已有加密 item 的 ID 尽力绑定。绑定只保存哈希和渠道身份，写入配置目录的 `responses-state/responses-affinity.json`，重启后继续生效。仅使用不断变化的 `previous_response_id`、且历史已裁剪掉原 opaque item 的客户端无法保证稳定绑定，但仍可使用下述降级恢复。
+9. 除客户端取消外，上游错误通常参与重试，包括 400/401/403/404/429/5xx、连接或读取失败、超时、无效响应和首个输出前的流内错误。`invalid_encrypted_content`、密文无法验证及 item ID 不匹配属于例外：同一渠道只在移除被拒绝的 opaque 状态后降级重试一次，仍失败则返回 400，不进入无限轮询，也不误降级到 Chat。已有其它协议协商（如 auto 切换接口、include_usage 兼容修正）仍保留。
+10. 重试退避仅属于当前请求的该渠道，不是共享熔断状态。一个渠道的 Retry-After 不延迟轮到的其他渠道；下一次再轮到该渠道时仍遵守剩余等待时间。
+11. 客户端取消或服务关停结束重试；停用/删除渠道、更新密钥、收紧本地密钥权限会在后续尝试时生效。无可用候选时返回错误，不向未授权或不匹配的渠道发送请求。Auth 账号额度保护保留。
+12. 已经向客户端输出业务内容后不重放请求。Responses 会话切换到不同账号、项目或实际模型时，代理不会把原安全域的密文继续发给新上游；会保留可见消息、工具调用和工具结果，移除 `previous_response_id` 及无法复用的 reasoning/compaction opaque item。该恢复会损失相应隐藏推理，但避免会话因不可解密密文永久卡死；普通无状态请求的故障转移不变。
 
 同优先级同权重示例：
 
@@ -277,11 +282,14 @@ debug_sse_max_events: 120
 请求 3: C -> A -> B
 ```
 
-如果 `A.max_retries: 1` 且 A 不可用：
+如果 A 的 Priority=0、配置 5 次，B 的 Priority=10、配置 3 次，C 的 Priority=20、配置 1 次且全部失败：
 
 ```text
-A 第 1 次 -> A retry 第 1 次 -> B 第 1 次
+A1 -> A2 -> A3 -> A4 -> A5 -> B1 -> B2 -> B3 -> C1 -> 下一轮
 ```
+
+任意一次成功即结束本次请求。只有 A 时则按轮重复尝试 A。旧字段名保留，但 `max_retries: 3` 现在表示每轮共 3 次，不是首次再加 3 次；`0` 仍至少尝试一次。持续轮询可能产生费用，并受客户端自己的超时限制。
+即使上次由 C 成功返回，下一次也从可用的高优先级 A 开始；C 不因历史成功跳到 A 前面。配置文件中的排列顺序不覆盖 Priority。
 
 ## OpenAI 与 Anthropic 渠道差异
 
@@ -336,7 +344,7 @@ extra_headers:
 | 端点 | 说明 |
 | --- | --- |
 | `POST /v1/messages` | Anthropic Messages API，支持流式与非流式 |
-| `POST /v1/messages/count_tokens` | Token 估算，只读、不计入每日限额 |
+| `POST /v1/messages/count_tokens` | Token 估算，只读、不新增用量日志，不受每日限额拦截；鉴权与模型/渠道权限仍生效 |
 
 鉴权同时接受两种客户端惯例，任选其一：
 
@@ -354,7 +362,7 @@ Anthropic 官方 SDK 只发 `x-api-key`。这里填的是**代理自己的** `au
   OpenAI / Google 等渠道没有 `/messages` 端点，即使声明了同一个模型也会被排除在候选之外。
 - 客户端的 `anthropic-version` 与 `anthropic-beta` 头会透传给上游；未提供 `anthropic-version`
   时代理补 `2023-06-01`。
-- 复用统一的模型匹配、优先级、权重、模型 fallback、失败重试与故障转移、熔断和用量日志。
+- 复用统一的模型匹配、优先级、权重、模型 fallback、持续轮询与故障转移、运行统计和用量日志。
   用量日志里 `api` 字段记为 `messages`。
 - 渠道的 `system_prompt_override` 生效，写入 Anthropic 的顶层 `system` 字段。
 - 错误按 Anthropic 形状返回，客户端 SDK 可以正常解析：

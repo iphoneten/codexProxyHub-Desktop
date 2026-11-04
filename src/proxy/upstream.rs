@@ -181,9 +181,9 @@ pub(super) async fn send_chat_stream_as_responses(
                     request_model,
                     custom_tool_names,
                     started,
-                    provider.strip_thought,
+                    provider,
                     ctx.cancel_token(),
-                );
+                ).await;
             }
             Ok(resp) => {
                 let status =
@@ -876,6 +876,9 @@ pub(super) async fn send_to_google_ai_provider(
                     } else {
                         Box::pin(body_stream)
                     };
+                    let body_stream = prepare_sse_stream(
+                        body_stream, provider.request_timeout, SseProbeKind::Chat, &ctx.cancel_token(),
+                    ).await?;
                     let response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1567,20 +1570,30 @@ pub(crate) fn truncate(text: &str) -> String {
 /// 若解析失败则回退到 truncate。
 pub(crate) fn clean_upstream_error(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(text) {
-        // 尝试提取 error.message
-        if let Some(msg) = v
+        let message = v
             .get("error")
             .and_then(|e| e.get("message"))
             .and_then(|m| m.as_str())
-        {
-            return truncate(msg);
+            .or_else(|| v.get("message").and_then(Value::as_str));
+        let code = v
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .or_else(|| v.get("code"))
+            .and_then(Value::as_str);
+        if let Some(msg) = message {
+            if let Some(code) = code {
+                let diagnostic = format!("{code}: {msg}");
+                if is_encrypted_state_rejection(&diagnostic) {
+                    return redact_encrypted_state_error(&diagnostic);
+                }
+            }
+            return redact_encrypted_state_error(msg);
         }
-        // 尝试提取顶层 message
-        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-            return truncate(msg);
+        if let Some(code) = code {
+            return redact_encrypted_state_error(code);
         }
     }
-    truncate(text)
+    redact_encrypted_state_error(text)
 }
 
 // ================== 上游响应体健康性校验 ==================
@@ -1601,11 +1614,10 @@ pub(crate) fn clean_upstream_error(text: &str) -> String {
 pub(crate) fn validate_upstream_chat_json(body: &Value) -> Result<(), String> {
     // 显式 error 字段：即便 status 是 200，也算失败
     if let Some(err) = body.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| err.as_str().unwrap_or("unknown upstream error"));
-        return Err(format!("上游返回错误: {}", truncate(msg)));
+        return Err(format!(
+            "上游返回错误: {}",
+            clean_upstream_error(&json!({"error": err}).to_string())
+        ));
     }
     match body.get("choices").and_then(Value::as_array) {
         Some(arr) if !arr.is_empty() => Ok(()),
@@ -1619,11 +1631,10 @@ pub(crate) fn validate_upstream_chat_json(body: &Value) -> Result<(), String> {
 /// 上游 /responses 响应至少应包含 `output`（数组或对象）或 `output_text`。
 pub(crate) fn validate_upstream_response_json(body: &Value) -> Result<(), String> {
     if let Some(err) = body.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| err.as_str().unwrap_or("unknown upstream error"));
-        return Err(format!("上游返回错误: {}", truncate(msg)));
+        return Err(format!(
+            "上游返回错误: {}",
+            clean_upstream_error(&json!({"error": err}).to_string())
+        ));
     }
     let has_output = body.get("output").is_some_and(|v| !v.is_null());
     let has_text = body
@@ -1643,11 +1654,10 @@ pub(crate) fn validate_upstream_response_json(body: &Value) -> Result<(), String
 /// 上游 /messages 响应至少应包含非空的 `content` 数组。
 pub(crate) fn validate_upstream_anthropic_json(body: &Value) -> Result<(), String> {
     if let Some(err) = body.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| err.as_str().unwrap_or("unknown upstream error"));
-        return Err(format!("上游返回错误: {}", truncate(msg)));
+        return Err(format!(
+            "上游返回错误: {}",
+            clean_upstream_error(&json!({"error": err}).to_string())
+        ));
     }
     match body.get("content").and_then(Value::as_array) {
         Some(arr) if !arr.is_empty() => Ok(()),

@@ -1,18 +1,27 @@
 use super::*;
 use crate::request_ctx::send_with_cancel;
 
-pub(super) fn chat_stream_to_responses(
+// Chat 的结束块之后可能另发 usage；仅短暂等待尾部，不依赖上游关闭长连接。
+const CHAT_USAGE_GRACE: Duration = Duration::from_millis(500);
+
+pub(super) async fn chat_stream_to_responses(
     resp: reqwest::Response,
     request_model: String,
     custom_tool_names: HashSet<String>,
     started: Instant,
-    strip_thought: bool,
+    provider: &ProviderConfig,
     cancel: CancellationToken,
 ) -> Result<ProviderResult, ProxyError> {
-    let stream = resp
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
-    let stream: ProxyByteStream = if strip_thought {
+    // 在转换器输出 response.created 之前识别上游流内错误，仍可安全重试其它渠道。
+    let stream = prepare_openai_stream(
+        resp,
+        provider.request_timeout,
+        provider.stream_idle_timeout,
+        provider.stream_max_duration,
+        SseProbeKind::Chat,
+        &cancel,
+    ).await?;
+    let stream: ProxyByteStream = if provider.strip_thought {
         Box::pin(strip_thought_from_chat_sse_stream(stream, cancel.clone()))
     } else {
         Box::pin(stream)
@@ -154,6 +163,8 @@ pub(super) enum SseProbeKind {
 pub(super) enum SseProbeDecision {
     Continue,
     Ready,
+    // 合法结束即使没有正文也可交付，但不能伪造首字耗时。
+    Complete,
     Error(ProxyError),
 }
 
@@ -170,11 +181,12 @@ pub(super) async fn prepare_sse_stream(
         result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
             let mut prefix = Vec::new();
             let mut text_buffer = String::new();
+            let mut pending_utf8 = Vec::new();
 
             loop {
                 match upstream.next().await {
                     Some(Ok(bytes)) => {
-                        text_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        append_sse_bytes(&mut text_buffer, &mut pending_utf8, &bytes);
                         prefix.extend_from_slice(&bytes);
                         while let Some((event, consumed)) = next_sse_event(&text_buffer) {
                             text_buffer.drain(..consumed);
@@ -183,7 +195,7 @@ pub(super) async fn prepare_sse_stream(
                             };
                             match inspect_sse_probe_event(kind, &data) {
                                 SseProbeDecision::Continue => {}
-                                SseProbeDecision::Ready => {
+                                SseProbeDecision::Ready | SseProbeDecision::Complete => {
                                     let prefix = Bytes::from(prefix);
                                     let stream = futures_util::stream::once(async move {
                                         Ok::<Bytes, io::Error>(prefix)
@@ -251,6 +263,9 @@ pub(super) fn inspect_chat_sse_probe_event(data: &str) -> SseProbeDecision {
     if chat_stream_delta(data).is_some() || !chat_stream_tool_call_deltas(data).is_empty() {
         return SseProbeDecision::Ready;
     }
+    if chat_stream_finish_reason(data).is_some() {
+        return SseProbeDecision::Complete;
+    }
     SseProbeDecision::Continue
 }
 
@@ -269,11 +284,20 @@ pub(super) fn inspect_responses_sse_probe_event(data: &str) -> SseProbeDecision 
             let message = value
                 .pointer("/error/message")
                 .or_else(|| value.pointer("/response/error/message"))
+                .or_else(|| value.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("Responses upstream error");
+            let code = value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/response/error/code"))
+                .or_else(|| value.get("code"))
+                .and_then(Value::as_str);
+            let diagnostic = code
+                .map(|code| format!("{code}: {message}"))
+                .unwrap_or_else(|| message.to_string());
             SseProbeDecision::Error(ProxyError::new(
-                stream_error_status(message),
-                truncate(message),
+                stream_error_status(&diagnostic),
+                redact_encrypted_state_error(&diagnostic),
             ))
         }
         Some("response.output_text.delta") => {
@@ -318,6 +342,7 @@ pub(super) fn inspect_responses_sse_probe_event(data: &str) -> SseProbeDecision 
                 SseProbeDecision::Continue
             }
         }
+        Some("response.incomplete") => SseProbeDecision::Complete,
         Some("response.completed") => SseProbeDecision::Error(ProxyError::new(
             StatusCode::BAD_GATEWAY,
             "Responses 上游流完成但未返回有效输出",
@@ -328,7 +353,9 @@ pub(super) fn inspect_responses_sse_probe_event(data: &str) -> SseProbeDecision 
 
 pub(super) fn stream_error_status(message: &str) -> StatusCode {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("rate") || lower.contains("limit") || lower.contains("concurrency") {
+    if is_encrypted_state_rejection(message) {
+        StatusCode::BAD_REQUEST
+    } else if lower.contains("rate") || lower.contains("limit") || lower.contains("concurrency") {
         StatusCode::TOO_MANY_REQUESTS
     } else if lower.contains("timeout") {
         StatusCode::GATEWAY_TIMEOUT
@@ -476,9 +503,13 @@ where
         let mut stream = Box::pin(stream);
         let mut buffer = String::new();
         let mut full_text = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut tool_calls: Vec<ChatToolCallState> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut completion_deadline = None;
         loop {
             let chunk = tokio::select! {
+                biased;
                 _ = tx.closed() => {
                     let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                     return;
@@ -487,6 +518,13 @@ where
                     let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
                     return;
                 }
+                _ = async {
+                    if let Some(deadline) = completion_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => break,
                 chunk = stream.next() => chunk,
             };
             let Some(chunk) = chunk else {
@@ -494,7 +532,7 @@ where
             };
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {
@@ -509,6 +547,8 @@ where
                                 created_at,
                                 &full_text,
                                 &tool_calls,
+                                usage,
+                                finish_reason.as_deref(),
                                 &cancel,
                             )
                             .await
@@ -522,6 +562,10 @@ where
                         }
                         // 顺便累积 usage（OpenAI include_usage 的 chunk 通常在 [DONE] 之前抵达）
                         accumulate_usage_from_sse_data(&data, &mut usage);
+                        // 结束已确认；尾部只收集用量，不能再追加正文或推翻结束状态。
+                        if finish_reason.is_some() {
+                            continue;
+                        }
                         if let Some(message) = chat_stream_error_message(&data) {
                             push_evt!(
                                 "response.failed",
@@ -573,6 +617,9 @@ where
                                     call.name = name;
                                 }
                             }
+                            if let Some(arguments) = delta.arguments {
+                                call.arguments.push_str(&arguments);
+                            }
                             if !call.added && !call.name.is_empty() {
                                 if call.call_id.is_empty() {
                                     call.call_id = format!("call_{}", Uuid::new_v4().simple());
@@ -606,43 +653,34 @@ where
                                     })
                                 );
                             }
-                            if let Some(arguments) = delta.arguments {
-                                call.arguments.push_str(&arguments);
-                                if call.added && !call.is_custom && !arguments.is_empty() {
-                                    push_evt!(
-                                        "response.function_call_arguments.delta",
-                                        json!({
-                                            "type": "response.function_call_arguments.delta",
-                                            "output_index": delta.index + 1,
-                                            "delta": arguments
-                                        })
-                                    );
-                                }
+                            if call.added
+                                && !call.is_custom
+                                && call.arguments_emitted < call.arguments.len()
+                            {
+                                let arguments = &call.arguments[call.arguments_emitted..];
+                                push_evt!(
+                                    "response.function_call_arguments.delta",
+                                    json!({
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": call.call_id,
+                                        "output_index": delta.index + 1,
+                                        "delta": arguments
+                                    })
+                                );
+                                call.arguments_emitted = call.arguments.len();
                             }
                         }
-                        if chat_stream_completed(&data) {
-                            if send_response_stream_done(
-                                &tx,
-                                &response_id,
-                                &item_id,
-                                &model,
-                                created_at,
-                                &full_text,
-                                &tool_calls,
-                                &cancel,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                let _ = u_tx.send(StreamOutcome::aborted(usage, first_token_ms));
-                                return;
-                            }
-                            let _ = u_tx.send(StreamOutcome::success(usage, first_token_ms));
-                            return;
+                        if let Some(reason) = chat_stream_finish_reason(&data) {
+                            finish_reason = Some(reason);
+                            completion_deadline = Some(tokio::time::Instant::now() + CHAT_USAGE_GRACE);
                         }
                     }
                 }
                 Err(err) => {
+                    if finish_reason.is_some() {
+                        // 已完成生成，尾部连接关闭/超时只结束 usage 等待。
+                        break;
+                    }
                     let message = err.to_string();
                     let _ = send_response_sse(
                         &tx,
@@ -665,6 +703,23 @@ where
             }
         }
 
+        if finish_reason.is_none() {
+            let message = "Chat 上游流未收到完成标记就已结束";
+            push_evt!(
+                "response.failed",
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "status": "failed",
+                        "model": model,
+                        "error": {"message": message}
+                    }
+                })
+            );
+            let _ = u_tx.send(StreamOutcome::failed(usage, first_token_ms, message));
+            return;
+        }
         if send_response_stream_done(
             &tx,
             &response_id,
@@ -673,6 +728,8 @@ where
             created_at,
             &full_text,
             &tool_calls,
+            usage,
+            finish_reason.as_deref(),
             &cancel,
         )
         .await
@@ -706,8 +763,16 @@ pub(super) async fn send_response_stream_done(
     created_at: i64,
     full_text: &str,
     tool_calls: &[ChatToolCallState],
+    usage: TokenUsage,
+    finish_reason: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<(), ()> {
+    let incomplete_reason = chat_incomplete_reason(finish_reason);
+    let status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
     send_response_sse(
         tx,
         "response.output_text.done",
@@ -743,7 +808,7 @@ pub(super) async fn send_response_stream_done(
             "item": {
                 "id": item_id,
                 "type": "message",
-                "status": "completed",
+                "status": status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": full_text}]
             }
@@ -754,7 +819,7 @@ pub(super) async fn send_response_stream_done(
     let mut output = vec![json!({
         "id": item_id,
         "type": "message",
-        "status": "completed",
+        "status": status,
         "role": "assistant",
         "content": [{"type": "output_text", "text": full_text}]
     })];
@@ -779,6 +844,7 @@ pub(super) async fn send_response_stream_done(
                 "response.custom_tool_call_input.done",
                 json!({
                     "type": "response.custom_tool_call_input.done",
+                    "item_id": call_id,
                     "output_index": output_index,
                     "input": input
                 }),
@@ -788,7 +854,7 @@ pub(super) async fn send_response_stream_done(
             json!({
                 "id": call_id,
                 "type": "custom_tool_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": call.name,
                 "input": input
@@ -799,6 +865,7 @@ pub(super) async fn send_response_stream_done(
                 "response.function_call_arguments.done",
                 json!({
                     "type": "response.function_call_arguments.done",
+                    "item_id": call_id,
                     "output_index": output_index,
                     "arguments": call.arguments
                 }),
@@ -808,7 +875,7 @@ pub(super) async fn send_response_stream_done(
             json!({
                 "id": call_id,
                 "type": "function_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": call.name,
                 "arguments": call.arguments
@@ -827,19 +894,26 @@ pub(super) async fn send_response_stream_done(
         .await?;
         output.push(item);
     }
+    let event = if incomplete_reason.is_some() {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
     send_response_sse(
         tx,
-        "response.completed",
+        event,
         json!({
-            "type": "response.completed",
+            "type": event,
             "response": {
                 "id": response_id,
                 "object": "response",
                 "created_at": created_at,
-                "status": "completed",
+                "status": status,
+                "incomplete_details": incomplete_reason.map(|reason| json!({"reason":reason})),
                 "model": model,
                 "output": output,
-                "output_text": full_text
+                "output_text": full_text,
+                "usage": {"input_tokens":usage.input,"output_tokens":usage.output,"total_tokens":usage.input + usage.output}
             }
         }),
         cancel,
@@ -853,6 +927,7 @@ pub(super) struct ChatToolCallState {
     call_id: String,
     name: String,
     arguments: String,
+    arguments_emitted: usize,
     added: bool,
     is_custom: bool,
 }
@@ -915,6 +990,39 @@ pub(super) async fn send_response_sse(
         cancel,
     )
     .await
+}
+
+/// 网络 chunk 可能切在 UTF-8 字符中间；保留未完成字节，不能逐 chunk 有损解码。
+pub(crate) fn append_sse_bytes(buffer: &mut String, pending: &mut Vec<u8>, bytes: &[u8]) {
+    if pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            buffer.push_str(text);
+            return;
+        }
+    }
+    pending.extend_from_slice(bytes);
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                buffer.push_str(text);
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                buffer.push_str(std::str::from_utf8(&pending[consumed..valid_end]).unwrap());
+                consumed = valid_end;
+                match error.error_len() {
+                    Some(len) => {
+                        buffer.push('\u{fffd}');
+                        consumed += len;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
 }
 
 pub(crate) fn next_sse_event(buffer: &str) -> Option<(String, usize)> {
@@ -1078,6 +1186,7 @@ where
         let mut stream = Box::pin(stream);
         let mut buffer = String::new();
         let mut stripper = ThoughtStripper::default();
+        let mut pending_utf8 = Vec::new();
         loop {
             // 这一层只是改写 SSE，本身不产 usage；被取消就直接收工，
             // 顺带 drop 掉上游 stream，让链路上游那一段也跟着结束。
@@ -1091,7 +1200,7 @@ where
             };
             match item {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {
@@ -1229,6 +1338,14 @@ pub(super) fn chat_to_response(
     request_model: &str,
     custom_tool_names: &HashSet<String>,
 ) -> Value {
+    let incomplete_reason = chat_incomplete_reason(
+        chat.pointer("/choices/0/finish_reason").and_then(Value::as_str),
+    );
+    let status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let message = chat
         .pointer("/choices/0/message")
         .cloned()
@@ -1247,7 +1364,7 @@ pub(super) fn chat_to_response(
         output.push(json!({
             "id": format!("msg-{}", Uuid::new_v4().simple()),
             "type": "message",
-            "status": "completed",
+            "status": status,
             "role": "assistant",
             "content": [{"type": "output_text", "text": text}]
         }));
@@ -1270,7 +1387,7 @@ pub(super) fn chat_to_response(
                 output.push(json!({
                     "id": call_id,
                     "type": "custom_tool_call",
-                    "status": "completed",
+                    "status": status,
                     "call_id": call_id,
                     "name": name,
                     "input": custom_tool_input(arguments)
@@ -1279,7 +1396,7 @@ pub(super) fn chat_to_response(
                 output.push(json!({
                     "id": call_id,
                     "type": "function_call",
-                    "status": "completed",
+                    "status": status,
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments
@@ -1291,7 +1408,7 @@ pub(super) fn chat_to_response(
         output.push(json!({
             "id": format!("msg-{}", Uuid::new_v4().simple()),
             "type": "message",
-            "status": "completed",
+            "status": status,
             "role": "assistant",
             "content": [{"type": "output_text", "text": ""}]
         }));
@@ -1306,12 +1423,21 @@ pub(super) fn chat_to_response(
         "id": format!("resp-{}", Uuid::new_v4().simple()),
         "object": "response",
         "created_at": chrono::Utc::now().timestamp(),
-        "status": "completed",
+        "status": status,
+        "incomplete_details": incomplete_reason.map(|reason| json!({"reason":reason})),
         "model": model,
         "output": output,
         "output_text": text,
         "usage": normalized_usage
     })
+}
+
+fn chat_incomplete_reason(finish_reason: Option<&str>) -> Option<&'static str> {
+    match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
 }
 
 pub(super) fn response_model(value: &Value) -> Option<String> {
@@ -1414,6 +1540,9 @@ where
         let mut buffer = String::new();
         let mut stream = Box::pin(stream);
         let mut completed = false;
+        let mut end_of_stream = false;
+        let mut completion_deadline = None;
+        let mut pending_utf8 = Vec::new();
         let mut stream_error = None;
         let mut client_disconnected = false;
         let mut first_token_ms = None;
@@ -1425,9 +1554,25 @@ where
             // 只等 stream.next() 的话，客户端断开要等到上游下一个 chunk 才会被发现；
             // 推理模型可能几十秒不吐字，这期间上游一直在生成、账号额度照扣。
             let chunk = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     client_disconnected = true;
                     finish_note = "client disconnected".to_string();
+                    break;
+                }
+                _ = tx.closed() => {
+                    client_disconnected = true;
+                    finish_note = "client disconnected".to_string();
+                    break;
+                }
+                _ = async {
+                    if let Some(deadline) = completion_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    finish_note = "chat completed; usage tail wait ended".to_string();
                     break;
                 }
                 chunk = stream.next() => chunk,
@@ -1438,7 +1583,7 @@ where
             };
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         if let (Some(capture), Some(events)) =
@@ -1448,8 +1593,16 @@ where
                         }
                         if let Some(data) = sse_data(&event) {
                             accumulate_usage_from_sse_data(&data, &mut usage);
+                            if stream_error.is_none() && !(completed && matches!(kind, SseProbeKind::Chat)) {
+                                stream_error = sse_stream_error(kind, &data);
+                            }
                             if sse_stream_completed(kind, &data) {
                                 completed = true;
+                                end_of_stream |= !matches!(kind, SseProbeKind::Chat)
+                                    || data.trim() == "[DONE]";
+                                if matches!(kind, SseProbeKind::Chat) && completion_deadline.is_none() {
+                                    completion_deadline = Some(tokio::time::Instant::now() + CHAT_USAGE_GRACE);
+                                }
                             }
                             if first_token_ms.is_none()
                                 && matches!(
@@ -1459,9 +1612,6 @@ where
                             {
                                 first_token_ms = Some(started.elapsed().as_millis() as i64);
                             }
-                            if stream_error.is_none() {
-                                stream_error = sse_stream_error(kind, &data);
-                            }
                         }
                     }
                     if send_with_cancel(&tx, Ok(bytes), &cancel).await.is_err() {
@@ -1469,7 +1619,7 @@ where
                         client_disconnected = true;
                         break;
                     }
-                    if completed {
+                    if end_of_stream {
                         if finish_note == "stream ended" {
                             finish_note = "completed event observed".to_string();
                         }
@@ -1477,6 +1627,10 @@ where
                     }
                 }
                 Err(err) => {
+                    if completed && matches!(kind, SseProbeKind::Chat) {
+                        finish_note = "chat completed; usage tail connection ended".to_string();
+                        break;
+                    }
                     let message = err.to_string();
                     finish_note = format!("stream error: {message}");
                     stream_error = Some(message.clone());
@@ -1594,23 +1748,30 @@ pub(super) fn sse_stream_completed(kind: SseProbeKind, data: &str) -> bool {
     });
     // Anthropic 原生流以 message_stop 收尾（没有 [DONE] 哨兵）。
     // 不识别它，直通流会被判成「上游流在完成事件前断开」而误记为失败。
-    let expected = match kind {
-        SseProbeKind::Anthropic => "message_stop",
-        _ => "response.completed",
-    };
-    event_type.as_deref() == Some(expected)
+    match kind {
+        SseProbeKind::Anthropic => event_type.as_deref() == Some("message_stop"),
+        SseProbeKind::Responses => matches!(
+            event_type.as_deref(),
+            Some("response.completed") | Some("response.incomplete")
+        ),
+        SseProbeKind::Chat => false,
+    }
 }
 
-pub(super) fn chat_stream_completed(data: &str) -> bool {
+fn chat_stream_finish_reason(data: &str) -> Option<String> {
     serde_json::from_str::<Value>(data)
         .ok()
         .and_then(|value| {
             value
                 .pointer("/choices/0/finish_reason")
-                .filter(|reason| !reason.is_null())
-                .cloned()
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .map(ToOwned::to_owned)
         })
-        .is_some()
+}
+
+pub(super) fn chat_stream_completed(data: &str) -> bool {
+    chat_stream_finish_reason(data).is_some()
 }
 
 pub(super) fn sse_stream_error(kind: SseProbeKind, data: &str) -> Option<String> {
@@ -1619,20 +1780,24 @@ pub(super) fn sse_stream_error(kind: SseProbeKind, data: &str) -> Option<String>
     }
     let value = serde_json::from_str::<Value>(data).ok()?;
     let event_type = value.get("type").and_then(Value::as_str)?;
-    if !matches!(
-        event_type,
-        "error" | "response.failed" | "response.incomplete"
-    ) {
+    if !matches!(event_type, "error" | "response.failed") {
         return None;
     }
-    Some(
-        value
-            .pointer("/error/message")
-            .or_else(|| value.pointer("/response/error/message"))
-            .and_then(Value::as_str)
-            .map(truncate)
-            .unwrap_or_else(|| format!("Responses 上游返回 {event_type}")),
-    )
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/response/error/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("Responses upstream error");
+    let code = value
+        .pointer("/error/code")
+        .or_else(|| value.pointer("/response/error/code"))
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str);
+    let diagnostic = code
+        .map(|code| format!("{code}: {message}"))
+        .unwrap_or_else(|| message.to_string());
+    Some(redact_encrypted_state_error(&diagnostic))
 }
 
 // 流式请求先写入 running 记录，流结束后原地更新，日志页可以实时看到进行中的请求。

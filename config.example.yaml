@@ -26,7 +26,7 @@ auth:
 
 routing:
   model_fallbacks: {}
-  # provider_first: 先渠道后 Auth 账号；auth_first: 先 Auth 账号后渠道
+  # 同一优先级内：provider_first 先渠道，auth_first 先 Auth 账号；不能越过更小的 priority。
   auth_preference: provider_first
   # 统一上游代理。Auth 账号始终使用；普通渠道需设置 use_proxy: true。
   # 留空表示不强制代理。
@@ -38,6 +38,8 @@ usage_log:
   sqlite_path: logs/proxy_usage.sqlite3
 
 # provider 默认超时/重试字段：connect_timeout: 10, request_timeout: 60, max_retries: 3
+# max_retries 是每轮总尝试次数（包含首次），0 按 1 次；全渠道失败后继续下一轮，成功或取消后结束。
+# persistent_retry 仅保留旧配置兼容；业务请求不再使用熔断/冷却/半开准入限制。
 # 普通渠道默认直连；设置 use_proxy: true 后使用 routing.auth_proxy。
 # 流式保护默认关闭：stream_idle_timeout: 0, stream_max_duration: 0
 # 原始 SSE 抓取默认关闭。排查渠道流式收尾问题时可在单个 provider 上开启：

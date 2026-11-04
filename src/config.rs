@@ -255,9 +255,10 @@ pub struct ProviderConfig {
     pub debug_sse_path: String,
     #[serde(default = "default_debug_sse_max_events")]
     pub debug_sse_max_events: usize,
+    /// 业务请求在每轮内对该渠道的尝试次数（包含首次）；0 兼容为一次。
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
-    /// 持续重试上游限流和暂时性服务错误，直到成功或请求取消，同时停用渠道熔断冷却。
+    /// 旧版兼容字段，继续读写保存；业务请求现统一按 max_retries 持续轮询。
     #[serde(default)]
     pub persistent_retry: bool,
     /// 空闲时发送上游短对话保活，真实请求优先。

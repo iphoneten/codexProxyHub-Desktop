@@ -1,4 +1,24 @@
 use super::*;
+use sha2::{Digest, Sha256};
+
+/// 合并键只存哈希，不把上游错误文本或内部请求标识带入运行日志。
+pub(super) fn failure_group_key(
+    scope: &str,
+    api: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    code: u16,
+    error: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    let code = code.to_string();
+    for value in [scope, api, provider, model, upstream_model, code.as_str(), error] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
 
 pub(super) struct UsageLogEvent<'a> {
     pub(super) api: &'a str,
@@ -174,6 +194,96 @@ pub(super) fn start_stream_attempt_log_for_key(
     })?
 }
 
+/// 首个上游输出前，handler future 可能被取消分支或客户端断开直接丢弃。
+/// 正常交付/失败时 take() 把日志交给已有收尾流程；未交付的尝试在 Drop 中记为取消。
+pub(super) struct StreamAttemptLogGuard {
+    config: Arc<AppConfig>,
+    id: Option<i64>,
+    api: &'static str,
+    provider: String,
+    model: String,
+    started: Instant,
+    api_key_id: String,
+    api_key_name: String,
+    request_id: String,
+    log_scope: String,
+    upstream_model: String,
+}
+
+impl StreamAttemptLogGuard {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        config: &Arc<AppConfig>,
+        stream: bool,
+        api: &'static str,
+        provider: &str,
+        model: &str,
+        upstream_model: &str,
+        started: Instant,
+        api_key_id: &str,
+        api_key_name: &str,
+        ctx: &RequestContext,
+    ) -> Self {
+        Self {
+            config: Arc::clone(config),
+            id: start_stream_attempt_log_for_key(
+                config, stream, api, provider, model, upstream_model, started,
+                api_key_id, api_key_name, ctx.request_id(),
+            ),
+            api,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started,
+            api_key_id: api_key_id.to_string(),
+            api_key_name: api_key_name.to_string(),
+            request_id: ctx.request_id().to_string(),
+            log_scope: ctx.log_scope().to_string(),
+            upstream_model: upstream_model.to_string(),
+        }
+    }
+
+    pub(super) fn take(&mut self) -> Option<i64> {
+        self.id.take()
+    }
+
+    pub(super) fn finish_error(&mut self, status: StatusCode, error: &str) {
+        let group = if status.as_u16() != 499 && error != STREAM_ABORTED_MESSAGE {
+            failure_group_key(&self.log_scope, self.api, &self.provider, &self.model,
+                &self.upstream_model, status.as_u16(), error)
+        } else {
+            String::new()
+        };
+        finish_failed_attempt_log_in_group(
+            &self.config, self.id.take(), self.api, &self.provider, &self.model,
+            self.started, error, &self.api_key_id, &self.api_key_name, &self.request_id, &group,
+        );
+    }
+}
+
+impl Drop for StreamAttemptLogGuard {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return; };
+        let config = Arc::clone(&self.config);
+        let api = self.api;
+        let provider = std::mem::take(&mut self.provider);
+        let model = std::mem::take(&mut self.model);
+        let started = self.started;
+        let api_key_id = std::mem::take(&mut self.api_key_id);
+        let api_key_name = std::mem::take(&mut self.api_key_name);
+        let request_id = std::mem::take(&mut self.request_id);
+        let finish = move || finish_failed_attempt_log_for_key(
+            &config, Some(id), api, &provider, &model, started, STREAM_ABORTED_MESSAGE,
+            &api_key_id, &api_key_name, &request_id,
+        );
+        // SQLite 的锁等待不能拖延网络取消或占用异步工作线程。
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(finish);
+        } else {
+            finish();
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn finish_failed_attempt_log(
     config: &AppConfig,
@@ -211,6 +321,24 @@ pub(super) fn finish_failed_attempt_log_for_key(
     api_key_name: &str,
     request_id: &str,
 ) {
+    finish_failed_attempt_log_in_group(config, log_id, api, provider, model, started,
+        error, api_key_id, api_key_name, request_id, "");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_failed_attempt_log_in_group(
+    config: &AppConfig,
+    log_id: Option<i64>,
+    api: &str,
+    provider: &str,
+    model: &str,
+    started: Instant,
+    error: &str,
+    api_key_id: &str,
+    api_key_name: &str,
+    request_id: &str,
+    group: &str,
+) {
     let Some(id) = log_id else {
         return;
     };
@@ -219,24 +347,11 @@ pub(super) fn finish_failed_attempt_log_for_key(
     } else {
         "error"
     };
-    if update_usage_log(
-        config,
+    if update_usage_log_sqlite_in_group(
+        config.usage_log_sqlite_path(),
         id,
-        started,
-        &UsageLogEvent {
-            api,
-            api_key_id,
-            api_key_name,
-            provider,
-            model,
-            upstream_model: "",
-            status,
-            error: Some(error),
-            usage: TokenUsage::default(),
-            first_token_ms: None,
-            token_source: None,
-            request_id,
-        },
+        status, "", started.elapsed().as_millis() as i64, None,
+        error, 0, 0, "upstream_or_unknown", group,
     )
     .is_err()
     {
@@ -457,13 +572,35 @@ pub(super) fn update_usage_log_sqlite(
     output_tokens: i64,
     token_source: &str,
 ) -> rusqlite::Result<usize> {
-    let conn = open_usage_log_connection(path)?;
+    update_usage_log_sqlite_in_group(path, id, status, upstream_model, latency_ms,
+        first_token_ms, error, input_tokens, output_tokens, token_source, "")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_usage_log_sqlite_in_group(
+    path: PathBuf,
+    id: i64,
+    status: &str,
+    upstream_model: &str,
+    latency_ms: i64,
+    first_token_ms: Option<i64>,
+    error: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    token_source: &str,
+    group: &str,
+) -> rusqlite::Result<usize> {
+    let mut conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
-    conn.execute(
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let last_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let updated = tx.execute(
         r#"
         UPDATE usage_logs
         SET status = ?1, upstream_model = ?2, latency_ms = ?3, first_token_ms = ?4,
-            input_tokens = ?5, output_tokens = ?6, error = ?7, token_source = ?8
+            input_tokens = ?5, output_tokens = ?6, error = ?7, token_source = ?8,
+            last_ts = ?10, failure_group = ?11,
+            latency_samples = CASE WHEN ?3 > 0 THEN 1 ELSE 0 END
         WHERE id = ?9
         "#,
         params![
@@ -475,9 +612,43 @@ pub(super) fn update_usage_log_sqlite(
             output_tokens,
             error,
             token_source,
-            id
+            id,
+            last_ts,
+            group,
         ],
-    )
+    )?;
+    // 只合并本请求新生成、无业务输出/用量的重复失败；成功、取消与旧记录不参与。
+    if updated > 0 && status == "error" && !group.is_empty()
+        && first_token_ms.is_none() && input_tokens == 0 && output_tokens == 0
+    {
+        use rusqlite::OptionalExtension;
+        let current: (String, i64, i64, i64) = tx.query_row(
+            "SELECT ts, repeat_count, latency_ms, latency_samples FROM usage_logs WHERE id = ?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let previous: Option<(i64, i64, i64, i64)> = tx.query_row(
+            "SELECT id, repeat_count, latency_ms, latency_samples FROM usage_logs
+             WHERE failure_group = ?1 AND failure_group != '' AND status = 'error' AND id != ?2
+               AND first_token_ms IS NULL AND input_tokens = 0 AND output_tokens = 0
+               AND substr(ts, 1, 10) = substr(?3, 1, 10)
+             ORDER BY id LIMIT 1",
+            params![group, id, current.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        if let Some((target, count, elapsed, samples)) = previous {
+            tx.execute(
+                "UPDATE usage_logs SET repeat_count = ?1, latency_ms = ?2, latency_samples = ?3,
+                     last_ts = ?4 WHERE id = ?5",
+                params![count.max(1).saturating_add(current.1.max(1)),
+                    elapsed.saturating_add(current.2), samples.max(0).saturating_add(current.3.max(0)),
+                    last_ts, target],
+            )?;
+            // 当前行刚由本次尝试创建，只有聚合写入成功后才折叠；事务失败保留两行。
+            tx.execute("DELETE FROM usage_logs WHERE id = ?1", [id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(updated)
 }
 
 pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusqlite::Result<i64> {
@@ -635,6 +806,11 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "api_key_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "request_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "repeat_count", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "last_ts", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "failure_group", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "latency_samples", "INTEGER NOT NULL DEFAULT 1")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_usage_logs_failure_group ON usage_logs(failure_group) WHERE failure_group != '';")?;
     Ok(())
 }
 
@@ -659,8 +835,140 @@ pub(super) fn ensure_column(
 
 #[cfg(test)]
 mod tests {
-    use super::log_provider_name;
+    use super::*;
     use crate::config::AppConfig;
+
+    fn merge_config() -> Arc<AppConfig> {
+        let path = std::env::temp_dir().join(format!("routehub-merged-failures-{}.sqlite3", Uuid::new_v4()));
+        Arc::new(serde_json::from_value(json!({
+            "usage_log": {"backend":"sqlite", "sqlite_path":path.to_string_lossy()},
+            "providers": []
+        })).unwrap())
+    }
+
+    fn failed_attempt(cfg: &Arc<AppConfig>, ctx: &RequestContext, provider: &str, code: u16, error: &str) {
+        let mut guard = StreamAttemptLogGuard::new(cfg, true, "responses", provider, "client-model",
+            "upstream-model", Instant::now(), "synthetic-key", "key", ctx);
+        guard.finish_error(StatusCode::from_u16(code).unwrap(), error);
+    }
+
+    #[test]
+    fn repeated_failures_merge_counts_and_leave_success_independent() {
+        let cfg = merge_config();
+        let ctx = RequestContext::detached();
+        for _ in 0..5 { failed_attempt(&cfg, &ctx, "A", 502, "same error"); }
+        failed_attempt(&cfg, &ctx, "B", 502, "same error");
+        let mut success = StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model",
+            "upstream-model", Instant::now(), "synthetic-key", "key", &ctx);
+        let success_id = success.take().unwrap();
+        update_usage_log_sqlite(cfg.usage_log_sqlite_path(), success_id, "ok", "upstream-model",
+            100, Some(10), "", 7, 3, "upstream").unwrap();
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let totals: (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(repeat_count), SUM(input_tokens + output_tokens) FROM usage_logs", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(totals, (3, 7, 10));
+        let count: i64 = conn.query_row("SELECT repeat_count FROM usage_logs WHERE channel='A' AND status='error'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 5);
+        let last: String = conn.query_row("SELECT last_ts FROM usage_logs WHERE channel='A' AND status='error'", [], |row| row.get(0)).unwrap();
+        assert!(!last.is_empty());
+    }
+
+    #[test]
+    fn merging_uses_actual_request_scope_and_error_identity() {
+        let cfg = merge_config();
+        let root = CancellationToken::new();
+        let first = RequestContext::child_of(&root, Some("same-client-request-id".into()));
+        let second = RequestContext::child_of(&root, Some("same-client-request-id".into()));
+        assert_eq!(first.request_id(), second.request_id());
+        assert_ne!(first.log_scope(), second.log_scope());
+        failed_attempt(&cfg, &first, "A", 502, "same error");
+        failed_attempt(&cfg, &first.clone(), "A", 502, "same error");
+        failed_attempt(&cfg, &second, "A", 502, "same error");
+        failed_attempt(&cfg, &first, "A", 503, "same error");
+        failed_attempt(&cfg, &first, "A", 502, "changed error");
+        failed_attempt(&cfg, &first, "auth:account-a", 502, "same error");
+        failed_attempt(&cfg, &first, "auth:account-b", 502, "same error");
+        let mut model_change = StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model",
+            "another-upstream-model", Instant::now(), "synthetic-key", "key", &first);
+        model_change.finish_error(StatusCode::BAD_GATEWAY, "same error");
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let totals: (i64, i64) = conn.query_row("SELECT COUNT(*), SUM(repeat_count) FROM usage_logs", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(totals, (7, 8));
+    }
+
+    #[test]
+    fn old_records_and_different_days_are_not_folded() {
+        let cfg = merge_config();
+        log_usage_sqlite_for_key(cfg.usage_log_sqlite_path(), "2026-10-26 12:00:00", "responses",
+            "synthetic-key", "key", "error", "A", "client-model", "", 10, None, "same error",
+            0, 0, "upstream", "same-client-request-id").unwrap();
+        let ctx = RequestContext::detached();
+        failed_attempt(&cfg, &ctx, "A", 502, "same error");
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        conn.execute("UPDATE usage_logs SET ts='2026-10-25 12:00:00' WHERE failure_group != ''", []).unwrap();
+        drop(conn);
+        failed_attempt(&cfg, &ctx, "A", 502, "same error");
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM usage_logs", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 3);
+        let old: (i64, String) = conn.query_row("SELECT repeat_count, failure_group FROM usage_logs WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(old, (1, String::new()));
+    }
+
+    #[test]
+    fn merged_elapsed_time_preserves_positive_latency_samples() {
+        let cfg = merge_config();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(log_stream_started(&cfg, "responses", "A", "client-model", "upstream-model",
+                Instant::now(), "synthetic-key", "key", "test-request").unwrap());
+        }
+        for (id, duration) in ids.into_iter().zip([0, 100, 300]) {
+            update_usage_log_sqlite_in_group(cfg.usage_log_sqlite_path(), id, "error", "",
+                duration, None, "same error", 0, 0, "upstream", "test-scoped-group").unwrap();
+        }
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let row: (i64, i64, i64) = conn.query_row("SELECT repeat_count, latency_ms, latency_samples FROM usage_logs", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(row, (3, 400, 2));
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_is_kept_separate_from_merged_failures() {
+        let cfg = merge_config();
+        let ctx = RequestContext::detached();
+        for _ in 0..3 { failed_attempt(&cfg, &ctx, "A", 502, "same error"); }
+        drop(StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model", "upstream-model",
+            Instant::now(), "synthetic-key", "key", &ctx));
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cancelled: i64 = conn.query_row("SELECT COUNT(*) FROM usage_logs WHERE status='aborted'", [], |row| row.get(0)).unwrap();
+                if cancelled == 1 { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let counts: (i64, i64) = conn.query_row("SELECT COUNT(*), SUM(repeat_count) FROM usage_logs", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(counts, (2, 4));
+    }
+
+    #[test]
+    fn concurrent_same_request_errors_do_not_lose_counts() {
+        let cfg = merge_config();
+        let ctx = RequestContext::detached();
+        // 先建立表，避免并发迁移本身干扰合并检查。
+        ensure_usage_log_schema(&open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap()).unwrap();
+        let workers = (0..8).map(|_| {
+            let cfg = cfg.clone(); let ctx = ctx.clone();
+            std::thread::spawn(move || failed_attempt(&cfg, &ctx, "A", 502, "same error"))
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let counts: (i64, i64) = conn.query_row("SELECT COUNT(*), SUM(repeat_count) FROM usage_logs", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(counts, (1, 8));
+    }
 
     #[test]
     fn auth_provider_logs_account_name_instead_of_id() {

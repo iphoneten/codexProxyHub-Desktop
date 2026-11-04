@@ -6,7 +6,6 @@ use super::AppView;
 use crate::config::AppConfig;
 use crate::proxy;
 use eframe::egui;
-use std::time::Instant;
 
 pub fn provider_summary_section(
     ui: &mut egui::Ui,
@@ -113,56 +112,30 @@ fn provider_runtime_badge(
     let Some(status) = status else {
         badge(
             ui,
-            "待请求",
+            "轮询待命",
             egui::Color32::from_rgb(248, 250, 252),
             muteds(),
         );
         return;
     };
 
-    match status.status {
-        proxy::ProviderCircuitStatus::Healthy => {
-            if status.failures == 0 {
-                badge(
-                    ui,
-                    &format!("健康 · {}", status.inflight),
-                    egui::Color32::from_rgb(240, 253, 244),
-                    good(),
-                );
-            } else {
-                badge(
-                    ui,
-                    &format!("失败 {}/3 · {}", status.failures, status.inflight),
-                    egui::Color32::from_rgb(255, 247, 237),
-                    egui::Color32::from_rgb(190, 120, 24),
-                );
-            }
-        }
-        proxy::ProviderCircuitStatus::Open => {
-            let text = match status.open_until {
-                Some(until) if until > Instant::now() => {
-                    let remaining = until
-                        .saturating_duration_since(Instant::now())
-                        .as_secs()
-                        .max(1);
-                    format!("熔断 {remaining}s")
-                }
-                _ => "待探测".to_string(),
-            };
+    if status.failures == 0 {
+        badge(
+            ui,
+            &format!("轮询 · 并发 {}", status.inflight),
+            egui::Color32::from_rgb(240, 253, 244),
+            good(),
+        );
+    } else {
+        ui.scope(|ui| {
             badge(
                 ui,
-                &text,
-                egui::Color32::from_rgb(254, 242, 242),
-                egui::Color32::from_rgb(176, 54, 64),
-            );
-        }
-        proxy::ProviderCircuitStatus::HalfOpen => {
-            badge(
-                ui,
-                &format!("半开 · {}", status.inflight),
+                &format!("轮询 · 失败 {} 次 · 并发 {}", status.failures, status.inflight),
                 egui::Color32::from_rgb(255, 247, 237),
                 egui::Color32::from_rgb(190, 120, 24),
             );
-        }
+        })
+        .response
+        .on_hover_text(status.last_error.as_deref().unwrap_or("最近请求失败"));
     }
 }

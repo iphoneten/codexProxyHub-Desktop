@@ -40,6 +40,8 @@ mod auth;
 mod handlers;
 mod oauth;
 mod request_layer;
+mod retry;
+mod responses_state;
 mod keepalive;
 mod routing;
 mod streaming;
@@ -50,8 +52,11 @@ use auth::*;
 use handlers::*;
 use oauth::*;
 use request_layer::*;
+use retry::ProviderRetryCycle;
+use responses_state::*;
 use routing::*;
 use streaming::*;
+pub(crate) use streaming::append_sse_bytes;
 use upstream::*;
 pub(crate) use usage_log::USAGE_LOG_FILTER_WHERE;
 use usage_log::*;
@@ -60,6 +65,8 @@ use usage_log::*;
 mod anthropic_passthrough_tests;
 #[cfg(test)]
 mod messages_e2e_tests;
+#[cfg(test)]
+mod protocol_tests;
 #[cfg(test)]
 mod tests;
 
@@ -152,9 +159,8 @@ pub(super) fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
 // 读侧 read() + clone Arc 指针，几乎无锁；写侧只在切换指针时短暂持有写锁
 pub(crate) type ConfigHandle = Arc<RwLock<Arc<AppConfig>>>;
 type ProxyByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
-const PROVIDER_CIRCUIT_FAILURE_THRESHOLD: usize = 3;
-const PROVIDER_CIRCUIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// 运行统计兼容接口：保留旧枚举名称，Open / HalfOpen 不再控制请求准入或排序。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProviderCircuitStatus {
     #[default]
@@ -163,6 +169,7 @@ pub enum ProviderCircuitStatus {
     HalfOpen,
 }
 
+/// 渠道运行统计；status / open_until 仅为旧接口兼容字段。
 #[derive(Clone, Debug, Default)]
 pub struct ProviderCircuitSnapshot {
     pub status: ProviderCircuitStatus,
@@ -177,200 +184,53 @@ pub struct ProviderCircuitSnapshot {
 
 pub type ProviderCircuitStatusHandle = Arc<RwLock<HashMap<String, ProviderCircuitSnapshot>>>;
 
-#[derive(Clone, Debug)]
-enum ProviderCircuitPhase {
-    Closed,
-    Open { until: Instant },
-    HalfOpen { probe_in_flight: bool },
-}
-
-#[derive(Clone, Debug)]
+// 保留 AppState 字段及旧类型名称，仅维护运行统计，不再保存熔断阶段。
+#[derive(Clone, Debug, Default)]
 struct ProviderCircuit {
-    phase: ProviderCircuitPhase,
     consecutive_failures: usize,
     last_error: Option<String>,
-    last_changed: Instant,
-}
-
-impl Default for ProviderCircuit {
-    fn default() -> Self {
-        Self {
-            phase: ProviderCircuitPhase::Closed,
-            consecutive_failures: 0,
-            last_error: None,
-            last_changed: Instant::now(),
-        }
-    }
 }
 
 #[derive(Debug)]
 struct ProviderCircuitGuard {
     provider: String,
-    config: ConfigHandle,
     circuits: Arc<Mutex<HashMap<String, ProviderCircuit>>>,
     statuses: ProviderCircuitStatusHandle,
     inflight: Arc<AtomicUsize>,
-    half_open_probe: bool,
-    completed: bool,
 }
 
 impl ProviderCircuitGuard {
-    fn mark_success(mut self) {
-        let persistent_retry = persistent_retry_enabled(&self.config, &self.provider);
+    fn mark_success(self) {
         let mut circuits = self.circuits.lock();
-        let circuit = circuits.entry(self.provider.clone()).or_default();
-        if !persistent_retry && !self.half_open_probe
-            && matches!(
-                circuit.phase,
-                ProviderCircuitPhase::Open { .. } | ProviderCircuitPhase::HalfOpen { .. }
-            )
-        {
-            self.completed = true;
-            return;
-        }
-        circuits.insert(
-            self.provider.clone(),
-            ProviderCircuit {
-                phase: ProviderCircuitPhase::Closed,
-                consecutive_failures: 0,
-                last_error: None,
-                last_changed: Instant::now(),
-            },
-        );
-        drop(circuits);
+        circuits.insert(self.provider.clone(), ProviderCircuit::default());
         let mut statuses = self.statuses.write();
         let status = statuses.entry(self.provider.clone()).or_default();
         status.status = ProviderCircuitStatus::Healthy;
         status.failures = 0;
         status.open_until = None;
         status.last_error = None;
-        status.quota_exhausted = false;
-        self.completed = true;
+        // Auth 额度保护独立于运行统计，迟到成功不能解除已耗尽账号的保护；
+        // 仍由后台额度刷新确认恢复，普通渠道维持成功后清理标记的兼容行为。
+        if !self.provider.starts_with("auth:") {
+            status.quota_exhausted = false;
+        }
     }
 
-    fn mark_failure(mut self, status: StatusCode, message: &str, retry_after: Option<Duration>) {
+    fn mark_failure(self, status: StatusCode, message: &str, _retry_after: Option<Duration>) {
         // Auth 账号收到 429 时通常表示该账号的额度/速率窗口已耗尽。
-        // 记录为账号级耗尽，避免短暂熔断结束后再次请求同一账号；
-        // 后台额度刷新确认恢复后会清除该标记。
+        // 保留账号级保护，由后台额度刷新确认恢复后清除，不引入渠道冷却。
         let quota_exhausted = quota_exhausted_error(message)
             || (self.provider.starts_with("auth:") && status == StatusCode::TOO_MANY_REQUESTS);
-        // 读取当前配置，让开关生效前已经在飞的请求也不能重新触发熔断。
-        if persistent_retry_enabled(&self.config, &self.provider) {
-            clear_provider_cooldown(&self.circuits, &self.statuses, &self.provider);
-            self.update_failure_status(
-                ProviderCircuitStatus::Healthy, 0, None, message, quota_exhausted,
-            );
-            self.completed = true;
-            return;
-        }
-        if !circuit_breaker_failure(status, message) {
-            self.mark_success();
-            return;
-        }
-
         let mut circuits = self.circuits.lock();
         let circuit = circuits.entry(self.provider.clone()).or_default();
         circuit.last_error = Some(message.to_string());
-        circuit.last_changed = Instant::now();
-
-        if !self.half_open_probe {
-            match circuit.phase.clone() {
-                ProviderCircuitPhase::Open { until } => {
-                    circuit.consecutive_failures += 1;
-                    let until = if status == StatusCode::TOO_MANY_REQUESTS || quota_exhausted {
-                        until.max(
-                            Instant::now()
-                                + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN),
-                        )
-                    } else {
-                        until
-                    };
-                    circuit.phase = ProviderCircuitPhase::Open { until };
-                    let failures = circuit.consecutive_failures;
-                    drop(circuits);
-                    self.update_failure_status(
-                        ProviderCircuitStatus::Open,
-                        failures,
-                        Some(until),
-                        message,
-                        quota_exhausted,
-                    );
-                    self.completed = true;
-                    return;
-                }
-                ProviderCircuitPhase::HalfOpen { .. } => {
-                    circuit.consecutive_failures += 1;
-                    let failures = circuit.consecutive_failures;
-                    drop(circuits);
-                    self.update_failure_status(
-                        ProviderCircuitStatus::HalfOpen,
-                        failures,
-                        None,
-                        message,
-                        quota_exhausted,
-                    );
-                    self.completed = true;
-                    return;
-                }
-                ProviderCircuitPhase::Closed => {}
-            }
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS || quota_exhausted {
-            circuit.consecutive_failures += 1;
-            let until = Instant::now() + retry_after.unwrap_or(PROVIDER_CIRCUIT_DEFAULT_COOLDOWN);
-            circuit.phase = ProviderCircuitPhase::Open { until };
-            let failures = circuit.consecutive_failures;
-            drop(circuits);
-            self.update_failure_status(
-                ProviderCircuitStatus::Open,
-                failures,
-                Some(until),
-                message,
-                quota_exhausted,
-            );
-            self.completed = true;
-            return;
-        }
-
-        circuit.consecutive_failures += 1;
-        let opened = matches!(circuit.phase, ProviderCircuitPhase::HalfOpen { .. })
-            || circuit.consecutive_failures >= PROVIDER_CIRCUIT_FAILURE_THRESHOLD;
-        let until = opened.then(|| Instant::now() + PROVIDER_CIRCUIT_DEFAULT_COOLDOWN);
-        if let Some(until) = until {
-            circuit.phase = ProviderCircuitPhase::Open { until };
-        } else {
-            circuit.phase = ProviderCircuitPhase::Closed;
-        }
-        let failures = circuit.consecutive_failures;
-        drop(circuits);
-        self.update_failure_status(
-            if opened {
-                ProviderCircuitStatus::Open
-            } else {
-                ProviderCircuitStatus::Healthy
-            },
-            failures,
-            until,
-            message,
-            quota_exhausted,
-        );
-        self.completed = true;
-    }
-
-    fn update_failure_status(
-        &self,
-        circuit_status: ProviderCircuitStatus,
-        failures: usize,
-        open_until: Option<Instant>,
-        message: &str,
-        quota_exhausted: bool,
-    ) {
+        // 所有上游失败均参与统计，长期轮询不允许计数溢出。
+        circuit.consecutive_failures = circuit.consecutive_failures.saturating_add(1);
         let mut statuses = self.statuses.write();
         let status = statuses.entry(self.provider.clone()).or_default();
-        status.status = circuit_status;
-        status.failures = failures;
-        status.open_until = open_until;
+        status.status = ProviderCircuitStatus::Healthy;
+        status.failures = circuit.consecutive_failures;
+        status.open_until = None;
         status.last_error = Some(message.to_string());
         if quota_exhausted {
             status.quota_exhausted = true;
@@ -380,65 +240,12 @@ impl ProviderCircuitGuard {
 
 impl Drop for ProviderCircuitGuard {
     fn drop(&mut self) {
-        let persistent_retry = persistent_retry_enabled(&self.config, &self.provider);
-        if !self.completed && persistent_retry {
-            clear_provider_cooldown(&self.circuits, &self.statuses, &self.provider);
-        } else if !self.completed && self.half_open_probe {
-            let until = Instant::now() + PROVIDER_CIRCUIT_DEFAULT_COOLDOWN;
-            let failures = {
-                let mut circuits = self.circuits.lock();
-                let circuit = circuits.entry(self.provider.clone()).or_default();
-                circuit.phase = ProviderCircuitPhase::Open { until };
-                circuit.last_error = Some("半开探测请求中断".to_string());
-                circuit.last_changed = Instant::now();
-                circuit.consecutive_failures = circuit
-                    .consecutive_failures
-                    .max(PROVIDER_CIRCUIT_FAILURE_THRESHOLD);
-                circuit.consecutive_failures
-            };
-            self.update_failure_status(
-                ProviderCircuitStatus::Open,
-                failures,
-                Some(until),
-                "半开探测请求中断",
-                false,
-            );
-        }
-
-        let remaining = self.inflight.fetch_sub(1, Ordering::AcqRel) - 1;
+        // 未完成（取消/断开）仅释放并发，不新增失败，也不清理之前的错误。
+        // 原子计数与快照在同一写锁内更新，避免并发完成时快照回退到旧值。
         let mut statuses = self.statuses.write();
+        let remaining = self.inflight.fetch_sub(1, Ordering::AcqRel) - 1;
         statuses.entry(self.provider.clone()).or_default().inflight = remaining;
     }
-}
-
-fn persistent_retry_enabled(config: &ConfigHandle, provider: &str) -> bool {
-    config.read().providers.iter()
-        .any(|item| item.name == provider && item.persistent_retry)
-}
-
-fn clear_provider_cooldown(
-    circuits: &Mutex<HashMap<String, ProviderCircuit>>,
-    statuses: &ProviderCircuitStatusHandle,
-    provider: &str,
-) {
-    let mut circuits = circuits.lock();
-    circuits.insert(provider.to_string(), ProviderCircuit::default());
-    let mut statuses = statuses.write();
-    let status = statuses.entry(provider.to_string()).or_default();
-    status.status = ProviderCircuitStatus::Healthy;
-    status.failures = 0;
-    status.open_until = None;
-    // 解除熔断不等于请求成功，保留最近错误、在飞数和独立的额度状态。
-}
-
-fn circuit_breaker_failure(status: StatusCode, message: &str) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-        || status == StatusCode::PROXY_AUTHENTICATION_REQUIRED
-        || status.is_server_error()
-        || quota_exhausted_error(message)
 }
 
 fn quota_exhausted_error(message: &str) -> bool {
@@ -485,6 +292,7 @@ struct AppState {
     keepalive_template_store: Arc<keepalive::TemplateStore>,
     provider_statuses: ProviderCircuitStatusHandle,
     session_affinity: Arc<Mutex<HashMap<String, SessionAffinity>>>,
+    responses_state: Arc<ResponsesStateStore>,
     // 每个 provider 是否接受 stream_options.include_usage 注入的自动探测结果
     // Some(true)  = 已确认接受；Some(false) = 已确认拒绝；None = 未探测（默认注入试试）
     // 只在进程内缓存，代理重启后重新探测
@@ -504,7 +312,7 @@ struct RawSseCapture {
 }
 
 impl AppState {
-    // 拿一份当前配置快照。整个请求生命周期内用这份，避免请求中途配置换了导致的不一致
+    // 单次转发使用稳定快照；持续轮询会在后续尝试前重新读取，以应用停用及权限变更。
     fn snapshot(&self) -> Arc<AppConfig> {
         self.config.read().clone()
     }
@@ -636,47 +444,10 @@ impl AppState {
     }
 
     fn begin_provider_attempt(&self, provider: &str) -> Result<ProviderCircuitGuard, ProxyError> {
-        if persistent_retry_enabled(&self.config, provider) {
-            clear_provider_cooldown(&self.provider_circuits, &self.provider_statuses, provider);
-        }
-        let now = Instant::now();
-        let mut circuits = self.provider_circuits.lock();
-        let circuit = circuits.entry(provider.to_string()).or_default();
-        let mut half_open_probe = false;
-
-        match &mut circuit.phase {
-            ProviderCircuitPhase::Closed => {}
-            ProviderCircuitPhase::Open { until } if *until > now => {
-                let remaining = until.saturating_duration_since(now).as_secs().max(1);
-                return Err(ProxyError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("渠道 '{provider}' 熔断冷却中，约 {remaining} 秒后重试"),
-                ));
-            }
-            ProviderCircuitPhase::Open { .. } => {
-                half_open_probe = true;
-                circuit.phase = ProviderCircuitPhase::HalfOpen {
-                    probe_in_flight: true,
-                };
-                circuit.last_changed = now;
-                let mut statuses = self.provider_statuses.write();
-                let status = statuses.entry(provider.to_string()).or_default();
-                status.status = ProviderCircuitStatus::HalfOpen;
-                status.open_until = None;
-            }
-            ProviderCircuitPhase::HalfOpen { probe_in_flight } => {
-                if *probe_in_flight {
-                    return Err(ProxyError::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("渠道 '{provider}' 正在半开探测"),
-                    ));
-                }
-                half_open_probe = true;
-                *probe_in_flight = true;
-                circuit.last_changed = now;
-            }
-        }
-        drop(circuits);
+        self.provider_circuits
+            .lock()
+            .entry(provider.to_string())
+            .or_default();
 
         let inflight = {
             let mut loads = self.provider_loads.lock();
@@ -685,24 +456,23 @@ impl AppState {
                 .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
                 .clone()
         };
-        let current_inflight = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut statuses = self.provider_statuses.write();
+            let status = statuses.entry(provider.to_string()).or_default();
+            status.inflight = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+            // 旧快照不阻拦正常轮询，也不清除最近错误及独立额度保护。
+            status.status = ProviderCircuitStatus::Healthy;
+            status.open_until = None;
+        }
         if let Some(cancel) = self.keepalive_requests.lock().get(provider) {
             cancel.cancel();
         }
-        self.provider_statuses
-            .write()
-            .entry(provider.to_string())
-            .or_default()
-            .inflight = current_inflight;
 
         Ok(ProviderCircuitGuard {
             provider: provider.to_string(),
-            config: Arc::clone(&self.config),
             circuits: Arc::clone(&self.provider_circuits),
             statuses: Arc::clone(&self.provider_statuses),
             inflight,
-            half_open_probe,
-            completed: false,
         })
     }
 }
@@ -794,6 +564,7 @@ struct AttemptFailure {
     started: Instant,
     status: StatusCode,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl AttemptFailure {
@@ -809,6 +580,7 @@ impl AttemptFailure {
             started,
             status: err.status,
             message: err.message,
+            retry_after: err.retry_after,
         }
     }
 }
@@ -987,13 +759,18 @@ pub async fn run_server(
         )),
         provider_statuses: circuit_status,
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
+        responses_state: Arc::new(ResponsesStateStore::new(
+            initial.resolve_runtime_path("responses-state/responses-affinity.json"),
+        )),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
         oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         root_cancel: root_cancel.clone(),
     };
+    restore_responses_state(&state).await;
     keepalive::restore_native_templates(&state).await;
     let keepalive_task = tokio::spawn(keepalive::run_idle_keepalive(state.clone()));
+    let shutdown_state = state.clone();
     let mut app = Router::new()
         .route("/", get(index))
         .route("/v1", get(index))
@@ -1046,6 +823,7 @@ pub async fn run_server(
         .await;
     keepalive_task.abort();
     let _ = keepalive_task.await;
+    flush_responses_state(&shutdown_state).await;
     result?;
     crate::runtime_log::record("INFO", "代理已停止");
     Ok(())
@@ -1200,6 +978,7 @@ mod state_tests {
             keepalive_template_store: Arc::new(keepalive::TemplateStore::default()),
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            responses_state: Arc::new(ResponsesStateStore::default()),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
             oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1282,7 +1061,7 @@ mod state_tests {
     }
 
     #[test]
-    fn provider_circuit_quota_error_text_opens_immediately() {
+    fn provider_runtime_quota_error_text_records_exhaustion_without_blocking() {
         let state = test_state();
         state
             .begin_provider_attempt("quota-text-limited")
@@ -1293,15 +1072,19 @@ mod state_tests {
                 None,
             );
 
-        let err = state
+        let guard = state
             .begin_provider_attempt("quota-text-limited")
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(err.message.contains("熔断冷却中"));
+            .unwrap();
         assert!(state
             .provider_statuses
             .read()
             .get("quota-text-limited")
             .is_some_and(|status| status.quota_exhausted));
+        assert_eq!(state.provider_statuses.read()["quota-text-limited"].failures, 1);
+        guard.mark_success();
+        let status = state.provider_statuses.read()["quota-text-limited"].clone();
+        assert_eq!(status.failures, 0);
+        assert!(status.last_error.is_none());
+        assert!(!status.quota_exhausted);
     }
 }

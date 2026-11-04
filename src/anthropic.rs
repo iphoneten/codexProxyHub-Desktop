@@ -523,6 +523,7 @@ where
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut stream = Box::pin(stream);
         let mut first_token_ms = None;
         // 首个 chunk 先发 role=assistant，OpenAI 客户端惯例
@@ -551,7 +552,7 @@ where
             };
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    crate::proxy::append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {
@@ -600,6 +601,17 @@ where
                                     u_tx.send(StreamOutcome::aborted(state.usage, first_token_ms));
                                 return;
                             }
+                        }
+                        if state.finished {
+                            let outcome = if send_with_cancel(
+                                &tx, Ok(Bytes::from("data: [DONE]\n\n")), &cancel,
+                            ).await.is_err() {
+                                StreamOutcome::aborted(state.usage, first_token_ms)
+                            } else {
+                                StreamOutcome::success(state.usage, first_token_ms)
+                            };
+                            let _ = u_tx.send(outcome);
+                            return;
                         }
                     }
                 }

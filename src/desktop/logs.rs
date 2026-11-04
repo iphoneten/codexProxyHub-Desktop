@@ -323,6 +323,7 @@ pub fn logs_section(
                     .show(ui, |ui| {
                         table_header(ui, "时间");
                         table_header(ui, "状态");
+                        table_header(ui, "次数");
                         table_header(ui, "API Key");
                         table_header(ui, "接口");
                         table_header(ui, "渠道");
@@ -333,14 +334,18 @@ pub fn logs_section(
                         ui.end_row();
 
                         for row in &log_view.rows {
-                            ui.monospace(&row.ts);
+                            ui.monospace(if row.last_ts.is_empty() { &row.ts } else { &row.last_ts })
+                                .on_hover_text(format!("首次：{}\n最后：{}", row.ts,
+                                    if row.last_ts.is_empty() { &row.ts } else { &row.last_ts }));
                             log_status_cell(ui, &row.status, loading_gif);
+                            ui.label(row.repeat_count.to_string());
                             ui.label(row.api_key_label());
                             ui.label(&row.api);
                             ui.label(&row.channel);
                             model_cell(ui, row);
                             ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
-                            ui.label(format!("{}/{}", row.display_latency(), row.first_token));
+                            ui.label(format!("{}{}/{}", if row.repeat_count > 1 { "累计 " } else { "" },
+                                row.display_latency(), row.first_token));
                             let err_display = if row.error.chars().count() > 30 {
                                 let truncated: String = row.error.chars().take(28).collect();
                                 format!("{truncated}...")
@@ -648,10 +653,11 @@ fn read_sqlite_log_page(
             r#"
             SELECT
                 ts, status, api_key_name, api, channel, request_model, upstream_model,
-                latency_ms, first_token_ms, input_tokens, output_tokens, error
+                latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                MAX(repeat_count, 1), last_ts
             FROM usage_logs
             WHERE {}
-            ORDER BY id DESC
+            ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
             LIMIT ?5
             OFFSET ?6
             "#,
@@ -686,6 +692,8 @@ fn read_sqlite_log_page(
                     input_tokens: row.get(9)?,
                     output_tokens: row.get(10)?,
                     error: row.get(11)?,
+                    repeat_count: row.get(12)?,
+                    last_ts: row.get(13)?,
                 })
             },
         )
@@ -709,6 +717,8 @@ pub struct LogRow {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) error: String,
+    pub(crate) repeat_count: i64,
+    pub(crate) last_ts: String,
 }
 
 impl LogRow {
@@ -873,6 +883,32 @@ mod tests {
             Some("2026-06-18 00:00:00")
         );
         assert_eq!(LogRange::All.start_timestamp_for(today), None);
+    }
+
+    #[test]
+    fn merged_log_page_preserves_filters_and_physical_record_count() {
+        let path = std::env::temp_dir().join(format!("routehub-merged-page-{}.sqlite3", uuid::Uuid::new_v4()));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d 10:00:00").to_string();
+        insert_test_log(&conn, &today, "key-a", "A", 7);
+        insert_test_log(&conn, &today, "key-a", "A", 0);
+        conn.execute("UPDATE usage_logs SET status='error', repeat_count=5, error='same error', last_ts=?1 WHERE id=2",
+            [chrono::Local::now().format("%Y-%m-%d 12:00:00").to_string()]).unwrap();
+        insert_test_log(&conn, &today, "key-b", "B", 50);
+        drop(conn);
+        let (rows, total) = read_sqlite_log_page(path.clone(), test_filter(LogRange::Today, LogStatusFilter::All, "key-a"), None, 0, 1).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repeat_count, 5);
+        assert_eq!(rows[0].status, "error");
+        assert!(!rows[0].last_ts.is_empty());
+        let (rows, _) = read_sqlite_log_page(path.clone(), test_filter(LogRange::Today, LogStatusFilter::All, "key-a"), None, 1, 1).unwrap();
+        assert_eq!(rows[0].repeat_count, 1);
+        let totals = read_sqlite_log_totals(path.clone(), test_filter(LogRange::Today, LogStatusFilter::All, "key-a"), None).unwrap();
+        assert_eq!(totals.input_tokens, 7);
+        let (_, errors) = read_sqlite_log_page(path, test_filter(LogRange::Today, LogStatusFilter::Failed, "key-a"), None, 0, 20).unwrap();
+        assert_eq!(errors, 1);
     }
 
     #[test]
@@ -1110,9 +1146,12 @@ fn runtime_logs_section(ui: &mut egui::Ui) {
         }
         for entry in entries {
             ui.horizontal_wrapped(|ui| {
-                ui.monospace(entry.time);
+                ui.monospace(&entry.time).on_hover_text(format!("首次：{}", entry.first_time));
                 ui.label(entry.level);
                 ui.label(entry.message);
+                if entry.repeat_count > 1 {
+                    ui.label(format!("×{}", entry.repeat_count));
+                }
             });
         }
     });

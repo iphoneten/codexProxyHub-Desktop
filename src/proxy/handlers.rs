@@ -139,7 +139,7 @@ pub(super) async fn embeddings(
 }
 
 /// 入站 Anthropic Messages API。请求体原样直通到 `provider_type: anthropic` 渠道，
-/// 复用统一的鉴权、模型/Token 限额、渠道选择、failover、熔断与用量日志。
+/// 复用统一的鉴权、模型/Token 限额、渠道轮询、运行统计与用量日志。
 ///
 /// 错误响应用 Anthropic 的 `{"type":"error","error":{...}}` 形状，
 /// 否则 Anthropic SDK 解析不出错误信息，只会抛一个无上下文的异常。
@@ -209,34 +209,57 @@ async fn count_tokens_inner(
     ensure_api_key_allows_model(&auth, &model)?;
 
     let providers = provider_attempts(&cfg, &state, &model, "messages", &auth.allowed_providers);
+    let mut retry_cycle = ProviderRetryCycle::new(
+        providers, &model, "messages", auth.allowed_providers.clone(),
+    ).for_token_estimate();
     let mut last_error = None;
-    for (provider, request_model) in providers {
-        let provider = match state.provider_with_fresh_oauth(&provider).await {
+    while let Some((provider, request_model)) = retry_cycle
+        .next(&state, &ctx, &headers, last_error.take()).await?
+    {
+        let started = Instant::now();
+        let cancel = ctx.cancel_token();
+        let refreshed = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::aborted()),
+            _ = state.root_cancel.cancelled() => return Err(ProxyError::aborted()),
+            result = state.provider_with_fresh_oauth(&provider) => result,
+        };
+        let provider = match refreshed {
             Ok(provider) => provider,
             Err(err) => {
-                last_error = Some(err);
+                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
                 continue;
             }
         };
         let mut upstream_body = with_model(body.clone(), &request_model);
         apply_model_mapping(&provider, &mut upstream_body);
         let client = state.client_for_provider(&provider);
-        match send_json_to_provider(
-            &client,
-            &provider,
-            "/messages/count_tokens",
-            &headers,
-            upstream_body,
-            &ctx,
-        )
-        .await
-        {
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::aborted()),
+            _ = state.root_cancel.cancelled() => return Err(ProxyError::aborted()),
+            result = send_json_to_provider(
+                &client,
+                &provider,
+                "/messages/count_tokens",
+                &headers,
+                upstream_body,
+                &ctx,
+            ) => result,
+        };
+        match result {
+            Ok(value) if value.get("error").is_some_and(|error| !error.is_null()) => {
+                last_error = Some(AttemptFailure::new(
+                    &provider, &request_model, started,
+                    ProxyError::new(StatusCode::BAD_GATEWAY, "上游 count_tokens 返回错误"),
+                ));
+            }
             Ok(value) => return Ok((StatusCode::OK, Json(value)).into_response()),
             Err(err) => {
                 if should_stop_failover(err.status) {
                     return Err(err);
                 }
-                last_error = Some(err);
+                last_error = Some(AttemptFailure::new(&provider, &request_model, started, err));
             }
         }
     }
@@ -278,6 +301,12 @@ pub(super) fn anthropic_error_response(err: ProxyError) -> Response {
         .into_response()
 }
 
+#[derive(Clone)]
+struct ResponsesAffinityUpdate {
+    provider_identity: String,
+    expected_owner_identity: Option<String>,
+}
+
 pub(super) async fn responses(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -293,20 +322,50 @@ pub(super) async fn responses(
     let api_key_name = auth.key_name;
     let allowed_providers = auth.allowed_providers;
     let mut permit = Some(auth.permit);
-    let affinity_key = api_key_affinity_key(&model, &api_key_id);
+    let responses_affinity = responses_affinity_key(&body, &headers, &api_key_id, &model);
+    let affinity_key = responses_affinity.key.clone();
+    let persistent_affinity = responses_affinity.persistent;
+    let responses_binding = persistent_affinity
+        .then(|| state.responses_binding(&affinity_key))
+        .flatten();
+    // 没有显式会话键的首轮仍沿用旧的 API Key + 模型粘性；第二轮拿到 rs_* 后，
+    // 用它为新的持久化 lineage 绑定引导一次，避免刚进入持久化模式就随机换账号。
+    let weak_affinity_key = api_key_affinity_key(&model, &api_key_id);
+    let weak_binding = responses_binding
+        .is_none()
+        .then(|| state.preferred_provider_for_affinity(&weak_affinity_key))
+        .flatten();
     let mut providers = provider_attempts(&cfg, &state, &model, "responses", &allowed_providers);
-    if let Some((preferred, preferred_model)) = state.preferred_provider_for_affinity(&affinity_key)
-    {
-        prefer_provider(&mut providers, &preferred, &preferred_model);
+    if let Some(binding) = &responses_binding {
+        prefer_bound_provider(
+            &mut providers,
+            &binding.provider,
+            &binding.request_model,
+        );
+    } else if let Some((preferred, preferred_model)) = &weak_binding {
+        prefer_provider(&mut providers, preferred, preferred_model);
     }
     dedupe_provider_attempts(&mut providers);
+    let has_opaque_state = responses_has_opaque_state(&body);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let heartbeat = stream && providers.iter().any(|(provider, _)| provider.persistent_retry);
+    let heartbeat = stream && !providers.is_empty();
     let heartbeat_ctx = ctx.clone();
+    let request_cancel = ctx.cancel_token();
+    let root_cancel = state.root_cancel.clone();
     let operation = async move {
         let mut last_error = None;
-
-        for (provider, request_model) in providers {
+        let expected_owner_identity = responses_binding
+            .as_ref()
+            .map(|binding| binding.provider_identity.clone())
+            .filter(|identity| !identity.is_empty());
+        let mut opaque_owner_identity = expected_owner_identity.clone();
+        let mut retry_cycle = ProviderRetryCycle::new(providers, &model, "responses", allowed_providers);
+        if let Some(binding) = &responses_binding {
+            retry_cycle.prefer_provider(&binding.provider, &binding.request_model);
+        }
+        while let Some((provider, request_model)) = retry_cycle
+            .next(&state, &ctx, &headers, last_error.take()).await?
+        {
             let started = Instant::now();
             let provider = match state.provider_with_fresh_oauth(&provider).await {
                 Ok(provider) => provider,
@@ -323,12 +382,45 @@ pub(super) async fn responses(
                         continue;
                     }
                 };
-            let upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
+            let mut upstream_body = upstream_body_for_provider(&provider, &body, &request_model);
+            let provider_identity = responses_provider_identity(&provider, &upstream_body, &headers);
+            let affinity_update = persistent_affinity.then(|| ResponsesAffinityUpdate {
+                provider_identity: provider_identity.clone(),
+                expected_owner_identity: expected_owner_identity.clone(),
+            });
+            if persistent_affinity {
+                let rejected = state.rejected_responses_state(&affinity_key, &provider_identity);
+                strip_rejected_responses_state(&mut upstream_body, &rejected);
+            }
+            if has_opaque_state {
+                if opaque_owner_identity.is_none() {
+                    opaque_owner_identity = Some(provider_identity.clone());
+                } else if opaque_owner_identity.as_deref() != Some(provider_identity.as_str()) {
+                    let removed = strip_all_responses_state(&mut upstream_body);
+                    if !removed.is_empty() {
+                        crate::runtime_log::record_repeated(
+                            "WARN",
+                            format!(
+                                "Responses 会话切换到渠道 {} 的不同账号、项目或模型；已保留可见历史与工具结果，并移除无法跨安全域复用的加密状态",
+                                provider.name
+                            ),
+                            format!("responses-state-domain-switch:{}", provider.name),
+                        );
+                        if persistent_affinity {
+                            state.remember_rejected_responses_state(
+                                &affinity_key,
+                                &provider_identity,
+                                removed,
+                            );
+                        }
+                    }
+                }
+            }
             let upstream_attempt_model = upstream_body
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or(&request_model);
-            let mut early_log_id = start_stream_attempt_log_for_key(
+            let mut early_log_id = StreamAttemptLogGuard::new(
                 &cfg,
                 stream,
                 "responses",
@@ -338,7 +430,7 @@ pub(super) async fn responses(
                 started,
                 &api_key_id,
                 &api_key_name,
-                ctx.request_id(),
+                &ctx,
             );
 
             // force_chat：判断本次 /responses 请求是否**从一开始就走 chat 翻译**。
@@ -374,6 +466,7 @@ pub(super) async fn responses(
                             &model,
                             &affinity_key,
                             &request_model,
+                            affinity_update.as_ref(),
                             result,
                             started,
                             stream,
@@ -387,18 +480,7 @@ pub(super) async fn responses(
                     }
                     Err(err) => {
                         let aborted = record_attempt_failure(circuit_guard, &err);
-                        finish_failed_attempt_log_for_key(
-                            &cfg,
-                            early_log_id.take(),
-                            "responses",
-                            &provider.name,
-                            &model,
-                            started,
-                            &err.message,
-                            &api_key_id,
-                            &api_key_name,
-                            ctx.request_id(),
-                        );
+                        early_log_id.finish_error(err.status, &err.message);
                         if aborted {
                             return Err(err);
                         }
@@ -408,15 +490,16 @@ pub(super) async fn responses(
                 continue;
             }
 
-            match send_to_provider(
+            match send_native_responses_with_recovery(
                 &state,
                 &provider,
-                "/responses",
                 &headers,
                 upstream_body.clone(),
                 stream,
                 started,
                 &ctx,
+                persistent_affinity.then_some(affinity_key.as_str()),
+                &provider_identity,
             )
             .await
             {
@@ -429,6 +512,7 @@ pub(super) async fn responses(
                         &model,
                         &affinity_key,
                         &request_model,
+                        affinity_update.as_ref(),
                         result,
                         started,
                         stream,
@@ -441,7 +525,7 @@ pub(super) async fn responses(
                     ));
                 }
                 Err(err)
-                    if should_fallback_responses_to_chat(&provider, err.status) =>
+                    if should_fallback_responses_to_chat(&provider, err.status, &err.message) =>
                 {
                     let chat_body = upstream_body;
                     match forward_responses_as_chat(
@@ -458,6 +542,7 @@ pub(super) async fn responses(
                                 &model,
                                 &affinity_key,
                                 &request_model,
+                                affinity_update.as_ref(),
                                 result,
                                 started,
                                 stream,
@@ -471,18 +556,7 @@ pub(super) async fn responses(
                         }
                         Err(chat_err) => {
                             let aborted = record_attempt_failure(circuit_guard, &chat_err);
-                            finish_failed_attempt_log_for_key(
-                                &cfg,
-                                early_log_id.take(),
-                                "responses",
-                                &provider.name,
-                                &model,
-                                started,
-                                &chat_err.message,
-                                &api_key_id,
-                                &api_key_name,
-                                ctx.request_id(),
-                            );
+                            early_log_id.finish_error(chat_err.status, &chat_err.message);
                             if aborted {
                                 return Err(chat_err);
                             }
@@ -496,22 +570,30 @@ pub(super) async fn responses(
                     }
                 }
                 Err(err) => {
+                    if is_encrypted_state_rejection(&err.message) {
+                        drop(circuit_guard);
+                        early_log_id.finish_error(StatusCode::BAD_REQUEST, &err.message);
+                        if !stream {
+                            log_error(
+                                &cfg,
+                                "responses",
+                                &provider.name,
+                                &request_model,
+                                started,
+                                None,
+                                &err.message,
+                                &api_key_id,
+                                &api_key_name,
+                                ctx.request_id(),
+                            );
+                        }
+                        return Err(ProxyError::new(StatusCode::BAD_REQUEST, err.message));
+                    }
                     let _ = record_attempt_failure(circuit_guard, &err);
                     let failure = AttemptFailure::new(&provider, &request_model, started, err);
-                    // 与 forward_openai 保持一致：只有客户端鉴权错误立即中止，其它 4xx/5xx 继续尝试下个渠道
+                    // 客户端取消立即中止；其它上游错误交给统一调度层按次数继续轮询。
                     if should_stop_failover(failure.status) {
-                        finish_failed_attempt_log_for_key(
-                            &cfg,
-                            early_log_id.take(),
-                            "responses",
-                            &failure.provider,
-                            &model,
-                            failure.started,
-                            &failure.message,
-                            &api_key_id,
-                            &api_key_name,
-                            ctx.request_id(),
-                        );
+                        early_log_id.finish_error(failure.status, &failure.message);
                         if !stream {
                             log_error(
                                 &cfg,
@@ -528,18 +610,7 @@ pub(super) async fn responses(
                         }
                         return Err(ProxyError::new(failure.status, failure.message));
                     }
-                    finish_failed_attempt_log_for_key(
-                        &cfg,
-                        early_log_id.take(),
-                        "responses",
-                        &failure.provider,
-                        &model,
-                        failure.started,
-                        &failure.message,
-                        &api_key_id,
-                        &api_key_name,
-                        ctx.request_id(),
-                    );
+                    early_log_id.finish_error(failure.status, &failure.message);
                     last_error = Some(failure);
                 }
             }
@@ -571,7 +642,73 @@ pub(super) async fn responses(
             format!("模型 '{}' 没有可用渠道", model),
         ))
     };
-    super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, "responses").await
+    tokio::select! {
+        biased;
+        _ = request_cancel.cancelled() => Err(ProxyError::aborted()),
+        _ = root_cancel.cancelled() => Err(ProxyError::aborted()),
+        result = super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, "responses") => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_native_responses_with_recovery(
+    state: &AppState,
+    provider: &ProviderConfig,
+    headers: &HeaderMap,
+    mut body: Value,
+    stream: bool,
+    started: Instant,
+    ctx: &RequestContext,
+    affinity_key: Option<&str>,
+    provider_identity: &str,
+) -> Result<ProviderResult, ProxyError> {
+    match send_to_provider(
+        state,
+        provider,
+        "/responses",
+        headers,
+        body.clone(),
+        stream,
+        started,
+        ctx,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(err) if is_encrypted_state_rejection(&err.message) => {
+            let removed = strip_all_responses_state(&mut body);
+            if removed.is_empty() {
+                return Err(err);
+            }
+            if let Some(affinity_key) = affinity_key {
+                state.remember_rejected_responses_state(
+                    affinity_key,
+                    provider_identity,
+                    removed,
+                );
+            }
+            crate::runtime_log::record_repeated(
+                "WARN",
+                format!(
+                    "渠道 {} 无法验证 Responses 加密会话状态；已保留可见历史与工具结果，并在同一渠道执行一次降级恢复",
+                    provider.name
+                ),
+                format!("responses-encrypted-state-recovery:{}", provider.name),
+            );
+            send_to_provider(
+                state,
+                provider,
+                "/responses",
+                headers,
+                body,
+                stream,
+                started,
+                ctx,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool {
@@ -587,14 +724,37 @@ pub(super) fn provider_prefers_chat_responses(provider: &ProviderConfig) -> bool
 pub(super) fn should_fallback_responses_to_chat(
     provider: &ProviderConfig,
     status: StatusCode,
+    message: &str,
 ) -> bool {
     provider.responses_mode == "auto"
+        && !is_encrypted_state_rejection(message)
         && matches!(
             status,
             StatusCode::BAD_REQUEST
                 | StatusCode::NOT_FOUND
                 | StatusCode::METHOD_NOT_ALLOWED
         )
+}
+
+pub(super) fn prefer_bound_provider(
+    providers: &mut Vec<(ProviderConfig, String)>,
+    preferred: &str,
+    preferred_model: &str,
+) {
+    let index = providers
+        .iter()
+        .position(|(provider, model)| {
+            provider.name == preferred && normalize_model(model) == normalize_model(preferred_model)
+        })
+        .or_else(|| {
+            providers
+                .iter()
+                .position(|(provider, _)| provider.name == preferred)
+        });
+    if let Some(index) = index.filter(|index| *index > 0) {
+        let item = providers.remove(index);
+        providers.insert(0, item);
+    }
 }
 
 pub(super) fn api_key_affinity_key(model: &str, api_key_id: &str) -> String {
@@ -613,7 +773,7 @@ pub(super) fn prefer_provider(
     preferred: &str,
     preferred_model: &str,
 ) {
-    // 上一轮成功的渠道及其逻辑模型优先；剩余候选仍保持原始模型优先于回退模型。
+    // 成功渠道仅在同一模型、同一优先级内优先，不能越过更高优先级或原始模型。
     let Some(index) = providers
         .iter()
         .position(|(provider, model)| {
@@ -622,8 +782,12 @@ pub(super) fn prefer_provider(
     else {
         return;
     };
+    let priority = providers[index].0.priority;
+    let first_in_tier = providers.iter().position(|(provider, model)| {
+        provider.priority == priority && normalize_model(model) == normalize_model(preferred_model)
+    }).unwrap_or(index);
     let item = providers.remove(index);
-    providers.insert(0, item);
+    providers.insert(first_in_tier, item);
 }
 
 pub(super) fn dedupe_provider_attempts(providers: &mut Vec<(ProviderConfig, String)>) {
@@ -646,6 +810,7 @@ pub(super) fn final_failover_status(status: StatusCode) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Uri;
 
     fn provider_with_name(name: &str) -> ProviderConfig {
         serde_json::from_value(json!({
@@ -658,6 +823,28 @@ mod tests {
             "capabilities": {"supports_chat": true, "supports_responses": true},
         }))
         .unwrap()
+    }
+
+    fn successful_response() -> Value {
+        json!({
+            "id":"resp_test",
+            "model":"gpt-test",
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"ok"}]
+            }]
+        })
+    }
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, server)
     }
 
     #[test]
@@ -725,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn prefer_provider_moves_previous_fallback_attempt_to_front() {
+    fn prefer_provider_keeps_previous_fallback_after_primary_model() {
         let mut providers = vec![
             (provider_with_name("primary-a"), "gpt-primary".to_string()),
             (provider_with_name("primary-b"), "gpt-primary".to_string()),
@@ -735,12 +922,32 @@ mod tests {
 
         prefer_provider(&mut providers, "sticky", "gpt-fallback");
 
-        assert_eq!(providers[0].0.name, "sticky");
-        assert_eq!(providers[0].1, "gpt-fallback");
-        assert_eq!(providers[1].0.name, "primary-a");
-        assert_eq!(providers[1].1, "gpt-primary");
-        assert_eq!(providers[2].0.name, "primary-b");
-        assert_eq!(providers[2].1, "gpt-primary");
+        assert_eq!(providers[0].0.name, "primary-a");
+        assert_eq!(providers[1].0.name, "primary-b");
+        assert_eq!(providers[2].0.name, "sticky");
+        assert_eq!(providers[2].1, "gpt-fallback");
+        assert_eq!(providers[3].0.name, "fallback-a");
+    }
+
+    #[test]
+    fn prefer_provider_only_moves_within_its_priority_tier() {
+        let mut first = provider_with_name("higher-priority");
+        first.priority = -10;
+        let mut peer = provider_with_name("same-priority");
+        peer.priority = 5;
+        let mut sticky = provider_with_name("previous-success");
+        sticky.priority = 5;
+        let mut providers = vec![
+            (first, "gpt-test".into()),
+            (peer, "gpt-test".into()),
+            (sticky, "gpt-test".into()),
+        ];
+
+        prefer_provider(&mut providers, "previous-success", "gpt-test");
+
+        assert_eq!(providers[0].0.name, "higher-priority");
+        assert_eq!(providers[1].0.name, "previous-success");
+        assert_eq!(providers[2].0.name, "same-priority");
     }
 
     #[test]
@@ -766,16 +973,214 @@ mod tests {
         let provider = provider_with_name("compat");
         assert!(should_fallback_responses_to_chat(
             &provider,
-            StatusCode::BAD_REQUEST
+            StatusCode::BAD_REQUEST,
+            "unsupported endpoint"
         ));
         assert!(should_fallback_responses_to_chat(
             &provider,
-            StatusCode::NOT_FOUND
+            StatusCode::NOT_FOUND,
+            "not found"
         ));
         assert!(!should_fallback_responses_to_chat(
             &provider,
-            StatusCode::UNAUTHORIZED
+            StatusCode::UNAUTHORIZED,
+            "unauthorized"
         ));
+        assert!(!should_fallback_responses_to_chat(
+            &provider,
+            StatusCode::BAD_REQUEST,
+            "The encrypted content for item rs_test could not be verified"
+        ));
+    }
+
+    #[test]
+    fn bound_responses_provider_moves_ahead_of_priority_and_model_fallback() {
+        let mut primary = provider_with_name("primary");
+        primary.priority = -10;
+        let mut bound = provider_with_name("auth:bound");
+        bound.priority = 20;
+        let mut providers = vec![
+            (primary, "gpt-primary".to_string()),
+            (provider_with_name("fallback"), "gpt-fallback".to_string()),
+            (bound, "gpt-fallback".to_string()),
+        ];
+
+        prefer_bound_provider(&mut providers, "auth:bound", "gpt-fallback");
+
+        assert_eq!(providers[0].0.name, "auth:bound");
+        assert_eq!(providers[0].1, "gpt-fallback");
+    }
+
+    #[tokio::test]
+    async fn encrypted_state_rejection_retries_once_without_opaque_items() {
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let has_encrypted = responses_has_opaque_state(&body);
+                    seen.lock().push(body);
+                    if has_encrypted {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{
+                                "code":"invalid_encrypted_content",
+                                "message":"The encrypted content for item rs_test could not be verified. Reason: Encrypted content could not be decrypted or parsed."
+                            }})),
+                        )
+                            .into_response()
+                    } else {
+                        Json(successful_response()).into_response()
+                    }
+                }
+            }),
+        );
+        let (base, server) = serve(app).await;
+        let state = crate::proxy::tests::test_state();
+        let mut provider = provider_with_name("recover");
+        provider.base_url = format!("{base}/v1");
+        provider.responses_mode = "native".into();
+        provider.max_retries = 0;
+        let headers = HeaderMap::new();
+        let body = json!({
+            "model":"gpt-test",
+            "prompt_cache_key":"session-recovery",
+            "previous_response_id":"resp_old",
+            "input":[
+                {"type":"message","role":"user","content":"continue"},
+                {"type":"reasoning","id":"rs_test","encrypted_content":"secret-cipher"},
+                {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ]
+        });
+        let key = responses_affinity_key(&body, &headers, "", "gpt-test");
+        let identity = responses_provider_identity(&provider, &body, &headers);
+
+        let result = send_native_responses_with_recovery(
+            &state,
+            &provider,
+            &headers,
+            body,
+            false,
+            Instant::now(),
+            &RequestContext::detached(),
+            Some(&key.key),
+            &identity,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(result.response.status(), StatusCode::OK);
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].to_string().contains("secret-cipher"));
+        assert!(!requests[1].to_string().contains("secret-cipher"));
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert!(requests[1].to_string().contains("call_1"));
+        assert!(requests[1].to_string().contains("continue"));
+    }
+
+    #[tokio::test]
+    async fn bound_stateful_request_prefers_owner_and_sanitizes_failover() {
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let seen = Arc::clone(&requests);
+        let app = Router::new().fallback(move |uri: Uri, Json(body): Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let provider = uri.path().split('/').nth(1).unwrap_or_default().to_string();
+                seen.lock().push((provider.clone(), body.clone()));
+                if provider == "owner" {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":{"message":"temporarily unavailable"}})),
+                    )
+                        .into_response()
+                } else {
+                    Json(successful_response()).into_response()
+                }
+            }
+        });
+        let (base, server) = serve(app).await;
+        let state = crate::proxy::tests::test_state();
+        let mut cfg = (*state.snapshot()).clone();
+        let mut owner = provider_with_name("owner");
+        owner.base_url = format!("{base}/owner/v1");
+        owner.responses_mode = "native".into();
+        owner.priority = 20;
+        owner.max_retries = 1;
+        let mut fallback = provider_with_name("fallback");
+        fallback.base_url = format!("{base}/fallback/v1");
+        fallback.responses_mode = "native".into();
+        fallback.priority = -10;
+        fallback.max_retries = 1;
+        cfg.providers = vec![fallback.clone(), owner.clone()];
+        cfg.auth_accounts.clear();
+        cfg.routing.model_fallbacks.clear();
+        cfg.auth.enabled = true;
+        cfg.auth.api_keys = vec![serde_json::from_value(json!({
+            "key":"synthetic-local", "name":"test", "max_concurrency":1
+        }))
+        .unwrap()];
+        let log_path = std::env::temp_dir().join(format!(
+            "routehub-responses-affinity-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        cfg.usage_log.sqlite_path = log_path.to_string_lossy().into_owned();
+        *state.config.write() = Arc::new(cfg);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer synthetic-local"),
+        );
+        let body = json!({
+            "model":"gpt-test",
+            "prompt_cache_key":"session-owner",
+            "previous_response_id":"resp_owner",
+            "input":[
+                {"type":"message","role":"user","content":"continue"},
+                {"type":"reasoning","id":"rs_owner","encrypted_content":"owner-cipher"}
+            ]
+        });
+        let key = responses_affinity_key(
+            &body,
+            &headers,
+            &api_key_id("synthetic-local"),
+            "gpt-test",
+        );
+        let owner_body = upstream_body_for_provider(&owner, &body, "gpt-test");
+        let owner_identity = responses_provider_identity(&owner, &owner_body, &headers);
+        assert!(state.responses_state.remember_binding(
+            &key.key,
+            "owner",
+            "gpt-test",
+            &owner_identity,
+            None,
+        ));
+
+        let response = responses(
+            State(state),
+            Extension(RequestContext::detached()),
+            headers,
+            Json(body),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = fs::remove_file(log_path);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "owner");
+        assert!(requests[0].1.to_string().contains("owner-cipher"));
+        assert_eq!(requests[1].0, "fallback");
+        assert!(!requests[1].1.to_string().contains("owner-cipher"));
+        assert!(requests[1].1.get("previous_response_id").is_none());
+        assert!(requests[1].1.to_string().contains("continue"));
     }
 
     #[test]
@@ -837,12 +1242,16 @@ pub(super) async fn forward_openai(
     }
     dedupe_provider_attempts(&mut providers);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let heartbeat = stream && providers.iter().any(|(provider, _)| provider.persistent_retry);
+    let heartbeat = stream && !providers.is_empty();
     let heartbeat_ctx = ctx.clone();
+    let request_cancel = ctx.cancel_token();
+    let root_cancel = state.root_cancel.clone();
     let operation = async move {
         let mut last_error = None;
-
-        for (provider, request_model) in providers {
+        let mut retry_cycle = ProviderRetryCycle::new(providers, &model, api, allowed_providers);
+        while let Some((provider, request_model)) = retry_cycle
+            .next(&state, &ctx, &headers, last_error.take()).await?
+        {
             let started = Instant::now();
             let provider = match state.provider_with_fresh_oauth(&provider).await {
                 Ok(provider) => provider,
@@ -870,7 +1279,7 @@ pub(super) async fn forward_openai(
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or(&request_model);
-            let mut early_log_id = start_stream_attempt_log_for_key(
+            let mut early_log_id = StreamAttemptLogGuard::new(
                 &cfg,
                 stream,
                 api,
@@ -880,7 +1289,7 @@ pub(super) async fn forward_openai(
                 started,
                 &api_key_id,
                 &api_key_name,
-                ctx.request_id(),
+                &ctx,
             );
             // chat/completions 路径下预留一份 body 用于 responses fallback
             let fallback_body = if path == "/chat/completions" {
@@ -909,6 +1318,7 @@ pub(super) async fn forward_openai(
                         &model,
                         &affinity_key,
                         &request_model,
+                        None,
                         result,
                         started,
                         stream,
@@ -941,6 +1351,7 @@ pub(super) async fn forward_openai(
                                     &model,
                                     &affinity_key,
                                     &request_model,
+                                    None,
                                     result,
                                     started,
                                     stream,
@@ -954,18 +1365,7 @@ pub(super) async fn forward_openai(
                             }
                             Err(fb_err) => {
                                 let aborted = record_attempt_failure(circuit_guard, &fb_err);
-                                finish_failed_attempt_log_for_key(
-                                    &cfg,
-                                    early_log_id.take(),
-                                    api,
-                                    &provider.name,
-                                    &model,
-                                    started,
-                                    &fb_err.message,
-                                    &api_key_id,
-                                    &api_key_name,
-                                    ctx.request_id(),
-                                );
+                                early_log_id.finish_error(fb_err.status, &fb_err.message);
                                 if aborted {
                                     return Err(fb_err);
                                 }
@@ -981,21 +1381,9 @@ pub(super) async fn forward_openai(
                     }
                     let _ = record_attempt_failure(circuit_guard, &err);
                     let failure = AttemptFailure::new(&provider, &request_model, started, err);
-                    // 只有客户端鉴权错误（401/407）立即中止：换渠道也是同样错，避免整链重试放大
-                    // 其它 4xx（400/403/404/…）都视为「这个上游不认可」，继续尝试下个渠道
+                    // 本地鉴权已在入口校验；上游 401/403 等同样按渠道次数轮询。
                     if should_stop_failover(failure.status) {
-                        finish_failed_attempt_log_for_key(
-                            &cfg,
-                            early_log_id.take(),
-                            api,
-                            &failure.provider,
-                            &model,
-                            failure.started,
-                            &failure.message,
-                            &api_key_id,
-                            &api_key_name,
-                            ctx.request_id(),
-                        );
+                        early_log_id.finish_error(failure.status, &failure.message);
                         if !stream {
                             log_error(
                                 &cfg,
@@ -1012,18 +1400,7 @@ pub(super) async fn forward_openai(
                         }
                         return Err(ProxyError::new(failure.status, failure.message));
                     }
-                    finish_failed_attempt_log_for_key(
-                        &cfg,
-                        early_log_id.take(),
-                        api,
-                        &failure.provider,
-                        &model,
-                        failure.started,
-                        &failure.message,
-                        &api_key_id,
-                        &api_key_name,
-                        ctx.request_id(),
-                    );
+                    early_log_id.finish_error(failure.status, &failure.message);
                     last_error = Some(failure);
                 }
             }
@@ -1055,10 +1432,16 @@ pub(super) async fn forward_openai(
             format!("模型 '{}' 没有可用渠道", model),
         ))
     };
-    super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, api).await
+    tokio::select! {
+        biased;
+        _ = request_cancel.cancelled() => Err(ProxyError::aborted()),
+        _ = root_cancel.cancelled() => Err(ProxyError::aborted()),
+        result = super::keepalive::while_waiting(operation, heartbeat, heartbeat_ctx, api) => result,
+    }
 }
 
-pub(super) fn commit_result(
+#[allow(clippy::too_many_arguments)]
+fn commit_result(
     cfg: Arc<AppConfig>,
     state: AppState,
     api: &str,
@@ -1066,6 +1449,7 @@ pub(super) fn commit_result(
     model: &str,
     affinity_key: &str,
     affinity_model: &str,
+    affinity_update: Option<&ResponsesAffinityUpdate>,
     mut result: ProviderResult,
     started: Instant,
     stream: bool,
@@ -1097,13 +1481,14 @@ pub(super) fn commit_result(
         let model = model.to_string();
         let affinity_key = affinity_key.to_string();
         let affinity_model = affinity_model.to_string();
+        let affinity_update = affinity_update.cloned();
         let upstream_model = result.upstream_model.clone();
         let request_id = ctx.request_id().to_string();
         tokio::spawn(async move {
             let mut circuit_guard = circuit_guard;
             match rx.await {
                 // 客户端提前断开：上游已被我们主动取消，这既不是上游故障也不是成功回答。
-                // 单独记 aborted，熔断按成功放行（不是渠道的错），
+                // 单独记 aborted，仅释放在途计数，不增加上游失败次数，
                 // 会话粘性既不加强也不清除（这次没有得到任何关于渠道健康度的信息）。
                 Ok(outcome) if outcome.aborted => {
                     drop(circuit_guard.take());
@@ -1137,7 +1522,9 @@ pub(super) fn commit_result(
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_failure(StatusCode::BAD_GATEWAY, &error, None);
                     }
-                    state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
+                    if affinity_update.is_none() {
+                        state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -1168,7 +1555,21 @@ pub(super) fn commit_result(
                     if let Some(guard) = circuit_guard.take() {
                         guard.mark_success();
                     }
-                    state.remember_affinity_provider(&affinity_key, &provider, &affinity_model);
+                    if let Some(update) = affinity_update.as_ref() {
+                        state.remember_responses_binding(
+                            &affinity_key,
+                            &provider,
+                            &affinity_model,
+                            &update.provider_identity,
+                            update.expected_owner_identity.as_deref(),
+                        );
+                    } else {
+                        state.remember_affinity_provider(
+                            &affinity_key,
+                            &provider,
+                            &affinity_model,
+                        );
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -1198,7 +1599,9 @@ pub(super) fn commit_result(
                             None,
                         );
                     }
-                    state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
+                    if affinity_update.is_none() {
+                        state.forget_affinity_provider(&affinity_key, &provider, &affinity_model);
+                    }
                     finalize_stream_log(
                         &cfg,
                         log_id,
@@ -1226,7 +1629,17 @@ pub(super) fn commit_result(
         if let Some(guard) = circuit_guard {
             guard.mark_success();
         }
-        state.remember_affinity_provider(affinity_key, provider, affinity_model);
+        if let Some(update) = affinity_update {
+            state.remember_responses_binding(
+                affinity_key,
+                provider,
+                affinity_model,
+                &update.provider_identity,
+                update.expected_owner_identity.as_deref(),
+            );
+        } else {
+            state.remember_affinity_provider(affinity_key, provider, affinity_model);
+        }
         log_success(
             &cfg,
             api,

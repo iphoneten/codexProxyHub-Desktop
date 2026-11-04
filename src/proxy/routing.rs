@@ -45,10 +45,13 @@ pub(super) fn provider_attempts(
         let (preferred, secondary): (Vec<_>, Vec<_>) = providers
             .into_iter()
             .partition(|provider| provider.auth_account_id.is_some() == auth_first);
+        let mut model_providers = Vec::new();
         for group in [preferred, secondary] {
-            let ordered = order_by_priority(state, &request_model, group);
-            out.extend(ordered.into_iter().map(|p| (p, request_model.clone())));
+            model_providers.extend(order_by_priority(state, &request_model, group));
         }
+        // Priority 是同一模型内的第一排序条件；稳定排序保留同优先级的来源偏好和权重/负载顺序。
+        model_providers.sort_by_key(|provider| provider.priority);
+        out.extend(model_providers.into_iter().map(|p| (p, request_model.clone())));
     }
     out
 }
@@ -133,27 +136,10 @@ pub(super) fn weighted_order(
         .collect()
 }
 
-pub(super) fn provider_health_rank(state: &AppState, provider: &str) -> u8 {
-    // 开启无限重试后，旧的熔断快照不能继续影响同优先级渠道排序。
-    if persistent_retry_enabled(&state.config, provider) {
-        return 0;
-    }
-    state
-        .provider_statuses
-        .read()
-        .get(provider)
-        .map(|status| match status.status {
-            ProviderCircuitStatus::Healthy => {
-                if status.failures == 0 {
-                    0
-                } else {
-                    1
-                }
-            }
-            ProviderCircuitStatus::HalfOpen => 2,
-            ProviderCircuitStatus::Open => 3,
-        })
-        .unwrap_or(0)
+pub(super) fn provider_health_rank(_state: &AppState, _provider: &str) -> u8 {
+    // 运行统计兼容接口：历史失败和旧 Open / HalfOpen 快照不参与排序。
+    // 所有业务渠道均正常轮询，仅保留既有优先级、权重及并发负载排序。
+    0
 }
 
 pub(super) fn provider_inflight(state: &AppState, provider: &str) -> usize {
@@ -208,7 +194,8 @@ pub(super) fn provider_supports_api(provider: &ProviderConfig, api: &str) -> boo
                 // 显式指定 chat 代表用户要求将 Responses 请求转换到
                 // /chat/completions，不应再被过期的 supports_chat:false 提前过滤。
                 "chat" => true,
-                "native" => supports_responses,
+                // 显式指定 native 同样优先于能力声明，让上游实际响应决定是否可用。
+                "native" => true,
                 _ => supports_responses || supports_chat,
             }
         }
@@ -359,6 +346,18 @@ pub(super) fn apply_anthropic_system_prompt_override(provider: &ProviderConfig, 
 }
 
 pub(super) fn responses_to_chat_body(body: &Value) -> Result<Value, ProxyError> {
+    if body
+        .get("previous_response_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        crate::runtime_log::record("WARN", "协议转换 Responses→Chat：previous_response_id 无法还原上游会话状态；沿用已有转换行为，建议提供完整 input 或使用 native");
+    }
+    if body
+        .pointer("/reasoning/summary")
+        .is_some_and(|value| !value.is_null())
+    {
+        crate::runtime_log::record("WARN", "协议转换 Responses→Chat：reasoning.summary 没有对应字段，不能保证保留；reasoning.effort 仍正常映射");
+    }
     let mut obj = Map::new();
     obj.insert(
         "model".to_string(),
@@ -376,6 +375,7 @@ pub(super) fn responses_to_chat_body(body: &Value) -> Result<Value, ProxyError> 
         "max_tokens",
         "max_output_tokens",
         "stream",
+        "parallel_tool_calls",
     ] {
         if let Some(value) = body.get(key) {
             let target = if key == "max_output_tokens" {
@@ -384,6 +384,25 @@ pub(super) fn responses_to_chat_body(body: &Value) -> Result<Value, ProxyError> 
                 key
             };
             obj.insert(target.to_string(), value.clone());
+        }
+    }
+    if let Some(effort) = body.pointer("/reasoning/effort") {
+        obj.insert("reasoning_effort".to_string(), effort.clone());
+    }
+    if let Some(format) = body.pointer("/text/format") {
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_schema") => {
+                let mut schema = format.as_object().cloned().unwrap_or_default();
+                schema.remove("type");
+                obj.insert(
+                    "response_format".to_string(),
+                    json!({"type": "json_schema", "json_schema": schema}),
+                );
+            }
+            Some("json_object") | Some("text") => {
+                obj.insert("response_format".to_string(), format.clone());
+            }
+            _ => {}
         }
     }
     if let Some(tools) = responses_tools_to_chat_tools(body.get("tools")) {
@@ -436,15 +455,24 @@ pub(super) fn responses_input_to_messages(input: Option<&Value>) -> Vec<Value> {
                                 .unwrap_or("{}")
                                 .to_string()
                         };
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [{
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": arguments}
-                            }]
-                        }));
+                        let call = json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments}
+                        });
+                        // 同一轮的并行调用必须放在一个 assistant 消息中，后面才能接多个 tool 结果。
+                        if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
+                            if !last["tool_calls"].is_array() {
+                                last["tool_calls"] = json!([]);
+                            }
+                            last["tool_calls"].as_array_mut().unwrap().push(call);
+                        } else {
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": Value::Null,
+                                "tool_calls": [call]
+                            }));
+                        }
                     }
                     Some("function_call_output") | Some("custom_tool_call_output") => {
                         let call_id = item
@@ -509,7 +537,11 @@ pub(super) fn responses_message_content_to_chat(role: &str, content: Option<&Val
                             .or_else(|| part.get("file_id"))
                             .and_then(Value::as_str)
                         {
-                            out.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                            let mut image = json!({"type": "image_url", "image_url": {"url": url}});
+                            if let Some(detail) = part.get("detail") {
+                                image["image_url"]["detail"] = detail.clone();
+                            }
+                            out.push(image);
                         }
                     }
                     _ => {}
@@ -553,7 +585,8 @@ pub(super) fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Option<Val
     let tools = tools?.as_array()?;
     let out = tools
         .iter()
-        .filter_map(|tool| match tool.get("type").and_then(Value::as_str) {
+        .enumerate()
+        .filter_map(|(index, tool)| match tool.get("type").and_then(Value::as_str) {
             Some("function") => {
                 if tool.get("function").is_some() {
                     return Some(tool.clone());
@@ -567,14 +600,18 @@ pub(super) fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Option<Val
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                Some(json!({
+                let mut converted = json!({
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": description,
                         "parameters": parameters
                     }
-                }))
+                });
+                if let Some(strict) = tool.get("strict") {
+                    converted["function"]["strict"] = strict.clone();
+                }
+                Some(converted)
             }
             Some("custom") => {
                 let name = tool.get("name").and_then(Value::as_str)?;
@@ -601,7 +638,10 @@ pub(super) fn responses_tools_to_chat_tools(tools: Option<&Value>) -> Option<Val
                     }
                 }))
             }
-            _ => None,
+            _ => {
+                crate::runtime_log::record("WARN", format!("协议转换 Responses→Chat：tools[{index}] 不能转换为 function 工具，沿用已有省略行为；建议使用 native"));
+                None
+            }
         })
         .collect::<Vec<_>>();
     if out.is_empty() {
@@ -680,6 +720,7 @@ mod preference_tests {
             keepalive_template_store: Arc::new(super::keepalive::TemplateStore::default()),
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            responses_state: Arc::new(ResponsesStateStore::default()),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
             oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -783,9 +824,10 @@ mod preference_tests {
     }
 
     #[test]
-    fn auth_preference_orders_accounts_before_providers() {
+    fn auth_preference_orders_accounts_first_at_equal_priority() {
         let state = test_state();
-        let cfg = sample_config("auth_first");
+        let mut cfg = sample_config("auth_first");
+        cfg.auth_accounts[0].priority = cfg.providers[0].priority;
         let names: Vec<_> = provider_attempts(&cfg, &state, "gpt-test", "responses", &[])
             .into_iter()
             .map(|(p, _)| p.name)
@@ -797,9 +839,10 @@ mod preference_tests {
     }
 
     #[test]
-    fn provider_preference_orders_providers_before_accounts() {
+    fn provider_preference_orders_providers_first_at_equal_priority() {
         let state = test_state();
-        let cfg = sample_config("provider_first");
+        let mut cfg = sample_config("provider_first");
+        cfg.auth_accounts[0].priority = cfg.providers[0].priority;
         let names: Vec<_> = provider_attempts(&cfg, &state, "gpt-test", "responses", &[])
             .into_iter()
             .map(|(p, _)| p.name)
@@ -808,6 +851,39 @@ mod preference_tests {
             names,
             vec!["channel-a".to_string(), "auth:acct-b".to_string()]
         );
+    }
+
+    #[test]
+    fn priority_precedes_source_preference_in_both_directions() {
+        for preference in ["auth_first", "provider_first"] {
+            for auth_first in [false, true] {
+                let state = test_state();
+                let mut cfg = sample_config(preference);
+                cfg.providers[0].priority = if auth_first { 10 } else { -5 };
+                cfg.auth_accounts[0].priority = if auth_first { -5 } else { 10 };
+                let attempts = provider_attempts(&cfg, &state, "gpt-test", "responses", &[]);
+                assert_eq!(attempts[0].0.priority, -5);
+                assert_eq!(attempts[1].0.priority, 10);
+                assert_eq!(attempts[0].0.auth_account_id.is_some(), auth_first);
+            }
+        }
+    }
+
+    #[test]
+    fn priority_sort_keeps_primary_model_before_fallback() {
+        let state = test_state();
+        let mut cfg = sample_config("provider_first");
+        cfg.auth_accounts.clear();
+        cfg.providers[0].priority = 100;
+        let mut fallback = sample_provider("fallback", -100);
+        fallback.models = vec!["backup-model".into()];
+        cfg.providers.push(fallback);
+        cfg.routing.model_fallbacks.insert("gpt-test".into(), vec!["backup-model".into()]);
+
+        let attempts = provider_attempts(&cfg, &state, "gpt-test", "responses", &[]);
+
+        assert_eq!(attempts[0].1, "gpt-test");
+        assert_eq!(attempts[1].1, "backup-model");
     }
 
     #[test]

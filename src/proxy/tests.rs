@@ -43,6 +43,7 @@ pub(super) fn test_state() -> AppState {
         keepalive_template_store: Arc::new(keepalive::TemplateStore::default()),
         provider_statuses: Arc::new(RwLock::new(HashMap::new())),
         session_affinity: Arc::new(Mutex::new(HashMap::new())),
+        responses_state: Arc::new(ResponsesStateStore::default()),
         usage_injection: Arc::new(Mutex::new(HashMap::new())),
         oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
         oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -66,42 +67,49 @@ fn auth_access_with_models(state: &AppState, allowed_models: &[&str]) -> AuthAcc
 }
 
 #[test]
-fn provider_circuit_opens_after_three_consecutive_failures() {
+fn provider_runtime_many_failures_still_allow_concurrent_attempts() {
     let state = test_state();
 
-    for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
+    for _ in 0..100 {
         state
             .begin_provider_attempt("unstable")
             .unwrap()
             .mark_failure(StatusCode::BAD_GATEWAY, "upstream unavailable", None);
     }
 
-    let err = state.begin_provider_attempt("unstable").unwrap_err();
-    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(err.message.contains("熔断冷却中"));
+    let guards = (0..8)
+        .map(|_| state.begin_provider_attempt("unstable").unwrap())
+        .collect::<Vec<_>>();
+    let status = state.provider_statuses.read()["unstable"].clone();
+    assert_eq!(status.failures, 100);
+    assert_eq!(status.inflight, 8);
+    assert_eq!(status.status, ProviderCircuitStatus::Healthy);
+    assert!(status.open_until.is_none());
+    drop(guards);
+    assert_eq!(provider_inflight(&state, "unstable"), 0);
+    assert_eq!(state.provider_statuses.read()["unstable"].inflight, 0);
 }
 
 #[test]
-fn provider_circuit_429_opens_immediately_with_retry_after() {
+fn provider_runtime_429_retry_after_does_not_block_channel() {
     let state = test_state();
     state
         .begin_provider_attempt("quota-limited")
         .unwrap()
         .mark_failure(
             StatusCode::TOO_MANY_REQUESTS,
-            "quota exceeded",
+            "rate limited",
             Some(Duration::from_secs(12)),
         );
 
-    let err = state.begin_provider_attempt("quota-limited").unwrap_err();
-    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(err.message.contains("熔断冷却中"));
-    let circuits = state.provider_circuits.lock();
-    let circuit = circuits.get("quota-limited").unwrap();
-    let ProviderCircuitPhase::Open { until } = circuit.phase else {
-        panic!("429 应立即打开熔断器");
-    };
-    assert!(until.saturating_duration_since(Instant::now()) >= Duration::from_secs(11));
+    let first = state.begin_provider_attempt("quota-limited").unwrap();
+    let second = state.begin_provider_attempt("quota-limited").unwrap();
+    let status = state.provider_statuses.read()["quota-limited"].clone();
+    assert_eq!(status.failures, 1);
+    assert_eq!(status.inflight, 2);
+    assert!(status.open_until.is_none());
+    assert!(!status.quota_exhausted);
+    drop((first, second));
 }
 
 fn set_persistent_retry(state: &AppState, name: &str, enabled: bool) {
@@ -113,13 +121,13 @@ fn set_persistent_retry(state: &AppState, name: &str, enabled: bool) {
 }
 
 #[test]
-fn persistent_retry_bypasses_cooldown_without_clearing_quota_or_losing_inflight() {
+fn provider_runtime_legacy_retry_toggle_preserves_stats_quota_and_inflight() {
     let state = test_state();
     let stale = state.begin_provider_attempt("persistent").unwrap();
     state.begin_provider_attempt("persistent").unwrap().mark_failure(
         StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", Some(Duration::from_secs(120)),
     );
-    assert!(state.begin_provider_attempt("persistent").is_err());
+    assert!(state.begin_provider_attempt("persistent").is_ok());
 
     set_persistent_retry(&state, "persistent", true);
     assert_eq!(provider_health_rank(&state, "persistent"), 0);
@@ -131,134 +139,121 @@ fn persistent_retry_bypasses_cooldown_without_clearing_quota_or_losing_inflight(
     assert!(state.provider_statuses.read()["persistent"].quota_exhausted);
     assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
     drop(guard);
-    // 在开关启用前开始的请求，其迟到失败也不得重新熔断。
+    // 旧开关变化不清空统计，迟到失败不阻拦后续请求。
     stale.mark_failure(StatusCode::BAD_GATEWAY, "late failure", None);
     let statuses = state.provider_statuses.read();
     let status = &statuses["persistent"];
     assert_eq!(status.status, ProviderCircuitStatus::Healthy);
     assert_eq!(status.inflight, 0);
+    assert_eq!(status.failures, 2);
     assert!(status.open_until.is_none());
     assert_eq!(status.last_error.as_deref(), Some("late failure"));
     assert!(status.quota_exhausted);
 }
 
 #[test]
-fn persistent_retry_failures_never_open_circuit_and_disabling_restores_it() {
+fn provider_runtime_all_upstream_failures_are_counted_regardless_of_legacy_toggle() {
     let state = test_state();
-    set_persistent_retry(&state, "persistent", true);
-    for code in [429, 500, 502, 503, 504, 401, 403, 408] {
-        for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD + 1 {
+    let mut failures = 0;
+    for enabled in [false, true, false] {
+        set_persistent_retry(&state, "persistent", enabled);
+        for code in [400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504] {
             state.begin_provider_attempt("persistent").unwrap().mark_failure(
                 StatusCode::from_u16(code).unwrap(), "upstream failed", None,
             );
-            assert!(matches!(state.provider_circuits.lock()["persistent"].phase, ProviderCircuitPhase::Closed));
-            assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
+            failures += 1;
+            let status = state.provider_statuses.read()["persistent"].clone();
+            assert_eq!(status.failures, failures);
+            assert_eq!(status.status, ProviderCircuitStatus::Healthy);
+            assert_eq!(status.last_error.as_deref(), Some("upstream failed"));
+            assert!(status.open_until.is_none());
+            assert!(state.begin_provider_attempt("persistent").is_ok());
         }
     }
-    set_persistent_retry(&state, "persistent", false);
-    for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
-        state.begin_provider_attempt("persistent").unwrap().mark_failure(
-            StatusCode::BAD_GATEWAY, "upstream failed", None,
-        );
-    }
-    assert!(state.begin_provider_attempt("persistent").unwrap_err().message.contains("熔断冷却中"));
 }
 
 #[test]
-fn persistent_retry_allows_concurrency_and_cancelling_old_half_open_probe() {
+fn provider_runtime_old_circuit_snapshots_never_block_concurrency() {
+    for old_status in [ProviderCircuitStatus::Open, ProviderCircuitStatus::HalfOpen] {
+        let state = test_state();
+        state.provider_statuses.write().insert(
+            "legacy".to_string(),
+            ProviderCircuitSnapshot {
+                status: old_status,
+                failures: 100,
+                open_until: Some(Instant::now() + Duration::from_secs(3600)),
+                last_error: Some("old failure".to_string()),
+                quota_exhausted: true,
+                ..Default::default()
+            },
+        );
+        let first = state.begin_provider_attempt("legacy").unwrap();
+        let second = state.begin_provider_attempt("legacy").unwrap();
+        assert_eq!(state.provider_statuses.read()["legacy"].inflight, 2);
+        drop((first, second));
+        let status = state.provider_statuses.read()["legacy"].clone();
+        assert_eq!(status.status, ProviderCircuitStatus::Healthy);
+        assert_eq!(status.failures, 100);
+        assert_eq!(status.inflight, 0);
+        assert_eq!(status.last_error.as_deref(), Some("old failure"));
+        assert!(status.open_until.is_none());
+        assert!(status.quota_exhausted);
+    }
+}
+
+#[test]
+fn provider_runtime_request_validation_failure_does_not_clear_quota_protection() {
     let state = test_state();
-    state.begin_provider_attempt("persistent").unwrap().mark_failure(
-        StatusCode::TOO_MANY_REQUESTS, "busy", None,
+    let pending = state.begin_provider_attempt("auth:limited").unwrap();
+    state.begin_provider_attempt("auth:limited").unwrap().mark_failure(
+        StatusCode::TOO_MANY_REQUESTS, "rate limited", None,
     );
-    state.provider_circuits.lock().get_mut("persistent").unwrap().phase =
-        ProviderCircuitPhase::Open { until: Instant::now() - Duration::from_millis(1) };
-    let probe = state.begin_provider_attempt("persistent").unwrap();
-    assert!(state.begin_provider_attempt("persistent").is_err());
-
-    set_persistent_retry(&state, "persistent", true);
-    let first = state.begin_provider_attempt("persistent").unwrap();
-    let second = state.begin_provider_attempt("persistent").unwrap();
-    assert_eq!(state.provider_statuses.read()["persistent"].inflight, 3);
-    drop(probe);
-    first.mark_success();
-    drop(second);
-    assert!(matches!(state.provider_circuits.lock()["persistent"].phase, ProviderCircuitPhase::Closed));
-    assert_eq!(state.provider_statuses.read()["persistent"].inflight, 0);
-    assert!(state.provider_statuses.read()["persistent"].open_until.is_none());
+    pending.mark_failure(StatusCode::BAD_REQUEST, "invalid request body", None);
+    let status = state.provider_statuses.read()["auth:limited"].clone();
+    assert_eq!(status.failures, 2);
+    assert_eq!(status.last_error.as_deref(), Some("invalid request body"));
+    assert!(status.quota_exhausted);
 }
 
 #[test]
-fn provider_circuit_ignores_request_validation_failures() {
+fn provider_runtime_success_clears_errors_without_losing_other_inflight_attempts() {
     let state = test_state();
-
-    for _ in 0..PROVIDER_CIRCUIT_FAILURE_THRESHOLD {
-        state
-            .begin_provider_attempt("valid-provider")
-            .unwrap()
-            .mark_failure(StatusCode::BAD_REQUEST, "invalid request body", None);
-    }
-
-    assert!(state.begin_provider_attempt("valid-provider").is_ok());
-    let circuits = state.provider_circuits.lock();
-    let circuit = circuits.get("valid-provider").unwrap();
+    let pending = state.begin_provider_attempt("recovering").unwrap();
+    state.begin_provider_attempt("recovering").unwrap().mark_failure(
+        StatusCode::BAD_GATEWAY, "failed", None,
+    );
+    state.begin_provider_attempt("recovering").unwrap().mark_success();
+    let status = state.provider_statuses.read()["recovering"].clone();
+    assert_eq!(status.failures, 0);
+    assert_eq!(status.inflight, 1);
+    assert!(status.last_error.is_none());
+    assert!(status.open_until.is_none());
+    let circuit = state.provider_circuits.lock()["recovering"].clone();
     assert_eq!(circuit.consecutive_failures, 0);
-    assert!(matches!(circuit.phase, ProviderCircuitPhase::Closed));
+    assert!(circuit.last_error.is_none());
+    drop(pending);
+    assert_eq!(state.provider_statuses.read()["recovering"].inflight, 0);
 }
 
 #[test]
-fn provider_circuit_half_open_allows_only_one_probe_and_success_recovers() {
+fn provider_runtime_cancel_preserves_errors_and_quota_without_new_failures() {
     let state = test_state();
-    {
-        let mut circuits = state.provider_circuits.lock();
-        circuits.insert(
-            "recovering".to_string(),
-            ProviderCircuit {
-                phase: ProviderCircuitPhase::Open {
-                    until: Instant::now() - Duration::from_millis(1),
-                },
-                consecutive_failures: PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
-                last_error: Some("temporary failure".to_string()),
-                last_changed: Instant::now(),
-            },
-        );
-    }
-
-    let probe = state.begin_provider_attempt("recovering").unwrap();
-    let concurrent = state.begin_provider_attempt("recovering").unwrap_err();
-    assert_eq!(concurrent.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(concurrent.message.contains("正在半开探测"));
-
-    probe.mark_success();
-    assert!(state.begin_provider_attempt("recovering").is_ok());
+    state.begin_provider_attempt("auth:cancel").unwrap().mark_failure(
+        StatusCode::TOO_MANY_REQUESTS, "rate limited", None,
+    );
+    drop(state.begin_provider_attempt("auth:cancel").unwrap());
+    let guard = state.begin_provider_attempt("auth:cancel").unwrap();
+    assert!(record_attempt_failure(guard, &ProxyError::aborted()));
+    let status = state.provider_statuses.read()["auth:cancel"].clone();
+    assert_eq!(status.failures, 1);
+    assert_eq!(status.inflight, 0);
+    assert_eq!(provider_inflight(&state, "auth:cancel"), 0);
+    assert_eq!(status.last_error.as_deref(), Some("rate limited"));
+    assert!(status.quota_exhausted);
 }
 
 #[test]
-fn provider_circuit_half_open_drop_returns_to_cooldown() {
-    let state = test_state();
-    {
-        let mut circuits = state.provider_circuits.lock();
-        circuits.insert(
-            "dropped-probe".to_string(),
-            ProviderCircuit {
-                phase: ProviderCircuitPhase::Open {
-                    until: Instant::now() - Duration::from_millis(1),
-                },
-                consecutive_failures: PROVIDER_CIRCUIT_FAILURE_THRESHOLD,
-                last_error: Some("temporary failure".to_string()),
-                last_changed: Instant::now(),
-            },
-        );
-    }
-
-    drop(state.begin_provider_attempt("dropped-probe").unwrap());
-
-    let err = state.begin_provider_attempt("dropped-probe").unwrap_err();
-    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(err.message.contains("熔断冷却中"));
-}
-
-#[test]
-fn provider_circuit_stale_success_does_not_close_open_circuit() {
+fn provider_runtime_stale_success_clears_latest_failures() {
     let state = test_state();
     let stale = state.begin_provider_attempt("race").unwrap();
     state.begin_provider_attempt("race").unwrap().mark_failure(
@@ -279,12 +274,14 @@ fn provider_circuit_stale_success_does_not_close_open_circuit() {
 
     stale.mark_success();
 
-    let err = state.begin_provider_attempt("race").unwrap_err();
-    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(state.begin_provider_attempt("race").is_ok());
+    let status = state.provider_statuses.read()["race"].clone();
+    assert_eq!(status.failures, 0);
+    assert!(status.last_error.is_none());
 }
 
 #[test]
-fn provider_circuit_stale_failure_does_not_interrupt_half_open_probe() {
+fn provider_runtime_stale_failure_does_not_block_concurrent_attempts() {
     let state = test_state();
     let stale = state.begin_provider_attempt("half-open-race").unwrap();
     state
@@ -299,21 +296,16 @@ fn provider_circuit_stale_failure_does_not_interrupt_half_open_probe() {
         .begin_provider_attempt("half-open-race")
         .unwrap()
         .mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
-    {
-        let mut circuits = state.provider_circuits.lock();
-        let circuit = circuits.get_mut("half-open-race").unwrap();
-        if let ProviderCircuitPhase::Open { until } = &mut circuit.phase {
-            *until = Instant::now() - Duration::from_millis(1);
-        }
-    }
-
-    let probe = state.begin_provider_attempt("half-open-race").unwrap();
+    let pending = state.begin_provider_attempt("half-open-race").unwrap();
     stale.mark_failure(StatusCode::BAD_GATEWAY, "late failure", None);
 
-    let concurrent = state.begin_provider_attempt("half-open-race").unwrap_err();
-    assert!(concurrent.message.contains("正在半开探测"));
-    probe.mark_success();
-    assert!(state.begin_provider_attempt("half-open-race").is_ok());
+    let concurrent = state.begin_provider_attempt("half-open-race").unwrap();
+    assert_eq!(state.provider_statuses.read()["half-open-race"].failures, 4);
+    assert_eq!(state.provider_statuses.read()["half-open-race"].inflight, 2);
+    pending.mark_success();
+    drop(concurrent);
+    assert_eq!(state.provider_statuses.read()["half-open-race"].failures, 0);
+    assert_eq!(state.provider_statuses.read()["half-open-race"].inflight, 0);
 }
 
 #[test]
@@ -332,6 +324,65 @@ fn cancelled_attempt_does_not_clear_previous_failures() {
         circuits.get("cancel-neutral").unwrap().consecutive_failures,
         1
     );
+    let status = state.provider_statuses.read()["cancel-neutral"].clone();
+    assert_eq!(status.failures, 1);
+    assert_eq!(status.inflight, 0);
+    assert_eq!(status.last_error.as_deref(), Some("failed"));
+}
+
+#[test]
+fn provider_runtime_auth_quota_remains_independent_until_refresh() {
+    let state = test_state();
+    let mut cfg = (*state.snapshot()).clone();
+    cfg.providers = vec![provider_with_name("normal", 1, 0)];
+    cfg.auth_accounts = vec![serde_json::from_value(json!({
+        "id": "limited", "models": ["gpt-test"], "access_token": "test-token"
+    })).unwrap()];
+    cfg.auth.openai_models = vec!["gpt-test".to_string()];
+    cfg.routing.model_fallbacks.clear();
+    let stale_success = state.begin_provider_attempt("auth:limited").unwrap();
+    state.begin_provider_attempt("auth:limited").unwrap().mark_failure(
+        StatusCode::TOO_MANY_REQUESTS, "rate limited", None,
+    );
+    // 普通渠道同样记录额度错误，但不引入账号以外的新路由过滤规则。
+    state.begin_provider_attempt("normal").unwrap().mark_failure(
+        StatusCode::BAD_REQUEST, "insufficient_quota", None,
+    );
+    stale_success.mark_success();
+    let status = state.provider_statuses.read()["auth:limited"].clone();
+    assert!(status.quota_exhausted);
+    assert_eq!(status.failures, 0);
+    assert!(status.last_error.is_none());
+    let attempts = provider_attempts(&cfg, &state, "gpt-test", "responses", &[]);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].0.name, "normal");
+
+    // 模拟额度刷新确认恢复，不读取真实账号或发出上游请求。
+    state.provider_statuses.write().get_mut("auth:limited").unwrap().quota_exhausted = false;
+    assert_eq!(provider_attempts(&cfg, &state, "gpt-test", "responses", &[]).len(), 2);
+}
+
+#[test]
+fn provider_runtime_parallel_completion_keeps_stats_and_inflight_consistent() {
+    let state = test_state();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let state = &state;
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    let failed = state.begin_provider_attempt("parallel").unwrap();
+                    let cancelled = state.begin_provider_attempt("parallel").unwrap();
+                    failed.mark_failure(StatusCode::BAD_GATEWAY, "failed", None);
+                    drop(cancelled);
+                }
+            });
+        }
+    });
+    let status = state.provider_statuses.read()["parallel"].clone();
+    assert_eq!(status.failures, 800);
+    assert_eq!(status.inflight, 0);
+    assert_eq!(provider_inflight(&state, "parallel"), 0);
+    assert_eq!(state.provider_circuits.lock()["parallel"].consecutive_failures, 800);
 }
 
 #[test]
@@ -508,30 +559,60 @@ fn weighted_order_uses_weight_adjusted_load() {
 }
 
 #[test]
-fn weighted_order_prefers_fully_healthy_provider_over_recent_failures() {
+fn weighted_order_ignores_failures_and_legacy_circuit_snapshots() {
+    for status in [
+        ProviderCircuitStatus::Healthy,
+        ProviderCircuitStatus::Open,
+        ProviderCircuitStatus::HalfOpen,
+    ] {
+        let state = test_state();
+        state.provider_statuses.write().insert(
+            "recent-failure".to_string(),
+            ProviderCircuitSnapshot {
+                status,
+                failures: 100,
+                open_until: Some(Instant::now() + Duration::from_secs(3600)),
+                last_error: Some("temporary".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(provider_health_rank(&state, "recent-failure"), 0);
+        let providers = vec![
+            provider_with_name("recent-failure", 3, 1),
+            provider_with_name("clean", 1, 1),
+        ];
+        // 旧失败不改变同负载渠道的加权轮询次序。
+        for expected in ["recent-failure", "recent-failure", "recent-failure", "clean"] {
+            let ordered = weighted_order(&state, "gpt-test", providers.clone());
+            assert_eq!(ordered[0].name, expected);
+        }
+        state.provider_loads.lock().insert("clean".to_string(), Arc::new(AtomicUsize::new(1)));
+        assert_eq!(weighted_order(&state, "gpt-test", providers)[0].name, "recent-failure");
+    }
+}
+
+#[test]
+fn provider_runtime_history_does_not_override_configured_priority() {
     let state = test_state();
+    let mut cfg = (*state.snapshot()).clone();
+    cfg.auth_accounts.clear();
+    cfg.routing.model_fallbacks.clear();
+    cfg.providers = vec![
+        provider_with_name("primary", 1, 0),
+        provider_with_name("backup", 10, 1),
+    ];
     state.provider_statuses.write().insert(
-        "recent-failure".to_string(),
+        "primary".to_string(),
         ProviderCircuitSnapshot {
-            status: ProviderCircuitStatus::Healthy,
-            failures: 1,
-            inflight: 0,
-            open_until: None,
-            last_error: Some("temporary".to_string()),
-            quota_exhausted: false,
+            status: ProviderCircuitStatus::Open,
+            failures: 100,
+            ..Default::default()
         },
     );
-
-    let providers = vec![
-        provider_with_name("recent-failure", 1, 1),
-        provider_with_name("clean", 1, 1),
-    ];
-
-    let ordered = weighted_order(&state, "gpt-test", providers);
-    assert_eq!(
-        ordered.first().map(|provider| provider.name.as_str()),
-        Some("clean")
-    );
+    state.provider_loads.lock().insert("primary".to_string(), Arc::new(AtomicUsize::new(5)));
+    let attempts = provider_attempts(&cfg, &state, "gpt-test", "chat", &[]);
+    assert_eq!(attempts[0].0.name, "primary");
+    assert_eq!(attempts[1].0.name, "backup");
 }
 
 #[test]
@@ -1023,6 +1104,73 @@ fn anthropic_defaults_to_x_api_key_authentication() {
 }
 
 #[test]
+fn explicit_native_mode_is_not_filtered_by_stale_responses_capability() {
+    for capabilities in [
+        json!({}),
+        json!({"supports_responses": true}),
+        json!({"supports_chat": true, "supports_responses": false}),
+        json!({"supports_chat": false, "supports_responses": false}),
+    ] {
+        let native = provider("openai", "native", capabilities);
+
+        assert!(provider_supports_api(&native, "responses"));
+        assert!(!provider_prefers_chat_responses(&native));
+        // 显式 native 仅覆盖 Responses 筛选，不放宽其它入站协议或启用自动降级。
+        assert_eq!(
+            provider_supports_api(&native, "chat"),
+            native.capabilities.get("supports_chat") != Some(&false)
+        );
+        assert!(!provider_supports_api(&native, "messages"));
+        assert!(!should_fallback_responses_to_chat(
+            &native,
+            StatusCode::NOT_FOUND,
+            "not found"
+        ));
+    }
+}
+
+#[test]
+fn explicit_native_mode_preserves_provider_routing_filters() {
+    let state = test_state();
+    let mut cfg = (*state.snapshot()).clone();
+    let mut native = provider(
+        "openai",
+        "native",
+        json!({"supports_chat": true, "supports_responses": false}),
+    );
+    native.name = "native-only".to_string();
+    native.models = vec![
+        "gpt-5.6-sol".to_string(),
+        "gpt-6-astra".to_string(),
+        "gpt-6.1-sol".to_string(),
+    ];
+    cfg.providers = vec![native];
+    cfg.auth_accounts.clear();
+    cfg.routing.model_fallbacks.clear();
+    let allowed = vec!["native-only".to_string()];
+
+    for model in &cfg.providers[0].models {
+        let attempts = provider_attempts(&cfg, &state, model, "responses", &allowed);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0.name, "native-only");
+        assert_eq!(&attempts[0].1, model);
+    }
+
+    assert!(provider_attempts(&cfg, &state, "unknown-model", "responses", &allowed).is_empty());
+    assert!(provider_attempts(
+        &cfg,
+        &state,
+        "gpt-6-astra",
+        "responses",
+        &["other-channel".to_string()]
+    )
+    .is_empty());
+
+    cfg.providers[0].enabled = false;
+    assert!(provider_attempts(&cfg, &state, "gpt-6-astra", "responses", &allowed).is_empty());
+}
+
+#[test]
 fn explicit_chat_mode_is_not_filtered_by_stale_chat_capability() {
     let explicit_chat = provider(
         "openai",
@@ -1334,7 +1482,7 @@ async fn chat_stream_to_responses_reports_error_outcome() {
 #[tokio::test]
 async fn chat_stream_to_responses_stops_when_client_disconnects() {
     // 客户端断开后,spawned 任务应立即结束并汇报「已取消」,
-    // 避免持续消费上游 token 与占用熔断 inflight 计数。
+    // 避免持续消费上游 token 与占用渠道 inflight 计数。
     let mut payload = String::new();
     for i in 0..64 {
         let chunk = json!({"choices":[{"delta":{"content": format!("t{i}")}}]});
@@ -1936,6 +2084,109 @@ fn stream_attempt_log_is_visible_before_upstream_finishes() {
     let _ = fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn cancelled_pre_output_attempt_always_finalizes_its_log() {
+    for api in ["chat", "responses"] {
+        for mode in ["client", "server", "dropped_future"] {
+            let arrived = Arc::new(tokio::sync::Notify::new());
+            let seen = arrived.clone();
+            let app = Router::new().fallback(move || {
+                seen.notify_one();
+                async { futures_util::future::pending::<Response>().await }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let state = test_state();
+            let mut cfg = (*state.snapshot()).clone();
+            cfg.auth.enabled = false;
+            cfg.auth_accounts.clear();
+            cfg.providers = vec![serde_json::from_value(json!({
+                "name":"test-channel", "base_url":format!("http://{}/v1", listener.local_addr().unwrap()),
+                "api_key":"synthetic", "models":["gpt-test"], "responses_mode":"native", "max_retries":1
+            })).unwrap()];
+            cfg.usage_log.sqlite_path = std::env::temp_dir().join(format!("routehub-cancel-log-{}.sqlite3", Uuid::new_v4()))
+                .to_string_lossy().into_owned();
+            *state.config.write() = Arc::new(cfg);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let ctx = RequestContext::child_of(&state.root_cancel, None);
+            let cancel = ctx.cancel_token();
+            let request_id = ctx.request_id().to_string();
+            let call_state = state.clone();
+            let task = tokio::spawn(async move {
+                if api == "responses" {
+                    responses(State(call_state), Extension(ctx), HeaderMap::new(), Json(json!({
+                        "model":"gpt-test", "input":"hello", "stream":true
+                    }))).await
+                } else {
+                    chat_completions(State(call_state), Extension(ctx), HeaderMap::new(), Json(json!({
+                        "model":"gpt-test", "messages":[{"role":"user","content":"hello"}], "stream":true
+                    }))).await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), arrived.notified()).await.unwrap();
+            match mode {
+                "client" => cancel.cancel(),
+                "server" => state.root_cancel.cancel(),
+                _ => task.abort(),
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap();
+            if mode == "dropped_future" {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(result.unwrap().unwrap_err().status.as_u16(), 499);
+            }
+            server.abort();
+            let conn = open_usage_log_connection(state.snapshot().usage_log_sqlite_path()).unwrap();
+            let row: (i64, String, String) = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let row: (i64, String, String) = conn.query_row(
+                        "SELECT COUNT(*), status, request_id FROM usage_logs", [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).unwrap();
+                    if row.1 != "running" { break row; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("取消收尾应及时写入，不依赖过期日志修复");
+            assert_eq!(row, (1, STREAM_ABORTED_STATUS.to_string(), request_id), "api={api}, mode={mode}");
+            assert_eq!(provider_inflight(&state, "test-channel"), 0);
+            assert_eq!(state.provider_statuses.read()["test-channel"].failures, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropping_heartbeat_response_finalizes_pending_attempt_log() {
+    let app = Router::new().fallback(|| async { futures_util::future::pending::<Response>().await });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let state = test_state();
+    let mut cfg = (*state.snapshot()).clone();
+    cfg.auth.enabled = false;
+    cfg.auth_accounts.clear();
+    cfg.providers = vec![serde_json::from_value(json!({
+        "name":"heartbeat-test", "base_url":format!("http://{}/v1", listener.local_addr().unwrap()),
+        "api_key":"synthetic", "models":["gpt-test"], "responses_mode":"native", "max_retries":1
+    })).unwrap()];
+    cfg.usage_log.sqlite_path = std::env::temp_dir().join(format!("routehub-heartbeat-cancel-{}.sqlite3", Uuid::new_v4()))
+        .to_string_lossy().into_owned();
+    *state.config.write() = Arc::new(cfg);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let response = tokio::time::timeout(Duration::from_secs(12), responses(
+        State(state.clone()), Extension(RequestContext::detached()), HeaderMap::new(),
+        Json(json!({"model":"gpt-test", "input":"hello", "stream":true})),
+    )).await.expect("等待期间应先返回 SSE 心跳连接").unwrap();
+    drop(response);
+    let conn = open_usage_log_connection(state.snapshot().usage_log_sqlite_path()).unwrap();
+    let status: String = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: String = conn.query_row("SELECT status FROM usage_logs ORDER BY id DESC LIMIT 1", [], |row| row.get(0)).unwrap();
+            if status != "running" { break status; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("心跳连接关闭后，后台转发的日志也应收尾");
+    server.abort();
+    assert_eq!(status, STREAM_ABORTED_STATUS);
+    assert_eq!(provider_inflight(&state, "heartbeat-test"), 0);
+}
+
 #[test]
 fn usage_log_connection_enables_wal_and_busy_timeout() {
     let path = std::env::temp_dir().join(format!(
@@ -2075,6 +2326,55 @@ async fn sse_probe_maps_responses_error_before_output_to_retryable_error() {
 
     assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(err.retryable());
+}
+
+#[tokio::test]
+async fn sse_probe_recognizes_top_level_encrypted_error_code() {
+    let chunk = json!({
+        "type": "error",
+        "code": "invalid_encrypted_content",
+        "message": "invalid request"
+    });
+    let stream: ProxyByteStream = Box::pin(futures_util::stream::iter([Ok::<Bytes, io::Error>(
+        Bytes::from(format!("data: {chunk}\n\n")),
+    )]));
+
+    let err = match prepare_sse_stream(
+        stream,
+        1,
+        SseProbeKind::Responses,
+        &CancellationToken::new(),
+    )
+    .await
+    {
+        Ok(_) => panic!("expected probe error"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(is_encrypted_state_rejection(&err.message));
+    assert!(!err.message.contains("invalid request"));
+}
+
+#[test]
+fn responses_incomplete_is_a_terminal_non_error_event() {
+    let event = json!({
+        "type":"response.incomplete",
+        "response":{
+            "id":"resp_test",
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":7,"output_tokens":3}
+        }
+    })
+    .to_string();
+
+    assert!(matches!(
+        inspect_responses_sse_probe_event(&event),
+        SseProbeDecision::Complete
+    ));
+    assert!(sse_stream_completed(SseProbeKind::Responses, &event));
+    assert!(sse_stream_error(SseProbeKind::Responses, &event).is_none());
 }
 
 #[test]

@@ -22,6 +22,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) struct RequestContext {
     request_id: String,
+    // 一次实际请求的内部日志范围；不受客户端复用 x-request-id 影响，不对外发送。
+    log_scope: String,
     cancel: CancellationToken,
 }
 
@@ -33,6 +35,7 @@ impl RequestContext {
                 .map(|id| sanitize_request_id(&id))
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(new_request_id),
+            log_scope: Uuid::new_v4().simple().to_string(),
             cancel: root.child_token(),
         }
     }
@@ -43,12 +46,17 @@ impl RequestContext {
     pub(crate) fn detached() -> Self {
         Self {
             request_id: new_request_id(),
+            log_scope: Uuid::new_v4().simple().to_string(),
             cancel: CancellationToken::new(),
         }
     }
 
     pub(crate) fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    pub(crate) fn log_scope(&self) -> &str {
+        &self.log_scope
     }
 
     pub(crate) fn cancel_token(&self) -> CancellationToken {

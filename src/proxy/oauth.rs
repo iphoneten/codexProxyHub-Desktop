@@ -305,6 +305,23 @@ fn jwt_exp(token: &str) -> Option<i64> {
     value.get("exp").and_then(Value::as_i64)
 }
 
+pub(super) fn oauth_token_security_identity(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = decode_base64_url(payload)?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let account = value
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let subject = value.get("sub").and_then(Value::as_str).unwrap_or_default();
+    if account.is_empty() && subject.is_empty() {
+        None
+    } else {
+        Some(format!("{account}\0{subject}"))
+    }
+}
+
 fn decode_base64_url(value: &str) -> Option<Vec<u8>> {
     fn sextet(byte: u8) -> Option<u8> {
         match byte {

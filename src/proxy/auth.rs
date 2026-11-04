@@ -113,6 +113,7 @@ mod tests {
             keepalive_template_store: Arc::new(super::keepalive::TemplateStore::default()),
             provider_statuses: Arc::new(RwLock::new(HashMap::new())),
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            responses_state: Arc::new(ResponsesStateStore::default()),
             usage_injection: Arc::new(Mutex::new(HashMap::new())),
             oauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             oauth_refresh_locks: Arc::new(Mutex::new(HashMap::new())),

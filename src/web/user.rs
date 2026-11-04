@@ -40,6 +40,8 @@ struct UserLogRow {
     input_tokens: i64,
     output_tokens: i64,
     error: String,
+    repeat_count: i64,
+    last_ts: String,
 }
 
 pub(super) async fn dashboard(
@@ -86,9 +88,9 @@ fn read_dashboard(
         .query_row(
             r#"
             SELECT
-                COUNT(*),
-                COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(MAX(repeat_count, 1)), 0),
+                COALESCE(SUM(CASE WHEN status = 'ok' THEN MAX(repeat_count, 1) ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'error' THEN MAX(repeat_count, 1) ELSE 0 END), 0),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN input_tokens + output_tokens ELSE 0 END), 0)
@@ -108,16 +110,18 @@ fn read_dashboard(
             },
         )
         .map_err(|err| format!("读取日志汇总失败: {err}"))?;
-    let total = summary.requests.max(0) as usize;
+    let total = conn.query_row("SELECT COUNT(*) FROM usage_logs WHERE api_key_id = ?1", [api_key_id],
+        |row| row.get::<_, i64>(0)).map_err(|err| format!("读取日志条数失败: {err}"))?.max(0) as usize;
     let mut statement = conn
         .prepare(
             r#"
             SELECT
                 id, ts, status, api, channel, request_model, upstream_model,
-                latency_ms, first_token_ms, input_tokens, output_tokens, error
+                latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                MAX(repeat_count, 1), last_ts
             FROM usage_logs
             WHERE api_key_id = ?1
-            ORDER BY id DESC
+            ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
             LIMIT ?2 OFFSET ?3
             "#,
         )
@@ -143,6 +147,8 @@ fn read_dashboard(
                     input_tokens: row.get(9)?,
                     output_tokens: row.get(10)?,
                     error: row.get(11)?,
+                    repeat_count: row.get(12)?,
+                    last_ts: row.get(13)?,
                 })
             },
         )
@@ -165,6 +171,29 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use uuid::Uuid;
+
+    #[test]
+    fn merged_user_logs_keep_key_isolation_and_pagination_counts() {
+        let path = std::env::temp_dir().join(format!("routehub-merged-user-{}.sqlite3", Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        crate::proxy::ensure_usage_log_schema(&conn).unwrap();
+        for (key, status, repeats, tokens) in [("key-a", "error", 5, 0), ("key-a", "ok", 1, 10), ("key-b", "error", 20, 0)] {
+            conn.execute("INSERT INTO usage_logs(ts, api, status, channel, request_model, latency_ms,
+                repeat_count, input_tokens, api_key_id) VALUES ('2026-10-28 10:00:00', 'responses', ?1, 'A', 'model', 100, ?2, ?3, ?4)",
+                params![status, repeats, tokens, key]).unwrap();
+        }
+        drop(conn);
+        let (summary, rows, total) = read_dashboard(path.clone(), "key-a", 0, 1).unwrap();
+        assert_eq!(summary.requests, 6);
+        assert_eq!(summary.errors, 5);
+        assert_eq!(summary.input_tokens, 10);
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+        let (_, rows, _) = read_dashboard(path.clone(), "key-a", 1, 1).unwrap();
+        assert_eq!(rows[0].repeat_count, 5);
+        let (_, rows, _) = read_dashboard(path, "key-a", 2, 1).unwrap();
+        assert!(rows.is_empty());
+    }
 
     #[test]
     fn dashboard_only_returns_logs_for_the_authenticated_key() {

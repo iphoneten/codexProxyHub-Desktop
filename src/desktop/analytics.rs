@@ -113,7 +113,7 @@ pub(super) fn overview_analytics_section(
                 ui,
                 "请求数",
                 &analytics.data.total_requests.to_string(),
-                "当前范围日志",
+                "按合并次数累计的尝试数",
             );
             analytics_stat(
                 ui,
@@ -281,7 +281,8 @@ fn read_overview_analytics(
 
     let (total_requests, avg_latency, input_tokens, output_tokens) = conn
         .query_row(
-            "SELECT COUNT(*), COALESCE(AVG(NULLIF(latency_ms, 0)), 0),
+            "SELECT COALESCE(SUM(MAX(repeat_count, 1)), 0),
+                    COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(CASE WHEN latency_ms > 0 THEN MAX(latency_samples, 1) ELSE 0 END), 0), 0),
                     COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
              FROM usage_logs
              WHERE (?1 IS NULL OR ts >= ?1)",
@@ -306,29 +307,29 @@ fn read_overview_analytics(
         },
         status_counts: read_group_counts(
             &conn,
-            "SELECT status, COUNT(*)
+            "SELECT status, SUM(MAX(repeat_count, 1))
              FROM usage_logs
              WHERE (?1 IS NULL OR ts >= ?1)
              GROUP BY status
-             ORDER BY COUNT(*) DESC",
+             ORDER BY SUM(MAX(repeat_count, 1)) DESC",
             range_start.as_deref(),
         )?,
         channel_counts: read_group_counts(
             &conn,
-            "SELECT channel, COUNT(*) FROM usage_logs
+            "SELECT channel, SUM(MAX(repeat_count, 1)) FROM usage_logs
              WHERE channel != '' AND (?1 IS NULL OR ts >= ?1)
              GROUP BY channel
-             ORDER BY COUNT(*) DESC
+             ORDER BY SUM(MAX(repeat_count, 1)) DESC
              LIMIT 8",
             range_start.as_deref(),
         )?,
         api_key_counts: read_group_counts(
             &conn,
-            "SELECT COALESCE(NULLIF(api_key_name, ''), '未命名'), COUNT(*)
+            "SELECT COALESCE(NULLIF(api_key_name, ''), '未命名'), SUM(MAX(repeat_count, 1))
              FROM usage_logs
              WHERE (?1 IS NULL OR ts >= ?1)
              GROUP BY COALESCE(NULLIF(api_key_name, ''), '未命名')
-             ORDER BY COUNT(*) DESC",
+             ORDER BY SUM(MAX(repeat_count, 1)) DESC",
             range_start.as_deref(),
         )?,
         api_key_tokens: read_group_counts(
@@ -365,7 +366,7 @@ fn read_channel_usage(
 ) -> Result<HashMap<String, ChannelUsage>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT channel, COUNT(*),
+            "SELECT channel, SUM(MAX(repeat_count, 1)),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0)
              FROM usage_logs
@@ -428,6 +429,29 @@ mod tests {
             Some("2026-06-18 00:00:00")
         );
         assert_eq!(AnalyticsRange::All.start_timestamp_for(today), None);
+    }
+
+    #[test]
+    fn merged_failure_analytics_use_attempt_counts_and_weighted_latency() {
+        let path = std::env::temp_dir().join(format!("routehub-merged-analytics-{}.sqlite3", uuid::Uuid::new_v4()));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d 10:00:00").to_string();
+        for (status, repeats, duration, samples, tokens) in [("error", 5, 400, 2, 0), ("ok", 1, 200, 1, 10)] {
+            conn.execute("INSERT INTO usage_logs(ts, api, status, channel, request_model, latency_ms,
+                repeat_count, latency_samples, input_tokens, api_key_name)
+                VALUES (?1, 'responses', ?2, 'A', 'model', ?3, ?4, ?5, ?6, 'key')",
+                rusqlite::params![today, status, duration, repeats, samples, tokens]).unwrap();
+        }
+        drop(conn);
+        let data = read_overview_analytics(path, AnalyticsRange::Today).unwrap();
+        assert_eq!(data.total_requests, 6);
+        assert_eq!(data.avg_latency_ms, 200);
+        assert_eq!(data.totals.input_tokens, 10);
+        assert!(data.status_counts.contains(&("error".into(), 5)));
+        assert!(data.channel_counts.contains(&("A".into(), 6)));
+        assert!(data.api_key_counts.contains(&("key".into(), 6)));
+        assert_eq!(data.channel_usage["A"].requests, 6);
     }
 
     #[test]

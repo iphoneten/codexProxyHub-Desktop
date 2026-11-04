@@ -103,6 +103,8 @@ struct AdminLogRow {
     input_tokens: i64,
     output_tokens: i64,
     error: String,
+    repeat_count: i64,
+    last_ts: String,
 }
 
 struct AdminDashboardData {
@@ -269,7 +271,8 @@ fn read_admin_dashboard(
         summary = read_summary(&conn)?;
         provider_usage = read_usage_breakdown(&conn, "channel", "channel != ''")?;
         api_key_usage = read_usage_breakdown(&conn, "api_key_id", "api_key_id != ''")?;
-        total = summary.requests.max(0) as usize;
+        total = conn.query_row("SELECT COUNT(*) FROM usage_logs", [], |row| row.get::<_, i64>(0))
+            .map_err(|err| format!("读取日志条数失败: {err}"))?.max(0) as usize;
         logs = read_logs(&conn, page, page_size)?;
     }
 
@@ -345,13 +348,13 @@ fn read_summary(conn: &rusqlite::Connection) -> Result<AdminSummary, String> {
     conn.query_row(
         r#"
         SELECT
-            COUNT(*),
-            COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(MAX(repeat_count, 1)), 0),
+            COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status = 'running' THEN MAX(repeat_count, 1) ELSE 0 END), 0),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
-            COALESCE(AVG(NULLIF(latency_ms, 0)), 0)
+            COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(CASE WHEN latency_ms > 0 THEN MAX(latency_samples, 1) ELSE 0 END), 0), 0)
         FROM usage_logs
         "#,
         [],
@@ -379,12 +382,12 @@ fn read_usage_breakdown(
         r#"
         SELECT
             {column},
-            COUNT(*),
-            COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(MAX(repeat_count, 1)), 0),
+            COALESCE(SUM(CASE WHEN status IN ('ok', 'stream_started') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status NOT IN ('ok', 'stream_started', 'running', 'aborted', 'raw', '-') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
-            COALESCE(MAX(ts), ''),
+            COALESCE(MAX(COALESCE(NULLIF(last_ts, ''), ts)), ''),
             COALESCE(SUM(CASE WHEN ts >= ?1 THEN input_tokens + output_tokens ELSE 0 END), 0)
         FROM usage_logs
         WHERE {condition}
@@ -428,9 +431,10 @@ fn read_logs(
             r#"
             SELECT
                 id, ts, status, api_key_name, api, channel, request_model, upstream_model,
-                latency_ms, first_token_ms, input_tokens, output_tokens, error
+                latency_ms, first_token_ms, input_tokens, output_tokens, error,
+                MAX(repeat_count, 1), last_ts
             FROM usage_logs
-            ORDER BY id DESC
+            ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
             LIMIT ?1 OFFSET ?2
             "#,
         )
@@ -453,6 +457,8 @@ fn read_logs(
                     input_tokens: row.get(10)?,
                     output_tokens: row.get(11)?,
                     error: row.get(12)?,
+                    repeat_count: row.get(13)?,
+                    last_ts: row.get(14)?,
                 })
             },
         )
@@ -469,6 +475,34 @@ fn default_page_size() -> usize {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn merged_admin_stats_count_attempts_without_inflating_tokens() {
+        let path = std::env::temp_dir().join(format!("routehub-merged-admin-{}.sqlite3", Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        for (status, repeats, duration, samples, tokens) in [("error", 5, 400, 2, 0), ("ok", 1, 200, 1, 10)] {
+            conn.execute("INSERT INTO usage_logs(ts, api, status, channel, request_model, latency_ms,
+                repeat_count, latency_samples, input_tokens, api_key_id)
+                VALUES ('2026-10-28 10:00:00', 'responses', ?1, 'A', 'model', ?2, ?3, ?4, ?5, 'key-a')",
+                params![status, duration, repeats, samples, tokens]).unwrap();
+        }
+        let summary = read_summary(&conn).unwrap();
+        assert_eq!(summary.requests, 6);
+        assert_eq!(summary.errors, 5);
+        assert_eq!(summary.input_tokens, 10);
+        assert_eq!(summary.avg_latency_ms, 200);
+        let usage = read_usage_breakdown(&conn, "channel", "channel != ''").unwrap();
+        assert_eq!(usage["A"].requests, 6);
+        assert_eq!(usage["A"].errors, 5);
+        drop(conn);
+        let config: AppConfig = serde_json::from_value(json!({"providers":[]})).unwrap();
+        let data = read_admin_dashboard(&config, path, 0, 1).unwrap();
+        assert_eq!(data.total, 2);
+        assert_eq!(data.logs.len(), 1);
+        let encoded = serde_json::to_string(&data.logs).unwrap();
+        assert!(!encoded.contains("failure_group"));
+    }
 
     #[test]
     fn admin_dashboard_does_not_expose_raw_credentials() {

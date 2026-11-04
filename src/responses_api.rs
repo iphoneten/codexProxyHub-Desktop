@@ -53,11 +53,11 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
                         }
                     }
                 }
-                "user" => {
+                "user" | "developer" => {
                     let content = convert_user_content(msg.get("content"))?;
                     input_items.push(json!({
                         "type": "message",
-                        "role": "user",
+                        "role": role,
                         "content": content,
                     }));
                 }
@@ -165,6 +165,12 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
     if let Some(v) = obj.get("stream") {
         out.insert("stream".into(), v.clone());
     }
+    if let Some(v) = obj.get("parallel_tool_calls") {
+        out.insert("parallel_tool_calls".into(), v.clone());
+    }
+    if let Some(v) = obj.get("reasoning_effort") {
+        out.insert("reasoning".into(), json!({"effort": v}));
+    }
     // max_tokens -> max_output_tokens
     if let Some(v) = obj
         .get("max_tokens")
@@ -191,6 +197,9 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
                 if let Some(name) = schema_obj.get("name") {
                     format.insert("name".into(), name.clone());
                 }
+                if let Some(description) = schema_obj.get("description") {
+                    format.insert("description".into(), description.clone());
+                }
                 if let Some(schema) = schema_obj.get("schema") {
                     format.insert("schema".into(), schema.clone());
                 }
@@ -205,8 +214,9 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
     // tools：结构从 {type:"function", function:{name,parameters}} 扁平成 {type:"function", name, parameters}
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         let mut out_tools = Vec::new();
-        for tool in tools {
+        for (index, tool) in tools.iter().enumerate() {
             if tool.get("type").and_then(Value::as_str) != Some("function") {
+                crate::runtime_log::record("WARN", format!("协议转换 Chat→Responses：tools[{index}] 不是当前转换器支持的 function 工具，沿用已有省略行为"));
                 continue;
             }
             let Some(func) = tool.get("function") else {
@@ -223,12 +233,16 @@ pub fn chat_to_responses_request(body: &Value) -> Result<Value, String> {
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            out_tools.push(json!({
+            let mut converted = json!({
                 "type": "function",
                 "name": name,
                 "description": description,
                 "parameters": parameters,
-            }));
+            });
+            if let Some(strict) = func.get("strict") {
+                converted["strict"] = strict.clone();
+            }
+            out_tools.push(converted);
         }
         if !out_tools.is_empty() {
             out.insert("tools".into(), Value::Array(out_tools));
@@ -299,10 +313,14 @@ fn convert_user_content(content: Option<&Value>) -> Result<Value, String> {
                             .and_then(Value::as_str)
                             .ok_or_else(|| "image_url.url 缺失".to_string())?;
                         // Responses API: input_image 用一个 image_url 字段承载 URL 或 data URI
-                        out.push(json!({
+                        let mut image = json!({
                             "type": "input_image",
                             "image_url": url,
-                        }));
+                        });
+                        if let Some(detail) = part.pointer("/image_url/detail") {
+                            image["detail"] = detail.clone();
+                        }
+                        out.push(image);
                     }
                     Some("input_audio") => {
                         out.push(json!({
@@ -542,6 +560,7 @@ where
     tokio::spawn(async move {
         let mut state = StreamState::new(request_model);
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut stream = Box::pin(stream);
         let mut first_token_ms = None;
         if send_json_chunk(&tx, &state.opening_delta(), &cancel)
@@ -569,7 +588,7 @@ where
             };
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    crate::proxy::append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {
@@ -653,16 +672,14 @@ fn stream_chunk_has_client_output(value: &Value) -> bool {
 
 fn responses_stream_error_message(payload: &Value) -> Option<String> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
-    if !matches!(
-        event_type,
-        "error" | "response.failed" | "response.incomplete"
-    ) {
+    if !matches!(event_type, "error" | "response.failed") {
         return None;
     }
     Some(
         payload
             .pointer("/error/message")
             .or_else(|| payload.pointer("/response/error/message"))
+            .or_else(|| payload.get("message"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("Responses 上游返回 {event_type}")),
@@ -685,6 +702,7 @@ struct StreamState {
     request_model: String,
     // output_item index -> openai tool_calls slot
     tool_slots: HashMap<u64, usize>,
+    function_arguments: HashMap<u64, String>,
     custom_tool_indexes: HashSet<u64>,
     custom_tool_inputs: HashMap<u64, String>,
     custom_arguments_emitted: HashSet<u64>,
@@ -703,6 +721,7 @@ impl StreamState {
             model: request_model.clone(),
             request_model,
             tool_slots: HashMap::new(),
+            function_arguments: HashMap::new(),
             custom_tool_indexes: HashSet::new(),
             custom_tool_inputs: HashMap::new(),
             custom_arguments_emitted: HashSet::new(),
@@ -799,6 +818,10 @@ impl StreamState {
                         } else {
                             item.get("arguments").and_then(Value::as_str).unwrap_or("")
                         };
+                        if item_type == Some("function_call") {
+                            self.function_arguments
+                                .insert(index, initial_args.to_string());
+                        }
                         out.push(self.build_chunk(
                             json!({
                                 "tool_calls": [{
@@ -874,6 +897,10 @@ impl StreamState {
                 let delta = payload.get("delta").and_then(Value::as_str);
                 if let (Some(index), Some(delta)) = (index, delta) {
                     if let Some(slot) = self.tool_slots.get(&index).copied() {
+                        self.function_arguments
+                            .entry(index)
+                            .or_default()
+                            .push_str(delta);
                         out.push(self.build_chunk(
                             json!({
                                 "tool_calls": [{
@@ -887,18 +914,23 @@ impl StreamState {
                 }
             }
             Some("response.function_call_arguments.done") => {
-                // 完整值来了：多数上游此前已经发过 delta，一般不需要重发
-                // 若之前没有收到 delta（有些实现直接一次给完），补一条
+                // done 是完整快照而非增量；只补尚未发送的后缀，避免重复 JSON 参数。
                 let index = payload.get("output_index").and_then(Value::as_u64);
                 let args = payload.get("arguments").and_then(Value::as_str);
                 if let (Some(index), Some(args)) = (index, args) {
                     if let Some(slot) = self.tool_slots.get(&index).copied() {
-                        if !args.is_empty() {
+                        let emitted = self.function_arguments.entry(index).or_default();
+                        let suffix = args
+                            .strip_prefix(emitted.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !suffix.is_empty() {
+                            emitted.push_str(&suffix);
                             out.push(self.build_chunk(
                                 json!({
                                     "tool_calls": [{
                                         "index": slot,
-                                        "function": {"arguments": args}
+                                        "function": {"arguments": suffix}
                                     }]
                                 }),
                                 None,
@@ -931,7 +963,18 @@ impl StreamState {
                     out.push(self.build_terminal_chunk());
                 }
             }
-            Some("response.failed") | Some("response.incomplete") => {
+            Some("response.failed") => {
+                if let Some(usage) = payload.pointer("/response/usage") {
+                    self.accumulate_usage(usage);
+                }
+                let error = payload
+                    .pointer("/response/error")
+                    .cloned()
+                    .filter(|value| value.is_object())
+                    .unwrap_or_else(|| json!({"type":"upstream_error", "message":"Responses 上游返回 response.failed"}));
+                out.push(json!({"error": error}));
+            }
+            Some("response.incomplete") => {
                 if let Some(resp) = payload.get("response") {
                     let status = resp.get("status").and_then(Value::as_str);
                     let incomplete_reason = resp
@@ -952,10 +995,12 @@ impl StreamState {
             Some("error") => {
                 let msg = payload
                     .pointer("/error/message")
+                    .or_else(|| payload.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("upstream error");
                 let error_type = payload
                     .pointer("/error/type")
+                    .or_else(|| payload.get("code"))
                     .and_then(Value::as_str)
                     .unwrap_or("upstream_error");
                 out.push(json!({
@@ -1021,6 +1066,68 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::time::Duration;
+
+    #[test]
+    fn protocol_function_arguments_snapshot_is_not_appended_twice() {
+        for delta_mode in [false, true] {
+            let mut state = StreamState::new("test-model".into());
+            let mut emitted = Vec::new();
+            for index in [1, 3] {
+                emitted.extend(state.handle_event(&json!({
+                    "type":"response.output_item.added", "output_index":index,
+                    "item":{"type":"function_call","call_id":format!("call_{index}"),"name":"lookup","arguments":""}
+                })));
+            }
+            if delta_mode {
+                for delta in ["{\"q\":", "\"你好\"}"] {
+                    for index in [1, 3] {
+                        emitted.extend(state.handle_event(&json!({
+                            "type":"response.function_call_arguments.delta", "output_index":index, "delta":delta
+                        })));
+                    }
+                }
+            }
+            for index in [1, 3] {
+                emitted.extend(state.handle_event(&json!({
+                    "type":"response.function_call_arguments.done", "output_index":index, "arguments":"{\"q\":\"你好\"}"
+                })));
+            }
+            for slot in [0, 1] {
+                let arguments = emitted.iter().filter_map(|event| {
+                    let call = &event["choices"][0]["delta"]["tool_calls"][0];
+                    (call["index"] == slot).then(|| call["function"]["arguments"].as_str()).flatten()
+                }).collect::<String>();
+                assert_eq!(arguments, "{\"q\":\"你好\"}", "slot={slot}, delta_mode={delta_mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_failed_response_emits_error_not_successful_finish() {
+        let mut state = StreamState::new("test-model".into());
+        let events = state.handle_event(&json!({
+            "type":"response.failed", "response":{"status":"failed","error":{"type":"server_error","message":"synthetic failure"}}
+        }));
+        assert!(events.iter().any(|event| event["error"]["message"] == "synthetic failure"));
+        assert!(!events.iter().any(|event| event["choices"][0]["finish_reason"] == "stop"));
+    }
+
+    #[test]
+    fn protocol_top_level_error_preserves_message() {
+        let event = json!({
+            "type": "error",
+            "code": "server_error",
+            "message": "synthetic failure"
+        });
+        let mut state = StreamState::new("test-model".into());
+        let outputs = state.handle_event(&event);
+        assert_eq!(outputs[0]["error"]["message"], "synthetic failure");
+        assert_eq!(outputs[0]["error"]["type"], "server_error");
+        assert_eq!(
+            responses_stream_error_message(&event).as_deref(),
+            Some("synthetic failure")
+        );
+    }
 
     #[test]
     fn request_extracts_system_to_instructions() {
@@ -1385,6 +1492,41 @@ mod tests {
         assert!(outcome.error.is_none());
         assert_eq!(outcome.usage.input, 1);
         assert_eq!(outcome.usage.output, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_translator_treats_incomplete_as_a_successful_terminal_event() {
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason":"max_output_tokens"},
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            }
+        });
+        let bytes = Bytes::from(format!("data: {event}\n\n"));
+        let stream = futures_util::stream::once(async move { Ok::<Bytes, io::Error>(bytes) })
+            .chain(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+
+        let (rx, body_stream) = spawn_responses_stream_translator_from_stream(
+            stream,
+            "gpt-test".to_string(),
+            Instant::now(),
+            CancellationToken::new(),
+        );
+        let body = axum::body::Body::from_stream(body_stream);
+        let body = tokio::time::timeout(Duration::from_millis(100), to_bytes(body, 1024 * 1024))
+            .await
+            .expect("下游流应在 response.incomplete 后立即结束")
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let outcome = rx.await.unwrap();
+
+        assert!(text.contains("\"finish_reason\":\"length\""));
+        assert!(text.contains("[DONE]"));
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.usage.input, 2);
+        assert_eq!(outcome.usage.output, 3);
     }
 
     #[tokio::test]

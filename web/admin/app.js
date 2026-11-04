@@ -211,14 +211,15 @@ function renderLogs(logs) {
   for (const log of logs) {
     const row = document.createElement("tr");
     const [label, className] = statusLabel(log.status);
-    appendCell(row, log.ts || "-");
-    appendStatus(row, label, className);
+    const repeatCount = Math.max(1, Number(log.repeat_count) || 1);
+    appendCell(row, log.last_ts || log.ts || "-", `首次：${log.ts || "-"}\n最后：${log.last_ts || log.ts || "-"}`);
+    appendStatus(row, repeatCount > 1 ? `${label} ×${formatNumber(repeatCount)}` : label, className);
     appendCell(row, log.api_key_name || "-", log.api_key_name || "-");
     appendCell(row, log.api || "-");
     appendCell(row, log.channel || "-");
     appendCell(row, modelLabel(log), modelLabel(log));
     appendCell(row, `${formatNumber(log.input_tokens)}/${formatNumber(log.output_tokens)}`);
-    appendCell(row, `${seconds(log.latency_ms)} / ${seconds(log.first_token_ms)}`);
+    appendCell(row, `${repeatCount > 1 ? "累计 " : ""}${seconds(log.latency_ms)} / ${seconds(log.first_token_ms)}`);
     appendCell(row, log.error || "-", log.error || "", log.error ? "error-text" : "");
     elements.logRows.append(row);
   }

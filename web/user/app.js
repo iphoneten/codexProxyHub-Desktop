@@ -164,19 +164,20 @@ function renderDashboard(payload) {
 function createLogRow(row) {
   const tr = document.createElement("tr");
   const [label, className] = statusLabel(row.status);
-  appendCell(tr, row.ts || "-", row.ts || "-");
+  const repeatCount = Math.max(1, Number(row.repeat_count) || 1);
+  appendCell(tr, row.last_ts || row.ts || "-", `首次：${row.ts || "-"}\n最后：${row.last_ts || row.ts || "-"}`);
 
   const statusCell = document.createElement("td");
   const status = document.createElement("span");
   status.className = `status ${className}`;
-  status.textContent = label;
+  status.textContent = repeatCount > 1 ? `${label} ×${formatNumber(repeatCount)}` : label;
   statusCell.append(status);
   tr.append(statusCell);
 
   appendCell(tr, row.api || "-");
   appendCell(tr, modelLabel(row));
   appendCell(tr, `${formatNumber(row.input_tokens)}/${formatNumber(row.output_tokens)}`);
-  appendCell(tr, `${seconds(row.latency_ms)} / ${seconds(row.first_token_ms)}`);
+  appendCell(tr, `${repeatCount > 1 ? "累计 " : ""}${seconds(row.latency_ms)} / ${seconds(row.first_token_ms)}`);
 
   const errorCell = document.createElement("td");
   errorCell.textContent = row.error || "-";

@@ -178,6 +178,7 @@ where
     tokio::spawn(async move {
         let mut stream = stream;
         let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
         let mut usage = TokenUsage::default();
         let mut first_token_ms = None;
         let mut sent_role = false;
@@ -200,7 +201,7 @@ where
             };
             match item {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    crate::proxy::append_sse_bytes(&mut buffer, &mut pending_utf8, &bytes);
                     while let Some((event, consumed)) = next_sse_event(&buffer) {
                         buffer.drain(..consumed);
                         let Some(data) = sse_data(&event) else {

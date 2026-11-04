@@ -33,3 +33,10 @@ uuid = { version = "1", features = ["v4", "v5"] }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSResponder"] }
 tray-icon = { version = "0.24.1", default-features = false }
+
+# macOS 26+ 的 NSScreen Swift 数组将枚举返回值标为 q，而旧 icrate 绑定使用 Q。
+# objc2 0.4.1 尚无 relax-sign-encoding；仅为该旧依赖关闭开发构建断言。
+# 保留应用及其他依赖的调试检查，升级窗口依赖链后应移除此临时兼容项。
+# 上游问题：https://github.com/rust-windowing/winit/issues/4299
+[profile.dev.package."objc2:0.4.1"]
+debug-assertions = false

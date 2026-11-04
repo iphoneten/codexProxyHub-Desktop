@@ -12,7 +12,6 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     thread,
-    time::Instant,
 };
 
 /// 模型同步在后台线程执行，UI 只轮询结果，避免阻塞渲染线程造成窗口卡顿。
@@ -471,8 +470,8 @@ fn provider_detail_panel(
                     ui.end_row();
                 });
             ui.horizontal_wrapped(|ui| {
-                form_label(ui, "熔断状态");
-                provider_circuit_detail(ui, circuit_status, &provider.name, provider.persistent_retry);
+                form_label(ui, "运行状态");
+                provider_runtime_detail(ui, circuit_status, &provider.name, provider.enabled);
             });
         });
 
@@ -483,7 +482,8 @@ fn provider_detail_panel(
                 .spacing(egui::vec2(14.0, 10.0))
                 .show(ui, |ui| {
                     form_label(ui, "Priority");
-                    ui.add(egui::DragValue::new(&mut provider.priority).speed(1));
+                    ui.add(egui::DragValue::new(&mut provider.priority).speed(1))
+                        .on_hover_text("数字越小越先尝试；每轮均按优先级排序，上次成功的低优先级渠道不能插队");
                     form_label(ui, "Weight");
                     ui.add(egui::DragValue::new(&mut provider.weight).range(1..=100));
                     ui.end_row();
@@ -503,8 +503,9 @@ fn provider_detail_panel(
                     ui.label("");
                     ui.end_row();
 
-                    form_label(ui, "Retries");
-                    ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50));
+                    form_label(ui, "每轮尝试次数");
+                    ui.add(egui::DragValue::new(&mut provider.max_retries).range(0..=50))
+                        .on_hover_text("包含首次请求；0 兼容为 1 次。一轮所有渠道失败后继续下一轮，直到成功、客户端断开或服务关闭");
                     form_label(ui, "Stream Idle");
                     ui.add(egui::DragValue::new(&mut provider.stream_idle_timeout).range(0..=3600));
                     ui.end_row();
@@ -512,9 +513,9 @@ fn provider_detail_panel(
                     form_label(ui, "开启心跳");
                     switch(ui, &mut provider.heartbeat_enabled)
                         .on_hover_text("空闲时向上游发送短请求；Responses 使用成功真实请求的模板，无模板或模板被拒绝时等待新请求；保活失败不阻断客户端，会产生上游用量");
-                    form_label(ui, "开启无限重试");
-                    switch(ui, &mut provider.persistent_retry)
-                        .on_hover_text("对 HTTP 429 / 500 / 502 / 503 / 504 持续重试，并停用渠道熔断冷却；直到成功、客户端断开或服务关闭，仍遵守重试间隔");
+                    form_label(ui, "业务请求");
+                    ui.label("持续轮询")
+                        .on_hover_text("所有上游失败均参与下一次尝试；旧 persistent_retry 字段仅保留配置兼容，不再控制业务轮询");
                     ui.end_row();
 
                     form_label(ui, "心跳间隔（秒）");
@@ -706,73 +707,45 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-fn provider_circuit_detail(
+fn provider_runtime_detail(
     ui: &mut egui::Ui,
     circuit_status: Option<&proxy::ProviderCircuitStatusHandle>,
     provider_name: &str,
-    persistent_retry: bool,
+    enabled: bool,
 ) {
     let Some(status_handle) = circuit_status else {
         ui.label(egui::RichText::new("代理未启动").color(muteds()));
         return;
     };
     let status = status_handle.read().get(provider_name).cloned();
-    if persistent_retry {
-        ui.label(egui::RichText::new("无限重试：配置生效后不使用熔断冷却").color(muteds()));
-        if let Some(status) = status {
-            ui.label(format!("当前并发 {}", status.inflight));
-            if let Some(error) = status.last_error {
-                ui.colored_label(
-                    egui::Color32::from_rgb(176, 54, 64),
-                    format!("最近请求失败: {}", error),
-                );
-            }
-        }
-        return;
-    }
     let Some(status) = status else {
-        ui.label(egui::RichText::new("等待首次请求").color(muteds()));
+        let text = if enabled {
+            "轮询待命，等待首次请求"
+        } else {
+            "渠道已停用"
+        };
+        ui.label(egui::RichText::new(text).color(muteds()));
         return;
     };
 
-    match status.status {
-        proxy::ProviderCircuitStatus::Healthy => {
-            if status.failures == 0 {
-                ui.colored_label(good(), format!("渠道健康，当前并发 {}", status.inflight));
-            } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 120, 24),
-                    format!(
-                        "渠道可用，连续失败 {}/3，当前并发 {}",
-                        status.failures, status.inflight
-                    ),
-                );
-            }
-        }
-        proxy::ProviderCircuitStatus::Open => match status.open_until {
-            Some(until) if until > Instant::now() => {
-                let remaining = until
-                    .saturating_duration_since(Instant::now())
-                    .as_secs()
-                    .max(1);
-                ui.colored_label(
-                    egui::Color32::from_rgb(176, 54, 64),
-                    format!("渠道已熔断，约 {remaining} 秒后探测"),
-                );
-            }
-            _ => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(190, 120, 24),
-                    "冷却已结束，等待半开探测",
-                );
-            }
-        },
-        proxy::ProviderCircuitStatus::HalfOpen => {
-            ui.colored_label(
-                egui::Color32::from_rgb(190, 120, 24),
-                format!("渠道半开探测中，当前并发 {}", status.inflight),
-            );
-        }
+    let participation = if enabled {
+        "参与轮询"
+    } else {
+        "渠道已停用"
+    };
+    if status.failures == 0 {
+        ui.colored_label(
+            if enabled { good() } else { muteds() },
+            format!("{participation}，当前并发 {}", status.inflight),
+        );
+    } else {
+        ui.colored_label(
+            egui::Color32::from_rgb(190, 120, 24),
+            format!(
+                "{participation}，连续失败 {} 次，当前并发 {}",
+                status.failures, status.inflight
+            ),
+        );
     }
 
     if let Some(error) = status.last_error {
@@ -967,5 +940,101 @@ pub fn default_provider() -> ProviderConfig {
         strip_thought: false,
         extra: Default::default(),
         auth_account_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::RwLock;
+
+    fn runtime_text(
+        status: Option<&proxy::ProviderCircuitStatusHandle>,
+        enabled: bool,
+    ) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                provider_runtime_detail(ui, status, "synthetic-channel", enabled);
+            });
+        });
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn provider_runtime_detail_respects_enabled_and_preserves_history() {
+        let status: proxy::ProviderCircuitStatusHandle = Arc::new(RwLock::new(HashMap::from([(
+            "synthetic-channel".into(),
+            proxy::ProviderCircuitSnapshot {
+                failures: 3,
+                inflight: 2,
+                last_error: Some("synthetic failure".into()),
+                ..Default::default()
+            },
+        )])));
+        assert_eq!(
+            runtime_text(Some(&status), true),
+            [
+                "参与轮询，连续失败 3 次，当前并发 2",
+                "最近请求失败: synthetic failure",
+            ]
+        );
+        assert_eq!(
+            runtime_text(Some(&status), false),
+            [
+                "渠道已停用，连续失败 3 次，当前并发 2",
+                "最近请求失败: synthetic failure",
+            ]
+        );
+
+        // 停用后旧请求仍可能完成，渲染不清空历史失败或最近错误。
+        status
+            .write()
+            .get_mut("synthetic-channel")
+            .unwrap()
+            .inflight = 0;
+        assert_eq!(
+            runtime_text(Some(&status), false),
+            [
+                "渠道已停用，连续失败 3 次，当前并发 0",
+                "最近请求失败: synthetic failure",
+            ]
+        );
+        let snapshot = status.read()["synthetic-channel"].clone();
+        assert_eq!(snapshot.failures, 3);
+        assert_eq!(snapshot.last_error.as_deref(), Some("synthetic failure"));
+    }
+
+    #[test]
+    fn provider_runtime_detail_distinguishes_stopped_disabled_and_waiting() {
+        let status: proxy::ProviderCircuitStatusHandle = Arc::new(RwLock::new(HashMap::new()));
+        for enabled in [true, false] {
+            assert_eq!(runtime_text(None, enabled), ["代理未启动"]);
+        }
+        assert_eq!(
+            runtime_text(Some(&status), true),
+            ["轮询待命，等待首次请求"]
+        );
+        assert_eq!(runtime_text(Some(&status), false), ["渠道已停用"]);
+
+        status.write().insert(
+            "synthetic-channel".into(),
+            proxy::ProviderCircuitSnapshot {
+                inflight: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(runtime_text(Some(&status), true), ["参与轮询，当前并发 1"]);
+        assert_eq!(
+            runtime_text(Some(&status), false),
+            ["渠道已停用，当前并发 1"]
+        );
     }
 }

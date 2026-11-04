@@ -183,7 +183,7 @@ pub fn routing_section(
     section(ui, "模型映射", |ui| {
         ui.set_max_width(640.0);
         ui.horizontal(|ui| {
-            ui.label("请求优先级");
+            ui.label("同优先级来源偏好");
             ui.radio_value(
                 &mut config.routing.auth_preference,
                 "provider_first".to_string(),
@@ -197,7 +197,7 @@ pub fn routing_section(
         });
         ui.colored_label(
             muteds(),
-            "账号优先：先走 Auth 账号（使用 Auth 代理）；渠道优先：先普通渠道。各组内部仍按 priority/weight 排序。",
+            "先按 Priority 从小到大尝试；优先级相同时再使用来源偏好。成功渠道偏好也仅在同一模型、同一优先级内生效。",
         );
         ui.add_space(10.0);
 
