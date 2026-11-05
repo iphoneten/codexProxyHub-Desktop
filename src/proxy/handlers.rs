@@ -401,7 +401,7 @@ pub(super) async fn responses(
                         crate::runtime_log::record_repeated(
                             "WARN",
                             format!(
-                                "Responses 会话切换到渠道 {} 的不同账号、项目或模型；已保留可见历史与工具结果，并移除无法跨安全域复用的加密状态",
+                                "Responses 会话切换到渠道 {} 的不同账号、项目或模型；已保留可见历史与工具结果，并移除无法跨安全域复用的状态与历史 item ID",
                                 provider.name
                             ),
                             format!("responses-state-domain-switch:{}", provider.name),
@@ -690,7 +690,7 @@ async fn send_native_responses_with_recovery(
             crate::runtime_log::record_repeated(
                 "WARN",
                 format!(
-                    "渠道 {} 无法验证 Responses 加密会话状态；已保留可见历史与工具结果，并在同一渠道执行一次降级恢复",
+                    "渠道 {} 无法复用 Responses 会话状态；已保留可见历史与工具结果，并在同一渠道执行一次降级恢复",
                     provider.name
                 ),
                 format!("responses-encrypted-state-recovery:{}", provider.name),
@@ -1013,6 +1013,19 @@ mod tests {
 
     #[tokio::test]
     async fn encrypted_state_rejection_retries_once_without_opaque_items() {
+        assert_state_rejection_recovery(
+            "The encrypted content for item rs_test could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+            true,
+        )
+        .await;
+        assert_state_rejection_recovery(
+            "The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it.",
+            false,
+        )
+        .await;
+    }
+
+    async fn assert_state_rejection_recovery(message: &'static str, with_encrypted_state: bool) {
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let seen = Arc::clone(&requests);
         let app = Router::new().route(
@@ -1026,8 +1039,7 @@ mod tests {
                         (
                             StatusCode::BAD_REQUEST,
                             Json(json!({"error":{
-                                "code":"invalid_encrypted_content",
-                                "message":"The encrypted content for item rs_test could not be verified. Reason: Encrypted content could not be decrypted or parsed."
+                                "message":message
                             }})),
                         )
                             .into_response()
@@ -1044,17 +1056,21 @@ mod tests {
         provider.responses_mode = "native".into();
         provider.max_retries = 0;
         let headers = HeaderMap::new();
-        let body = json!({
+        let mut body = json!({
             "model":"gpt-test",
             "prompt_cache_key":"session-recovery",
-            "previous_response_id":"resp_old",
             "input":[
-                {"type":"message","role":"user","content":"continue"},
-                {"type":"reasoning","id":"rs_test","encrypted_content":"secret-cipher"},
-                {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"message","id":"msg_old","role":"user","content":"continue"},
+                {"type":"function_call","id":"fc_old","call_id":"call_1","name":"read","arguments":"{}"},
                 {"type":"function_call_output","call_id":"call_1","output":"ok"}
             ]
         });
+        if with_encrypted_state {
+            body["previous_response_id"] = json!("resp_old");
+            body["input"].as_array_mut().unwrap().push(json!({
+                "type":"reasoning","id":"rs_test","encrypted_content":"secret-cipher"
+            }));
+        }
         let key = responses_affinity_key(&body, &headers, "", "gpt-test");
         let identity = responses_provider_identity(&provider, &body, &headers);
 
@@ -1076,15 +1092,26 @@ mod tests {
         assert_eq!(result.response.status(), StatusCode::OK);
         let requests = requests.lock();
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].to_string().contains("secret-cipher"));
+        assert_eq!(requests[0]["input"][0]["id"], "msg_old");
         assert!(!requests[1].to_string().contains("secret-cipher"));
         assert!(requests[1].get("previous_response_id").is_none());
-        assert!(requests[1].to_string().contains("call_1"));
-        assert!(requests[1].to_string().contains("continue"));
+        assert_eq!(
+            requests[1]["input"],
+            json!([
+                {"type":"message","role":"user","content":"continue"},
+                {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ])
+        );
     }
 
     #[tokio::test]
     async fn bound_stateful_request_prefers_owner_and_sanitizes_failover() {
+        assert_bound_stateful_failover(true).await;
+        assert_bound_stateful_failover(false).await;
+    }
+
+    async fn assert_bound_stateful_failover(with_encrypted_state: bool) {
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let seen = Arc::clone(&requests);
         let app = Router::new().fallback(move |uri: Uri, Json(body): Json<Value>| {
@@ -1136,15 +1163,22 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer synthetic-local"),
         );
-        let body = json!({
+        let mut body = json!({
             "model":"gpt-test",
             "prompt_cache_key":"session-owner",
-            "previous_response_id":"resp_owner",
             "input":[
-                {"type":"message","role":"user","content":"continue"},
-                {"type":"reasoning","id":"rs_owner","encrypted_content":"owner-cipher"}
+                {"type":"message","id":"msg_owner","role":"user","content":"continue"},
+                {"type":"function_call","id":"fc_owner","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
             ]
         });
+        if with_encrypted_state {
+            body["previous_response_id"] = json!("resp_owner");
+            body["input"].as_array_mut().unwrap().push(json!({
+                "type":"reasoning","id":"rs_owner","encrypted_content":"owner-cipher"
+            }));
+        }
+        let original_input = body["input"].clone();
         let key = responses_affinity_key(
             &body,
             &headers,
@@ -1176,11 +1210,18 @@ mod tests {
         let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, "owner");
-        assert!(requests[0].1.to_string().contains("owner-cipher"));
+        assert_eq!(requests[0].1["input"], original_input);
         assert_eq!(requests[1].0, "fallback");
         assert!(!requests[1].1.to_string().contains("owner-cipher"));
         assert!(requests[1].1.get("previous_response_id").is_none());
-        assert!(requests[1].1.to_string().contains("continue"));
+        assert_eq!(
+            requests[1].1["input"],
+            json!([
+                {"type":"message","role":"user","content":"continue"},
+                {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ])
+        );
     }
 
     #[test]

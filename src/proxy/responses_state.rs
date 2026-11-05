@@ -512,7 +512,12 @@ pub(super) fn responses_has_opaque_state(body: &Value) -> bool {
         || body
             .get("input")
             .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(opaque_item_fingerprint_is_some))
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    opaque_item_fingerprint_is_some(item)
+                        || replay_item_id_fingerprint(item).is_some()
+                })
+            })
 }
 
 pub(super) fn strip_rejected_responses_state(body: &mut Value, rejected: &HashSet<String>) -> bool {
@@ -533,12 +538,21 @@ pub(super) fn strip_rejected_responses_state(body: &mut Value, rejected: &HashSe
         changed = true;
     }
     if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
-        let original = items.len();
-        items.retain(|item| {
-            !opaque_item_fingerprint(item)
+        items.retain_mut(|item| {
+            if opaque_item_fingerprint(item)
                 .is_some_and(|fingerprint| rejected.contains(&fingerprint))
+            {
+                changed = true;
+                return false;
+            }
+            if replay_item_id_fingerprint(item)
+                .is_some_and(|fingerprint| rejected.contains(&fingerprint))
+            {
+                item.as_object_mut().unwrap().remove("id");
+                changed = true;
+            }
+            true
         });
-        changed |= items.len() != original;
     }
     changed
 }
@@ -557,12 +571,16 @@ pub(super) fn strip_all_responses_state(body: &mut Value) -> Vec<String> {
         object.remove("previous_response_id");
     }
     if let Some(items) = object.get_mut("input").and_then(Value::as_array_mut) {
-        items.retain(|item| {
-            let Some(fingerprint) = opaque_item_fingerprint(item) else {
-                return true;
-            };
-            removed.push(fingerprint);
-            false
+        items.retain_mut(|item| {
+            if let Some(fingerprint) = opaque_item_fingerprint(item) {
+                removed.push(fingerprint);
+                return false;
+            }
+            if let Some(fingerprint) = replay_item_id_fingerprint(item) {
+                removed.push(fingerprint);
+                item.as_object_mut().unwrap().remove("id");
+            }
+            true
         });
     }
     removed
@@ -576,6 +594,7 @@ pub(super) fn is_encrypted_state_rejection(message: &str) -> bool {
         || lower.contains("invalid_encrypted_summary")
         || lower.contains("item_id did not match the target item id")
         || lower.contains("could not decode the compaction blob")
+        || lower.contains("was created under a different azure openai resource")
         || ((lower.contains("encrypted content") || lower.contains("encrypted_content"))
             && (lower.contains("could not be verified")
                 || lower.contains("could not be decrypted")
@@ -587,7 +606,7 @@ pub(super) fn is_encrypted_state_rejection(message: &str) -> bool {
 
 pub(super) fn redact_encrypted_state_error(message: &str) -> String {
     if is_encrypted_state_rejection(message) {
-        "invalid_encrypted_content: 上游无法验证 Responses 加密会话状态；密文可能来自其他账号、项目或模型"
+        "invalid_encrypted_content: 上游无法复用 Responses 会话状态；状态可能来自其他账号、项目、资源或模型"
             .to_string()
     } else {
         truncate(message)
@@ -646,6 +665,21 @@ fn opaque_item_fingerprint(item: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(|id| digest(&format!("item-id\0{id}")))
+}
+
+fn replay_item_id_fingerprint(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "message"
+        | "function_call"
+        | "function_call_output"
+        | "custom_tool_call"
+        | "custom_tool_call_output" => {}
+        _ => return None,
+    }
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| digest(&format!("replay-item-id\0{id}")))
 }
 
 fn previous_response_fingerprint(value: &str) -> String {
@@ -876,6 +910,64 @@ mod tests {
     }
 
     #[test]
+    fn stripping_replayed_ids_preserves_messages_attachments_and_tool_links() {
+        let mut body = json!({"model":"gpt-test", "input":[
+            {"type":"message","id":"msg_old","role":"assistant","content":[
+                {"type":"output_text","text":"visible","annotations":[]}
+            ]},
+            {"type":"message","role":"user","content":[
+                {"type":"input_image","image_url":"https://example.test/image.png","detail":"auto"}
+            ]},
+            {"type":"function_call","id":"fc_old","call_id":"call_1","name":"read","arguments":"{}"},
+            {"type":"function_call_output","id":"fco_old","call_id":"call_1","output":"ok"},
+            {"type":"custom_tool_call","id":"ctc_old","call_id":"call_2","name":"edit","input":"patch"},
+            {"type":"custom_tool_call_output","id":"ctco_old","call_id":"call_2","output":"done"}
+        ]});
+        assert!(responses_has_opaque_state(&body));
+        let removed = strip_all_responses_state(&mut body);
+        assert_eq!(removed.len(), 5);
+        assert!(!responses_has_opaque_state(&body));
+        assert_eq!(
+            body,
+            json!({"model":"gpt-test", "input":[
+                {"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"visible","annotations":[]}
+                ]},
+                {"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"https://example.test/image.png","detail":"auto"}
+                ]},
+                {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"},
+                {"type":"custom_tool_call","call_id":"call_2","name":"edit","input":"patch"},
+                {"type":"custom_tool_call_output","call_id":"call_2","output":"done"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn rejected_replayed_id_keeps_content_and_new_item_ids() {
+        let mut rejected_body = json!({"input":[
+            {"type":"message","id":"msg_old","role":"assistant","content":"visible"}
+        ]});
+        let rejected = strip_all_responses_state(&mut rejected_body)
+            .into_iter()
+            .collect();
+        let mut body = json!({"input":[
+            {"type":"message","id":"msg_old","role":"assistant","content":"visible"},
+            {"type":"message","id":"msg_new","role":"assistant","content":"new"}
+        ]});
+        assert!(strip_rejected_responses_state(&mut body, &rejected));
+        assert_eq!(
+            body,
+            json!({"input":[
+                {"type":"message","role":"assistant","content":"visible"},
+                {"type":"message","id":"msg_new","role":"assistant","content":"new"}
+            ]})
+        );
+        assert!(!strip_rejected_responses_state(&mut body, &rejected));
+    }
+
+    #[test]
     fn provider_identity_tracks_security_domain_but_not_oauth_refresh_token() {
         let body = json!({"model":"gpt-test"});
         let headers = HeaderMap::new();
@@ -937,6 +1029,9 @@ mod tests {
         ));
         assert!(is_encrypted_state_rejection(
             "reasoning encrypted_content was not issued to this caller"
+        ));
+        assert!(is_encrypted_state_rejection(
+            "The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."
         ));
         assert!(!is_encrypted_state_rejection(
             "invalid request: temperature"
