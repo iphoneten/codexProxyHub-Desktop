@@ -317,6 +317,7 @@ pub(super) async fn responses(
     let auth = authorize_and_acquire(&state, &cfg, &headers)?;
     let api_key_id = request_api_key_id(&cfg, &headers);
     let model = body_model(&body)?;
+    let reasoning_effort = body_reasoning_effort(&body).to_string();
     ensure_api_key_allows_model(&auth, &model)?;
     enforce_daily_token_limit(&cfg, &auth, &api_key_id)?;
     let api_key_name = auth.key_name;
@@ -430,6 +431,7 @@ pub(super) async fn responses(
                 started,
                 &api_key_id,
                 &api_key_name,
+                &reasoning_effort,
                 &ctx,
             );
 
@@ -474,6 +476,7 @@ pub(super) async fn responses(
                             permit.take(),
                             &api_key_id,
                             &api_key_name,
+                            &reasoning_effort,
                             &ctx,
                             Some(circuit_guard),
                         ));
@@ -520,6 +523,7 @@ pub(super) async fn responses(
                         permit.take(),
                         &api_key_id,
                         &api_key_name,
+                        &reasoning_effort,
                         &ctx,
                         Some(circuit_guard),
                     ));
@@ -550,6 +554,7 @@ pub(super) async fn responses(
                                 permit.take(),
                                 &api_key_id,
                                 &api_key_name,
+                                &reasoning_effort,
                                 &ctx,
                                 Some(circuit_guard),
                             ));
@@ -585,6 +590,7 @@ pub(super) async fn responses(
                                 &api_key_id,
                                 &api_key_name,
                                 ctx.request_id(),
+                                &reasoning_effort,
                             );
                         }
                         return Err(ProxyError::new(StatusCode::BAD_REQUEST, err.message));
@@ -606,6 +612,7 @@ pub(super) async fn responses(
                                 &api_key_id,
                                 &api_key_name,
                                 ctx.request_id(),
+                                &reasoning_effort,
                             );
                         }
                         return Err(ProxyError::new(failure.status, failure.message));
@@ -629,6 +636,7 @@ pub(super) async fn responses(
                     &api_key_id,
                     &api_key_name,
                     ctx.request_id(),
+                    &reasoning_effort,
                 );
             }
             return Err(ProxyError::new(
@@ -1275,6 +1283,7 @@ pub(super) async fn forward_openai(
 ) -> Result<Response, ProxyError> {
     let cfg = state.snapshot();
     let model = body_model(&body)?;
+    let reasoning_effort = body_reasoning_effort(&body).to_string();
     let affinity_key = api_key_affinity_key(&model, &api_key_id);
     let mut providers = provider_attempts(&cfg, &state, &model, api, &allowed_providers);
     if let Some((preferred, preferred_model)) = state.preferred_provider_for_affinity(&affinity_key)
@@ -1330,6 +1339,7 @@ pub(super) async fn forward_openai(
                 started,
                 &api_key_id,
                 &api_key_name,
+                &reasoning_effort,
                 &ctx,
             );
             // chat/completions 路径下预留一份 body 用于 responses fallback
@@ -1367,6 +1377,7 @@ pub(super) async fn forward_openai(
                         permit.take(),
                         &api_key_id,
                         &api_key_name,
+                        &reasoning_effort,
                         &ctx,
                         Some(circuit_guard),
                     ));
@@ -1400,6 +1411,7 @@ pub(super) async fn forward_openai(
                                     permit.take(),
                                     &api_key_id,
                                     &api_key_name,
+                                    &reasoning_effort,
                                     &ctx,
                                     Some(circuit_guard),
                                 ));
@@ -1437,6 +1449,7 @@ pub(super) async fn forward_openai(
                                 &api_key_id,
                                 &api_key_name,
                                 ctx.request_id(),
+                                &reasoning_effort,
                             );
                         }
                         return Err(ProxyError::new(failure.status, failure.message));
@@ -1460,6 +1473,7 @@ pub(super) async fn forward_openai(
                     &api_key_id,
                     &api_key_name,
                     ctx.request_id(),
+                    &reasoning_effort,
                 );
             }
             return Err(ProxyError::new(
@@ -1498,6 +1512,7 @@ fn commit_result(
     permit: Option<OwnedSemaphorePermit>,
     api_key_id: &str,
     api_key_name: &str,
+    reasoning_effort: &str,
     ctx: &RequestContext,
     circuit_guard: Option<ProviderCircuitGuard>,
 ) -> Response {
@@ -1513,6 +1528,7 @@ fn commit_result(
                 api_key_id,
                 api_key_name,
                 ctx.request_id(),
+                reasoning_effort,
             )
         });
         let api = api.to_string();
@@ -1525,6 +1541,7 @@ fn commit_result(
         let affinity_update = affinity_update.cloned();
         let upstream_model = result.upstream_model.clone();
         let request_id = ctx.request_id().to_string();
+        let reasoning_effort = reasoning_effort.to_string();
         tokio::spawn(async move {
             let mut circuit_guard = circuit_guard;
             match rx.await {
@@ -1550,6 +1567,7 @@ fn commit_result(
                             first_token_ms: outcome.first_token_ms,
                             token_source: None,
                             request_id: &request_id,
+                            reasoning_effort: &reasoning_effort,
                         },
                     )
                     .await
@@ -1583,6 +1601,7 @@ fn commit_result(
                             first_token_ms,
                             token_source: None,
                             request_id: &request_id,
+                            reasoning_effort: &reasoning_effort,
                         },
                     )
                     .await
@@ -1628,6 +1647,7 @@ fn commit_result(
                             first_token_ms,
                             token_source: None,
                             request_id: &request_id,
+                            reasoning_effort: &reasoning_effort,
                         },
                     )
                     .await
@@ -1660,6 +1680,7 @@ fn commit_result(
                             first_token_ms: None,
                             token_source: None,
                             request_id: &request_id,
+                            reasoning_effort: &reasoning_effort,
                         },
                     )
                     .await
@@ -1694,6 +1715,7 @@ fn commit_result(
             api_key_id,
             api_key_name,
             ctx.request_id(),
+            reasoning_effort,
         );
     }
     if stream {

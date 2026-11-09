@@ -513,6 +513,7 @@ mod tests {
             4,
             "upstream_or_unknown",
             "synthetic-request",
+            "",
         )
         .unwrap();
 
@@ -643,6 +644,7 @@ mod tests {
             provider: "A", model: "test-model", upstream_model: "test-model", status: "ok",
             error: None, usage: TokenUsage { input: 1, output: 0 }, first_token_ms: None,
             token_source: None, request_id: "synthetic-estimate-setup",
+            reasoning_effort: "",
         });
         let log_path = cfg.usage_log_sqlite_path();
         *state.config.write() = Arc::new(cfg);

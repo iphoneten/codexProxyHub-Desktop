@@ -1,6 +1,15 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+pub(super) fn body_reasoning_effort(body: &Value) -> &str {
+    body.pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("reasoning_effort").and_then(Value::as_str))
+        .or_else(|| body.pointer("/output_config/effort").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+}
+
 /// 合并键只存哈希，不把上游错误文本或内部请求标识带入运行日志。
 pub(super) fn failure_group_key(
     scope: &str,
@@ -34,6 +43,7 @@ pub(super) struct UsageLogEvent<'a> {
     pub(super) token_source: Option<&'a str>,
     /// 与响应头 `x-request-id` 同值，用来把一行日志和客户端侧的一次请求对上。
     pub(super) request_id: &'a str,
+    pub(super) reasoning_effort: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50,6 +60,7 @@ pub(super) fn log_success(
     api_key_id: &str,
     api_key_name: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) {
     log_usage(
         config,
@@ -67,6 +78,7 @@ pub(super) fn log_success(
             first_token_ms,
             token_source: None,
             request_id,
+            reasoning_effort,
         },
     );
 }
@@ -82,6 +94,7 @@ pub(super) fn log_error(
     api_key_id: &str,
     api_key_name: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) {
     let status = if error == STREAM_ABORTED_MESSAGE {
         STREAM_ABORTED_STATUS
@@ -104,6 +117,7 @@ pub(super) fn log_error(
             first_token_ms,
             token_source: None,
             request_id,
+            reasoning_effort,
         },
     );
 }
@@ -118,6 +132,7 @@ pub(super) fn log_stream_started(
     api_key_id: &str,
     api_key_name: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) -> Option<i64> {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let log_provider = log_provider_name(config, provider);
@@ -138,6 +153,7 @@ pub(super) fn log_stream_started(
         0,
         "upstream_or_unknown",
         request_id,
+        reasoning_effort,
     )
     .ok()
 }
@@ -164,6 +180,7 @@ pub(super) fn start_stream_attempt_log(
         "",
         api_key_name,
         "",
+        "",
     )
 }
 
@@ -178,6 +195,7 @@ pub(super) fn start_stream_attempt_log_for_key(
     api_key_id: &str,
     api_key_name: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) -> Option<i64> {
     stream.then(|| {
         log_stream_started(
@@ -190,6 +208,7 @@ pub(super) fn start_stream_attempt_log_for_key(
             api_key_id,
             api_key_name,
             request_id,
+            reasoning_effort,
         )
     })?
 }
@@ -208,6 +227,7 @@ pub(super) struct StreamAttemptLogGuard {
     request_id: String,
     log_scope: String,
     upstream_model: String,
+    reasoning_effort: String,
 }
 
 impl StreamAttemptLogGuard {
@@ -222,6 +242,7 @@ impl StreamAttemptLogGuard {
         started: Instant,
         api_key_id: &str,
         api_key_name: &str,
+        reasoning_effort: &str,
         ctx: &RequestContext,
     ) -> Self {
         Self {
@@ -229,6 +250,7 @@ impl StreamAttemptLogGuard {
             id: start_stream_attempt_log_for_key(
                 config, stream, api, provider, model, upstream_model, started,
                 api_key_id, api_key_name, ctx.request_id(),
+                reasoning_effort,
             ),
             api,
             provider: provider.to_string(),
@@ -239,6 +261,7 @@ impl StreamAttemptLogGuard {
             request_id: ctx.request_id().to_string(),
             log_scope: ctx.log_scope().to_string(),
             upstream_model: upstream_model.to_string(),
+            reasoning_effort: reasoning_effort.to_string(),
         }
     }
 
@@ -256,6 +279,7 @@ impl StreamAttemptLogGuard {
         finish_failed_attempt_log_in_group(
             &self.config, self.id.take(), self.api, &self.provider, &self.model,
             self.started, error, &self.api_key_id, &self.api_key_name, &self.request_id, &group,
+            &self.reasoning_effort,
         );
     }
 }
@@ -271,9 +295,11 @@ impl Drop for StreamAttemptLogGuard {
         let api_key_id = std::mem::take(&mut self.api_key_id);
         let api_key_name = std::mem::take(&mut self.api_key_name);
         let request_id = std::mem::take(&mut self.request_id);
+        let reasoning_effort = std::mem::take(&mut self.reasoning_effort);
         let finish = move || finish_failed_attempt_log_for_key(
             &config, Some(id), api, &provider, &model, started, STREAM_ABORTED_MESSAGE,
             &api_key_id, &api_key_name, &request_id,
+            &reasoning_effort,
         );
         // SQLite 的锁等待不能拖延网络取消或占用异步工作线程。
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -306,6 +332,7 @@ pub(super) fn finish_failed_attempt_log(
         "",
         api_key_name,
         "",
+        "",
     );
 }
 
@@ -320,9 +347,10 @@ pub(super) fn finish_failed_attempt_log_for_key(
     api_key_id: &str,
     api_key_name: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) {
     finish_failed_attempt_log_in_group(config, log_id, api, provider, model, started,
-        error, api_key_id, api_key_name, request_id, "");
+        error, api_key_id, api_key_name, request_id, "", reasoning_effort);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,6 +366,7 @@ fn finish_failed_attempt_log_in_group(
     api_key_name: &str,
     request_id: &str,
     group: &str,
+    reasoning_effort: &str,
 ) {
     let Some(id) = log_id else {
         return;
@@ -366,6 +395,7 @@ fn finish_failed_attempt_log_in_group(
             api_key_id,
             api_key_name,
             request_id,
+            reasoning_effort,
         );
     }
 }
@@ -446,6 +476,7 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
         event.usage.output,
         token_source,
         event.request_id,
+        event.reasoning_effort,
     );
 }
 
@@ -503,6 +534,7 @@ pub(super) fn log_usage_sqlite(
         output_tokens,
         token_source,
         "",
+        "",
     )
 }
 
@@ -524,6 +556,7 @@ pub(super) fn log_usage_sqlite_for_key(
     output_tokens: i64,
     token_source: &str,
     request_id: &str,
+    reasoning_effort: &str,
 ) -> rusqlite::Result<i64> {
     let conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
@@ -533,10 +566,10 @@ pub(super) fn log_usage_sqlite_for_key(
             (
                 ts, api, status, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source,
-                api_key_id, api_key_name, request_id
+                api_key_id, api_key_name, request_id, reasoning_effort
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         "#,
         params![
             ts,
@@ -553,7 +586,8 @@ pub(super) fn log_usage_sqlite_for_key(
             token_source,
             api_key_id,
             api_key_name,
-            request_id
+            request_id,
+            reasoning_effort
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -806,6 +840,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "api_key_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "request_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "reasoning_effort", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "repeat_count", "INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "last_ts", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "failure_group", "TEXT NOT NULL DEFAULT ''")?;
@@ -846,9 +881,49 @@ mod tests {
         })).unwrap())
     }
 
+    #[test]
+    fn request_logs_preserve_reasoning_effort_and_model_names() {
+        let cfg = merge_config();
+        let started = Instant::now();
+        for (api, body, expected) in [
+            ("responses", json!({"reasoning":{"effort":"high"}}), "high"),
+            ("chat", json!({"reasoning_effort":"medium"}), "medium"),
+            ("messages", json!({"output_config":{"effort":"low"}}), "low"),
+            ("chat", json!({"reasoning_effort":null}), ""),
+            ("responses", json!({"reasoning":{"effort":123}}), ""),
+            ("responses", json!({}), ""),
+        ] {
+            let effort = body_reasoning_effort(&body);
+            log_success(&cfg, api, "A", "client-model", "upstream-model",
+                TokenUsage::default(), started, None, false, "", "", "success", effort);
+            log_error(&cfg, api, "A", "client-model", started, None, "synthetic error",
+                "", "", "failure", effort);
+            let id = log_stream_started(&cfg, api, "A", "client-model", "upstream-model",
+                started, "", "", "stream", effort).unwrap();
+            let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+            let running: (String, String) = conn.query_row(
+                "SELECT status, reasoning_effort FROM usage_logs WHERE id=?1", [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(running, ("running".into(), expected.into()));
+            update_usage_log_sqlite(cfg.usage_log_sqlite_path(), id, "ok", "upstream-model",
+                100, Some(10), "", 3, 2, "upstream").unwrap();
+            let rows: Vec<(String, String, String, String)> = conn.prepare(
+                "SELECT status, request_model, upstream_model, reasoning_effort
+                 FROM usage_logs ORDER BY id DESC LIMIT 3",
+            ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(rows, vec![
+                ("ok".into(), "client-model".into(), "upstream-model".into(), expected.into()),
+                ("error".into(), "client-model".into(), "".into(), expected.into()),
+                ("ok".into(), "client-model".into(), "upstream-model".into(), expected.into()),
+            ]);
+        }
+    }
+
     fn failed_attempt(cfg: &Arc<AppConfig>, ctx: &RequestContext, provider: &str, code: u16, error: &str) {
         let mut guard = StreamAttemptLogGuard::new(cfg, true, "responses", provider, "client-model",
-            "upstream-model", Instant::now(), "synthetic-key", "key", ctx);
+            "upstream-model", Instant::now(), "synthetic-key", "key", "", ctx);
         guard.finish_error(StatusCode::from_u16(code).unwrap(), error);
     }
 
@@ -859,7 +934,7 @@ mod tests {
         for _ in 0..5 { failed_attempt(&cfg, &ctx, "A", 502, "same error"); }
         failed_attempt(&cfg, &ctx, "B", 502, "same error");
         let mut success = StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model",
-            "upstream-model", Instant::now(), "synthetic-key", "key", &ctx);
+            "upstream-model", Instant::now(), "synthetic-key", "key", "", &ctx);
         let success_id = success.take().unwrap();
         update_usage_log_sqlite(cfg.usage_log_sqlite_path(), success_id, "ok", "upstream-model",
             100, Some(10), "", 7, 3, "upstream").unwrap();
@@ -891,7 +966,7 @@ mod tests {
         failed_attempt(&cfg, &first, "auth:account-a", 502, "same error");
         failed_attempt(&cfg, &first, "auth:account-b", 502, "same error");
         let mut model_change = StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model",
-            "another-upstream-model", Instant::now(), "synthetic-key", "key", &first);
+            "another-upstream-model", Instant::now(), "synthetic-key", "key", "", &first);
         model_change.finish_error(StatusCode::BAD_GATEWAY, "same error");
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
         let totals: (i64, i64) = conn.query_row("SELECT COUNT(*), SUM(repeat_count) FROM usage_logs", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
@@ -903,7 +978,7 @@ mod tests {
         let cfg = merge_config();
         log_usage_sqlite_for_key(cfg.usage_log_sqlite_path(), "2026-10-26 12:00:00", "responses",
             "synthetic-key", "key", "error", "A", "client-model", "", 10, None, "same error",
-            0, 0, "upstream", "same-client-request-id").unwrap();
+            0, 0, "upstream", "same-client-request-id", "").unwrap();
         let ctx = RequestContext::detached();
         failed_attempt(&cfg, &ctx, "A", 502, "same error");
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
@@ -923,7 +998,7 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..3 {
             ids.push(log_stream_started(&cfg, "responses", "A", "client-model", "upstream-model",
-                Instant::now(), "synthetic-key", "key", "test-request").unwrap());
+                Instant::now(), "synthetic-key", "key", "test-request", "").unwrap());
         }
         for (id, duration) in ids.into_iter().zip([0, 100, 300]) {
             update_usage_log_sqlite_in_group(cfg.usage_log_sqlite_path(), id, "error", "",
@@ -941,7 +1016,7 @@ mod tests {
         let ctx = RequestContext::detached();
         for _ in 0..3 { failed_attempt(&cfg, &ctx, "A", 502, "same error"); }
         drop(StreamAttemptLogGuard::new(&cfg, true, "responses", "A", "client-model", "upstream-model",
-            Instant::now(), "synthetic-key", "key", &ctx));
+            Instant::now(), "synthetic-key", "key", "", &ctx));
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {

@@ -323,11 +323,11 @@ pub fn logs_section(
                     .show(ui, |ui| {
                         table_header(ui, "时间");
                         table_header(ui, "状态");
-                        table_header(ui, "次数");
                         table_header(ui, "API Key");
                         table_header(ui, "接口");
                         table_header(ui, "渠道");
                         table_header(ui, "模型");
+                        table_header(ui, "推理强度");
                         table_header(ui, "Token");
                         table_header(ui, "用时/首字(秒)");
                         table_header(ui, "错误");
@@ -337,12 +337,21 @@ pub fn logs_section(
                             ui.monospace(if row.last_ts.is_empty() { &row.ts } else { &row.last_ts })
                                 .on_hover_text(format!("首次：{}\n最后：{}", row.ts,
                                     if row.last_ts.is_empty() { &row.ts } else { &row.last_ts }));
-                            log_status_cell(ui, &row.status, loading_gif);
-                            ui.label(row.repeat_count.to_string());
+                            ui.horizontal(|ui| {
+                                log_status_cell(ui, &row.status, loading_gif);
+                                if row.repeat_count > 1 {
+                                    ui.label(format!("×{}", row.repeat_count));
+                                }
+                            });
                             ui.label(row.api_key_label());
                             ui.label(&row.api);
                             ui.label(&row.channel);
                             model_cell(ui, row);
+                            ui.label(if row.reasoning_effort.is_empty() {
+                                "—"
+                            } else {
+                                &row.reasoning_effort
+                            });
                             ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
                             ui.label(format!("{}{}/{}", if row.repeat_count > 1 { "累计 " } else { "" },
                                 row.display_latency(), row.first_token));
@@ -654,7 +663,7 @@ fn read_sqlite_log_page(
             SELECT
                 ts, status, api_key_name, api, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error,
-                MAX(repeat_count, 1), last_ts
+                MAX(repeat_count, 1), last_ts, reasoning_effort
             FROM usage_logs
             WHERE {}
             ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
@@ -694,6 +703,7 @@ fn read_sqlite_log_page(
                     error: row.get(11)?,
                     repeat_count: row.get(12)?,
                     last_ts: row.get(13)?,
+                    reasoning_effort: row.get(14)?,
                 })
             },
         )
@@ -712,6 +722,7 @@ pub struct LogRow {
     pub(crate) channel: String,
     pub(crate) model: String,
     pub(crate) upstream_model: String,
+    pub(crate) reasoning_effort: String,
     pub(crate) first_token: String,
     pub(crate) latency: String,
     pub(crate) input_tokens: i64,
@@ -864,6 +875,34 @@ mod tests {
             status,
             api_key_id,
         }
+    }
+
+    #[test]
+    fn log_page_loads_reasoning_effort_and_preserves_legacy_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-reasoning-{}.sqlite3", uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_logs (
+                id INTEGER PRIMARY KEY, ts TEXT NOT NULL, api TEXT NOT NULL,
+                status TEXT NOT NULL, channel TEXT NOT NULL, request_model TEXT NOT NULL,
+                latency_ms INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '',
+                token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown'
+             );
+             INSERT INTO usage_logs (ts, api, status, channel, request_model, latency_ms)
+             VALUES ('2026-07-17 10:00:00', 'responses', 'ok', 'test-channel', 'legacy-model', 100);"
+        ).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        insert_test_log(&conn, "2026-07-17 11:00:00", "key-a", "A", 3);
+        conn.execute("UPDATE usage_logs SET reasoning_effort='high' WHERE id=2", []).unwrap();
+        let filter = test_filter(LogRange::All, LogStatusFilter::All, "");
+        let (rows, total) = read_sqlite_log_page(path, filter, None, 0, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows[0].model, "gpt-test");
+        assert_eq!(rows[0].reasoning_effort, "high");
+        assert_eq!(rows[1].model, "legacy-model");
+        assert!(rows[1].reasoning_effort.is_empty());
     }
 
     #[test]

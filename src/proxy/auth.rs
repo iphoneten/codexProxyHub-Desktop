@@ -155,6 +155,7 @@ providers: []
             4,
             "upstream_or_unknown",
             "req_test",
+            "",
         )
         .unwrap();
         let state = test_state();
