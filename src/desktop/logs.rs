@@ -6,6 +6,7 @@ use super::common::{
 use super::{AppMessage, MessageKind};
 use crate::config::AppConfig;
 use crate::proxy;
+use chrono::{Datelike, Timelike};
 use eframe::egui;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,6 +17,10 @@ enum LogRange {
     SevenDays,
     ThirtyDays,
     All,
+    Custom {
+        start: chrono::NaiveDateTime,
+        end: chrono::NaiveDateTime,
+    },
 }
 
 impl Default for LogRange {
@@ -43,12 +48,22 @@ impl LogRange {
             Self::SevenDays => 6,
             Self::ThirtyDays => 29,
             Self::All => return None,
+            Self::Custom { start, .. } => {
+                return Some(start.format("%Y-%m-%d %H:%M:%S").to_string());
+            }
         };
         let start = today
             .checked_sub_signed(chrono::Duration::days(days_back))
             .unwrap_or(today)
             .and_hms_opt(0, 0, 0)?;
         Some(start.format("%Y-%m-%d %H:%M:%S").to_string())
+    }
+
+    fn end_timestamp(self) -> Option<String> {
+        match self {
+            Self::Custom { end, .. } => Some(end.format("%Y-%m-%d %H:%M:%S").to_string()),
+            _ => None,
+        }
     }
 }
 
@@ -104,6 +119,9 @@ pub struct LogViewState {
     loaded_api_key_id: String,
     loaded_status: LogStatusFilter,
     range: LogRange,
+    custom_range_open: bool,
+    custom_start: chrono::NaiveDateTime,
+    custom_end: chrono::NaiveDateTime,
     api_key_id: String,
     status: LogStatusFilter,
     pub(crate) page: usize,
@@ -115,6 +133,7 @@ pub struct LogViewState {
 
 impl Default for LogViewState {
     fn default() -> Self {
+        let today = chrono::Local::now().date_naive();
         Self {
             runtime_tab: false,
             rows: Vec::new(),
@@ -123,6 +142,9 @@ impl Default for LogViewState {
             loaded_api_key_id: String::new(),
             loaded_status: LogStatusFilter::default(),
             range: LogRange::default(),
+            custom_range_open: false,
+            custom_start: today.and_hms_opt(0, 0, 0).unwrap(),
+            custom_end: today.and_hms_opt(23, 59, 59).unwrap(),
             api_key_id: String::new(),
             status: LogStatusFilter::default(),
             page: 0,
@@ -205,9 +227,17 @@ pub fn logs_section(
             ui.separator();
             let mut changed = false;
             for (range, label) in LogRange::OPTIONS {
-                changed |= ui
-                    .selectable_value(&mut log_view.range, range, label)
-                    .changed();
+                let response = ui.selectable_value(&mut log_view.range, range, label);
+                changed |= response.changed();
+                if response.clicked() {
+                    log_view.custom_range_open = false;
+                }
+            }
+            if ui
+                .selectable_label(log_view.custom_range_open, "自定义")
+                .clicked()
+            {
+                log_view.custom_range_open = true;
             }
             egui::ComboBox::from_id_source("log_status_filter")
                 .selected_text(log_view.status.label())
@@ -236,6 +266,7 @@ pub fn logs_section(
             }
             if soft_button(ui, "清空选项").clicked() {
                 log_view.range = LogRange::All;
+                log_view.custom_range_open = false;
                 log_view.api_key_id.clear();
                 log_view.status = LogStatusFilter::All;
                 log_view.page = 0;
@@ -243,6 +274,30 @@ pub fn logs_section(
                 *message = AppMessage::new("已清空筛选选项", MessageKind::Success);
             }
         });
+        if log_view.custom_range_open {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("开始");
+                log_datetime_picker(ui, "log_custom_start", &mut log_view.custom_start);
+                ui.label("结束");
+                log_datetime_picker(ui, "log_custom_end", &mut log_view.custom_end);
+                if soft_button(ui, "查询").clicked() {
+                    if log_view.custom_start > log_view.custom_end {
+                        *message = AppMessage::new("开始时间不能晚于结束时间", MessageKind::Error);
+                    } else {
+                        log_view.range = LogRange::Custom {
+                            start: log_view.custom_start,
+                            end: log_view.custom_end,
+                        };
+                        log_view.page = 0;
+                        refresh_logs(config, log_view, Some(message));
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("按本地时间查询，包含开始和结束时间；调整后点击查询生效。")
+                    .color(muteds()),
+            );
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if confirm_delete_button(ui, "usage_logs_clear", "清空日志") {
@@ -450,6 +505,73 @@ fn normalized_api_key_name_filter<'a>(
         .filter(|name| !name.is_empty() && *name != "未命名 Key")
 }
 
+fn log_datetime_picker(ui: &mut egui::Ui, id: &str, value: &mut chrono::NaiveDateTime) {
+    ui.push_id(id, |ui| {
+        let popup_id = ui.make_persistent_id("calendar");
+        let response = soft_button(ui, &value.format("%Y-%m-%d").to_string());
+        if response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+            ui.data_mut(|data| data.insert_temp(popup_id, value.date().with_day(1).unwrap()));
+        }
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(220.0);
+                let mut month = ui
+                    .data_mut(|data| data.get_temp::<chrono::NaiveDate>(popup_id))
+                    .unwrap_or_else(|| value.date().with_day(1).unwrap());
+                ui.horizontal(|ui| {
+                    if soft_button(ui, "上月").clicked() {
+                        if let Some(previous) = month.checked_sub_months(chrono::Months::new(1)) {
+                            month = previous;
+                        }
+                    }
+                    ui.label(month.format("%Y年%m月").to_string());
+                    if soft_button(ui, "下月").clicked() {
+                        if let Some(next) = month.checked_add_months(chrono::Months::new(1)) {
+                            month = next;
+                        }
+                    }
+                });
+                ui.data_mut(|data| data.insert_temp(popup_id, month));
+                egui::Grid::new("days").show(ui, |ui| {
+                    for label in ["一", "二", "三", "四", "五", "六", "日"] {
+                        ui.label(label);
+                    }
+                    ui.end_row();
+                    let offset = month.weekday().num_days_from_monday();
+                    for _ in 0..offset {
+                        ui.label("");
+                    }
+                    for day in 1..=31 {
+                        let Some(date) = month.with_day(day) else {
+                            break;
+                        };
+                        if ui
+                            .selectable_label(value.date() == date, day.to_string())
+                            .clicked()
+                        {
+                            *value = date.and_time(value.time());
+                            ui.memory_mut(|memory| memory.close_popup());
+                        }
+                        if (offset + day) % 7 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            },
+        );
+        let (mut hour, mut minute, mut second) = (value.hour(), value.minute(), value.second());
+        ui.add(egui::DragValue::new(&mut hour).range(0..=23).suffix("时"));
+        ui.add(egui::DragValue::new(&mut minute).range(0..=59).suffix("分"));
+        ui.add(egui::DragValue::new(&mut second).range(0..=59).suffix("秒"));
+        *value = value.date().and_hms_opt(hour, minute, second).unwrap();
+    });
+}
+
 /// 「清空日志」按钮旁展示的生效范围，和实际 DELETE 使用的筛选条件一一对应。
 fn clear_scope_label(config: &AppConfig, log_view: &LogViewState) -> String {
     let range_label = LogRange::OPTIONS
@@ -457,7 +579,14 @@ fn clear_scope_label(config: &AppConfig, log_view: &LogViewState) -> String {
         .find(|(range, _)| *range == log_view.range)
         .map(|(_, label)| *label)
         .unwrap_or("全部");
-    let mut label = range_label.to_string();
+    let mut label = match log_view.range {
+        LogRange::Custom { start, end } => format!(
+            "{} 至 {}",
+            start.format("%Y-%m-%d %H:%M:%S"),
+            end.format("%Y-%m-%d %H:%M:%S")
+        ),
+        _ => range_label.to_string(),
+    };
     if log_view.status != LogStatusFilter::All {
         label.push_str(" · ");
         label.push_str(log_view.status.label());
@@ -488,6 +617,7 @@ fn clear_logs(config: &AppConfig, log_view: &mut LogViewState, message: &mut App
         api_key_filter,
         api_key_name_filter,
         filter.status.sql_kind(),
+        filter.range.end_timestamp().as_deref(),
     );
     match result {
         Ok(0) => {
@@ -582,6 +712,7 @@ fn read_sqlite_log_totals(
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     let range_start = filter.range.start_timestamp();
+    let range_end = filter.range.end_timestamp();
     let api_key_filter = normalized_api_key_filter(filter.api_key_id);
     let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
     let (input_tokens, output_tokens) = conn
@@ -596,7 +727,8 @@ fn read_sqlite_log_totals(
                 range_start.as_deref(),
                 api_key_filter,
                 api_key_name_filter,
-                filter.status.sql_kind()
+                filter.status.sql_kind(),
+                range_end.as_deref()
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -639,6 +771,7 @@ fn read_sqlite_log_page(
     proxy::ensure_usage_log_schema(&conn)
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     let range_start = filter.range.start_timestamp();
+    let range_end = filter.range.end_timestamp();
     let api_key_filter = normalized_api_key_filter(filter.api_key_id);
     let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
     let status_kind = filter.status.sql_kind();
@@ -652,7 +785,8 @@ fn read_sqlite_log_page(
                 range_start.as_deref(),
                 api_key_filter,
                 api_key_name_filter,
-                status_kind
+                status_kind,
+                range_end.as_deref()
             ],
             |row| row.get::<_, i64>(0),
         )
@@ -667,8 +801,8 @@ fn read_sqlite_log_page(
             FROM usage_logs
             WHERE {}
             ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
-            LIMIT ?5
-            OFFSET ?6
+            LIMIT ?6
+            OFFSET ?7
             "#,
             proxy::USAGE_LOG_FILTER_WHERE
         ))
@@ -680,6 +814,7 @@ fn read_sqlite_log_page(
                 api_key_filter,
                 api_key_name_filter,
                 status_kind,
+                range_end.as_deref(),
                 page_size as i64,
                 page.saturating_mul(page_size) as i64
             ],
@@ -922,6 +1057,98 @@ mod tests {
             Some("2026-06-18 00:00:00")
         );
         assert_eq!(LogRange::All.start_timestamp_for(today), None);
+        for (range, _) in LogRange::OPTIONS {
+            assert_eq!(range.end_timestamp(), None);
+        }
+    }
+
+    #[test]
+    fn custom_log_range_filters_boundaries_pagination_totals_and_deletion() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-custom-range-{}.sqlite3",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let range = LogRange::Custom {
+            start: date.and_hms_opt(10, 0, 0).unwrap(),
+            end: date.and_hms_opt(11, 0, 0).unwrap(),
+        };
+        for (ts, tokens) in [
+            ("2026-07-17 09:59:59", 1),
+            ("2026-07-17 10:00:00", 2),
+            ("2026-07-17 10:30:00", 3),
+            ("2026-07-17 11:00:00", 4),
+            ("2026-07-17 11:00:01", 5),
+        ] {
+            insert_test_log(&conn, ts, "key-a", "A", tokens);
+        }
+        insert_test_log(&conn, "2026-07-17 10:30:00", "key-b", "B", 100);
+        insert_test_log_with_status(&conn, "2026-07-17 10:30:00", "error");
+        let filter = test_filter(range, LogStatusFilter::Success, "key-a");
+        let (rows, total) = read_sqlite_log_page(path.clone(), filter, Some("A"), 0, 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts, "2026-07-17 11:00:00");
+        let (rows, total) = read_sqlite_log_page(path.clone(), filter, Some("A"), 1, 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, "2026-07-17 10:00:00");
+        let totals = read_sqlite_log_totals(path.clone(), filter, Some("A")).unwrap();
+        assert_eq!(totals.input_tokens, 9);
+        assert_eq!(totals.output_tokens, 3);
+
+        let empty_filter = test_filter(
+            LogRange::Custom {
+                start: date.and_hms_opt(12, 0, 0).unwrap(),
+                end: date.and_hms_opt(12, 0, 0).unwrap(),
+            },
+            LogStatusFilter::All,
+            "",
+        );
+        assert_eq!(
+            read_sqlite_log_page(path.clone(), empty_filter, None, 0, 20).unwrap().1,
+            0
+        );
+        assert_eq!(
+            read_sqlite_log_totals(path.clone(), empty_filter, None).unwrap().input_tokens,
+            0
+        );
+
+        insert_running_test_log(&conn, "2026-07-17 10:30:00", "key-a");
+        let removed = proxy::delete_usage_logs(
+            path.clone(),
+            range.start_timestamp().as_deref(),
+            Some("key-a"),
+            Some("A"),
+            LogStatusFilter::Success.sql_kind(),
+            range.end_timestamp().as_deref(),
+        )
+        .unwrap();
+        assert_eq!(removed, 3);
+        let removed = proxy::delete_usage_logs(
+            path.clone(),
+            range.start_timestamp().as_deref(),
+            Some("key-a"),
+            Some("A"),
+            None,
+            range.end_timestamp().as_deref(),
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM usage_logs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM usage_logs WHERE status = 'running'", [],
+                |row| row.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1070,6 +1297,7 @@ mod tests {
             None,
             None,
             LogStatusFilter::Failed.sql_kind(),
+            None,
         )
         .unwrap();
         assert_eq!(removed, 2);
@@ -1083,6 +1311,7 @@ mod tests {
             None,
             None,
             LogStatusFilter::Running.sql_kind(),
+            None,
         )
         .unwrap();
         assert_eq!(removed_running, 0);
@@ -1127,6 +1356,7 @@ mod tests {
             Some("key-a"),
             Some("A"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(removed, 1);
@@ -1141,7 +1371,7 @@ mod tests {
         assert_eq!(total, 3);
 
         // 全量清空：只剩运行中的行。
-        let removed_all = proxy::delete_usage_logs(path.clone(), None, None, None, None).unwrap();
+        let removed_all = proxy::delete_usage_logs(path.clone(), None, None, None, None, None).unwrap();
         assert_eq!(removed_all, 2);
         let (rows, total) = read_sqlite_log_page(
             path.clone(),
@@ -1163,7 +1393,7 @@ mod tests {
         assert_eq!(totals.output_tokens, 0);
 
         // 已经清空后再点一次不应该报错，也不会再删到任何行。
-        let removed_again = proxy::delete_usage_logs(path.clone(), None, None, None, None).unwrap();
+        let removed_again = proxy::delete_usage_logs(path.clone(), None, None, None, None, None).unwrap();
         assert_eq!(removed_again, 0);
 
         let _ = std::fs::remove_file(path);

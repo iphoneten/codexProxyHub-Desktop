@@ -3477,3 +3477,6 @@ TanStack Query
 Rust Core 保证性能，Provider/Account/Proxy 三层解耦保证扩展能力，Routing Engine 保证智能调度，Tauri 保证桌面体验，SQLite 保证单机简单可靠，未来再通过 Redis/PostgreSQL 扩展到多节点。
 
 这套架构比较适合你现在已经拥有的代码基础，不需要推倒重来；当前 proxy.rs 里的 Circuit Breaker、Session Affinity、OAuth Runtime Token、Usage Injection、API Key Limiter、HTTP Client Pool 都可以保留，只需要逐步把职责从 proxy.rs 中拆出来。
+
+source "$HOME/.cargo/env"
+./build-dmg.sh

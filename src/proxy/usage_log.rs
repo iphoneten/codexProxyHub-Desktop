@@ -706,7 +706,7 @@ pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusq
 /// 请求日志的公共筛选条件，读取（计数 / 分页 / 汇总）和清空共用同一份，
 /// 保证「删的就是筛选出来的」。绑定参数顺序固定为：
 /// `?1` 起始时间、`?2` api_key_id、`?3` api_key_name、`?4` 状态标记，
-/// 四个都允许传 `NULL` 表示该维度不过滤。
+/// `?5` 结束时间，五个都允许传 `NULL` 表示该维度不过滤。
 ///
 /// 状态标记用的是界面「状态」列的口径而不是数据库原始值：`success` 覆盖
 /// `ok` / `stream_started`，`running` 只匹配运行中，`aborted` 是客户端提前
@@ -714,6 +714,7 @@ pub(super) fn read_api_key_today_tokens(path: PathBuf, api_key_id: &str) -> rusq
 /// 这样不会有行从所有筛选里漏掉。
 pub(crate) const USAGE_LOG_FILTER_WHERE: &str = r#"
     (?1 IS NULL OR ts >= ?1)
+      AND (?5 IS NULL OR ts <= ?5)
       AND (
           ?2 IS NULL
           OR api_key_id = ?2
@@ -740,16 +741,22 @@ pub(super) fn delete_usage_logs(
     api_key_id: Option<&str>,
     api_key_name: Option<&str>,
     status_kind: Option<&str>,
+    range_end: Option<&str>,
 ) -> rusqlite::Result<usize> {
     let conn = open_usage_log_connection(path)?;
     ensure_usage_log_schema(&conn)?;
     let removed = conn.execute(
         &format!("DELETE FROM usage_logs WHERE status != 'running' AND {USAGE_LOG_FILTER_WHERE}"),
-        params![range_start, api_key_id, api_key_name, status_kind],
+        params![range_start, api_key_id, api_key_name, status_kind, range_end],
     )?;
     // 只在全量清空后回收磁盘空间：SQLite 删行只会把页标记为可复用，文件不会变小。
     // WAL 模式下 VACUUM 需要独占访问，代理正在写日志时会失败，忽略即可。
-    if removed > 0 && range_start.is_none() && api_key_id.is_none() && status_kind.is_none() {
+    if removed > 0
+        && range_start.is_none()
+        && range_end.is_none()
+        && api_key_id.is_none()
+        && status_kind.is_none()
+    {
         let _ = conn.execute_batch("VACUUM");
     }
     Ok(removed)

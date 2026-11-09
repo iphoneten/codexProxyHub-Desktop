@@ -100,8 +100,9 @@ pub(crate) fn delete_usage_logs(
     api_key_id: Option<&str>,
     api_key_name: Option<&str>,
     status_kind: Option<&str>,
+    range_end: Option<&str>,
 ) -> rusqlite::Result<usize> {
-    usage_log::delete_usage_logs(path, range_start, api_key_id, api_key_name, status_kind)
+    usage_log::delete_usage_logs(path, range_start, api_key_id, api_key_name, status_kind, range_end)
 }
 
 pub(crate) fn api_key_id(api_key: &str) -> String {
