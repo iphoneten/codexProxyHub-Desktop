@@ -736,6 +736,7 @@ impl StreamState {
                         if let Some(v) = u.get("output_tokens").and_then(Value::as_i64) {
                             self.usage.output = v;
                         }
+                        self.usage.accumulate_cache(u);
                     }
                 }
             }
@@ -821,6 +822,7 @@ impl StreamState {
                             self.usage.output = v;
                         }
                     }
+                    self.usage.accumulate_cache(u);
                 }
             }
             Some("message_stop") => {
@@ -837,6 +839,23 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_state_preserves_cached_usage_until_message_stop() {
+        let mut state = StreamState::new("claude-test".into());
+        state.handle_event(&json!({
+            "type":"message_start", "message":{"usage":{
+                "input_tokens":10, "output_tokens":0,
+                "cache_read_input_tokens":60, "cache_creation_input_tokens":30
+            }}
+        }));
+        state.handle_event(&json!({"type":"message_delta", "usage":{"output_tokens":2}}));
+        let out = state.handle_event(&json!({"type":"message_stop"}));
+        assert_eq!(state.usage.cached_input, 60);
+        assert_eq!(state.usage.total_input(), 100);
+        assert_eq!(out[0]["usage"]["prompt_tokens"], 10);
+        assert_eq!(out[0]["usage"]["completion_tokens"], 2);
+    }
 
     #[test]
     fn request_extracts_system_and_maps_max_tokens() {

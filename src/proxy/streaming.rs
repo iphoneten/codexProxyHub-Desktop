@@ -1449,21 +1449,11 @@ pub(super) fn response_model(value: &Value) -> Option<String> {
 }
 
 pub(super) fn extract_token_usage(value: &Value) -> TokenUsage {
-    let Some(usage) = value.get("usage") else {
-        return TokenUsage::default();
-    };
-    TokenUsage {
-        input: usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        output: usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
+    let mut tokens = TokenUsage::default();
+    if let Some(usage) = value.get("usage").or_else(|| value.get("usageMetadata")) {
+        tokens.accumulate(usage);
     }
+    tokens
 }
 
 pub(super) fn supports_include_usage_injection(path: &str) -> bool {
@@ -1497,24 +1487,7 @@ pub(super) fn accumulate_usage_from_sse_data(data: &str, target: &mut TokenUsage
         value.pointer("/response/usage"),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if let Some(v) = candidate
-            .get("input_tokens")
-            .or_else(|| candidate.get("prompt_tokens"))
-            .and_then(Value::as_i64)
-        {
-            if v > 0 {
-                target.input = v;
-            }
-        }
-        if let Some(v) = candidate
-            .get("output_tokens")
-            .or_else(|| candidate.get("completion_tokens"))
-            .and_then(Value::as_i64)
-        {
-            if v > 0 {
-                target.output = v;
-            }
-        }
+        target.accumulate(candidate);
     }
 }
 

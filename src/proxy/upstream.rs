@@ -30,7 +30,7 @@ pub(super) async fn forward_responses_as_chat(
         .await;
     }
 
-    let mut upstream =
+    let (mut upstream, usage) =
         if provider.provider_type == "anthropic" || is_google_native_provider(provider) {
             let result = send_to_provider(
                 state,
@@ -43,7 +43,7 @@ pub(super) async fn forward_responses_as_chat(
                 ctx,
             )
             .await?;
-            response_json(result.response).await?
+            (response_json(result.response).await?, result.usage)
         } else {
             let client = state.client_for_provider(provider);
             let value = send_json_to_provider(
@@ -60,7 +60,8 @@ pub(super) async fn forward_responses_as_chat(
             if let Err(msg) = validate_upstream_chat_json(&value) {
                 return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
             }
-            value
+            let usage = extract_token_usage(&value);
+            (value, usage)
         };
     if provider.strip_thought {
         strip_thought_from_chat_json(&mut upstream);
@@ -78,7 +79,6 @@ pub(super) async fn forward_responses_as_chat(
             .unwrap_or_default()
             .to_string()
     });
-    let usage = extract_token_usage(&wrapped);
     Ok(ProviderResult {
         response: (StatusCode::OK, Json(wrapped)).into_response(),
         upstream_model,
@@ -125,18 +125,23 @@ pub(super) async fn send_chat_stream_as_responses(
             ctx,
         )
         .await?;
+        let usage_rx = result.usage_rx;
         let stream = result
             .response
             .into_body()
             .into_data_stream()
             .map(|item| item.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
-        return chat_sse_stream_to_responses(
+        let mut result = chat_sse_stream_to_responses(
             stream,
             request_model,
             custom_tool_names,
             started,
             ctx.cancel_token(),
-        );
+        )?;
+        if usage_rx.is_some() {
+            result.usage_rx = usage_rx;
+        }
+        return Ok(result);
     }
     if provider.provider_type == "anthropic" {
         let client = state.client_for_provider(provider);
@@ -768,6 +773,7 @@ pub(super) async fn send_to_anthropic_provider(
                 if let Err(msg) = validate_upstream_anthropic_json(&value) {
                     return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
                 }
+                let usage = extract_token_usage(&value);
                 let mut translated =
                     crate::anthropic::anthropic_to_openai_response(value, &request_model);
                 if provider.strip_thought {
@@ -778,7 +784,6 @@ pub(super) async fn send_to_anthropic_provider(
                     .and_then(Value::as_str)
                     .unwrap_or(&request_model)
                     .to_string();
-                let usage = extract_token_usage(&translated);
                 return Ok(ProviderResult {
                     response: (StatusCode::OK, Json(translated)).into_response(),
                     upstream_model,
@@ -904,12 +909,12 @@ pub(super) async fn send_to_google_ai_provider(
                         "Google AI 响应缺少 candidates",
                     ));
                 }
+                let usage = extract_token_usage(&value);
                 let mut translated =
                     crate::google_ai::google_to_openai_response(value, &request_model);
                 if provider.strip_thought {
                     strip_thought_from_chat_json(&mut translated);
                 }
-                let usage = extract_token_usage(&translated);
                 return Ok(ProviderResult {
                     response: (StatusCode::OK, Json(translated)).into_response(),
                     upstream_model: request_model,
@@ -1100,6 +1105,7 @@ pub(super) async fn send_chat_via_responses(
                 if let Err(msg) = validate_upstream_response_json(&value) {
                     return Err(ProxyError::new(StatusCode::BAD_GATEWAY, msg));
                 }
+                let usage = extract_token_usage(&value);
                 let translated =
                     crate::responses_api::responses_to_chat_response(value, &request_model);
                 let upstream_model = translated
@@ -1107,7 +1113,6 @@ pub(super) async fn send_chat_via_responses(
                     .and_then(Value::as_str)
                     .unwrap_or(&request_model)
                     .to_string();
-                let usage = extract_token_usage(&translated);
                 return Ok(ProviderResult {
                     response: (StatusCode::OK, Json(translated)).into_response(),
                     upstream_model,

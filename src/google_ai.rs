@@ -541,6 +541,7 @@ fn accumulate_google_usage(value: Option<&Value>, usage: &mut TokenUsage) {
         .unwrap_or(usage.output);
     usage.input = input;
     usage.output = output;
+    usage.accumulate_cache(value);
 }
 
 async fn send_sse(
@@ -597,6 +598,17 @@ fn plain_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_usage_is_preserved_when_later_chunks_omit_metadata() {
+        let mut usage = TokenUsage::default();
+        accumulate_google_usage(Some(&json!({"promptTokenCount":100,"cachedContentTokenCount":60})), &mut usage);
+        accumulate_google_usage(Some(&json!({"candidatesTokenCount":2})), &mut usage);
+        accumulate_google_usage(None, &mut usage);
+        assert_eq!(usage.total_input(), 100);
+        assert_eq!(usage.cached_input, 60);
+        assert_eq!(usage.output, 2);
+    }
 
     #[test]
     fn translates_chat_request_to_google_contents() {

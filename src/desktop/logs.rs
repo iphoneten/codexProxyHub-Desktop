@@ -178,6 +178,16 @@ impl LogViewState {
 pub struct LogTotals {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
+}
+
+pub(super) fn cache_hit_rate(input_tokens: i64, cached_input_tokens: i64) -> String {
+    let rate = if input_tokens > 0 {
+        cached_input_tokens.max(0) as f64 / input_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    format!("{rate:.2}%")
 }
 
 pub fn logs_section(
@@ -335,6 +345,20 @@ pub fn logs_section(
                 "",
                 good(),
             );
+            metric_tile(
+                ui,
+                "缓存命中 Token",
+                &format_compact_tokens(totals.cached_input_tokens),
+                "当前筛选范围内的缓存读取 token",
+                accent(),
+            );
+            metric_tile(
+                ui,
+                "缓存命中率",
+                &cache_hit_rate(totals.input_tokens, totals.cached_input_tokens),
+                "缓存命中 token / 总输入 token",
+                good(),
+            );
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -379,10 +403,8 @@ pub fn logs_section(
                         table_header(ui, "时间");
                         table_header(ui, "状态");
                         table_header(ui, "API Key");
-                        table_header(ui, "接口");
-                        table_header(ui, "渠道");
+                        table_header(ui, "渠道/接口");
                         table_header(ui, "模型");
-                        table_header(ui, "推理强度");
                         table_header(ui, "Token");
                         table_header(ui, "用时/首字(秒)");
                         table_header(ui, "错误");
@@ -399,15 +421,35 @@ pub fn logs_section(
                                 }
                             });
                             ui.label(row.api_key_label());
-                            ui.label(&row.api);
-                            ui.label(&row.channel);
-                            model_cell(ui, row);
-                            ui.label(if row.reasoning_effort.is_empty() {
-                                "—"
-                            } else {
-                                &row.reasoning_effort
+                            ui.vertical(|ui| {
+                                ui.set_width(200.0);
+                                let channel = middle_ellipsis(ui, &row.channel, 200.0);
+                                ui.add(egui::Label::new(channel).extend())
+                                    .on_hover_text(&row.channel);
+                                if !row.api.trim().is_empty() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(6.0);
+                                        forward_arrow(ui);
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(&row.api).size(11.0).color(muteds()),
+                                        ).truncate()).on_hover_text(&row.api);
+                                    });
+                                }
                             });
-                            ui.label(format!("{}/{}", row.input_tokens, row.output_tokens));
+                            model_cell(ui, row);
+                            ui.vertical(|ui| {
+                                ui.label(format!("{}/{}", row.input_tokens, row.output_tokens))
+                                    .on_hover_text("输入 / 输出 Token");
+                                ui.label(egui::RichText::new(format!(
+                                    "缓存 {} · {}",
+                                    format_compact_tokens(row.cached_input_tokens),
+                                    cache_hit_rate(row.input_tokens, row.cached_input_tokens),
+                                )).size(11.0).color(muteds()))
+                                    .on_hover_text(format!(
+                                        "缓存命中 Token：{}\n命中率 = 缓存命中 Token / 总输入 Token",
+                                        row.cached_input_tokens,
+                                    ));
+                            });
                             ui.label(format!("{}{}/{}", if row.repeat_count > 1 { "累计 " } else { "" },
                                 row.display_latency(), row.first_token));
                             let err_display = if row.error.chars().count() > 30 {
@@ -715,10 +757,11 @@ fn read_sqlite_log_totals(
     let range_end = filter.range.end_timestamp();
     let api_key_filter = normalized_api_key_filter(filter.api_key_id);
     let api_key_name_filter = normalized_api_key_name_filter(api_key_filter, api_key_name);
-    let (input_tokens, output_tokens) = conn
+    let (input_tokens, output_tokens, cached_input_tokens) = conn
         .query_row(
             &format!(
-                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cached_input_tokens), 0)
                  FROM usage_logs
                  WHERE {}",
                 proxy::USAGE_LOG_FILTER_WHERE
@@ -730,12 +773,13 @@ fn read_sqlite_log_totals(
                 filter.status.sql_kind(),
                 range_end.as_deref()
             ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
         )
         .map_err(|err| format!("汇总 SQLite Token 失败: {err}"))?;
     Ok(LogTotals {
         input_tokens,
         output_tokens,
+        cached_input_tokens,
     })
 }
 
@@ -797,7 +841,7 @@ fn read_sqlite_log_page(
             SELECT
                 ts, status, api_key_name, api, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error,
-                MAX(repeat_count, 1), last_ts, reasoning_effort
+                MAX(repeat_count, 1), last_ts, reasoning_effort, cached_input_tokens
             FROM usage_logs
             WHERE {}
             ORDER BY COALESCE(NULLIF(last_ts, ''), ts) DESC, id DESC
@@ -839,6 +883,7 @@ fn read_sqlite_log_page(
                     repeat_count: row.get(12)?,
                     last_ts: row.get(13)?,
                     reasoning_effort: row.get(14)?,
+                    cached_input_tokens: row.get(15)?,
                 })
             },
         )
@@ -862,6 +907,7 @@ pub struct LogRow {
     pub(crate) latency: String,
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
+    pub(crate) cached_input_tokens: i64,
     pub(crate) error: String,
     pub(crate) repeat_count: i64,
     pub(crate) last_ts: String,
@@ -890,9 +936,45 @@ impl LogRow {
     }
 }
 
+fn middle_ellipsis(ui: &egui::Ui, text: &str, width: f32) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let fits = |text: &str| {
+        ui.painter().layout_no_wrap(text.to_string(), font.clone(), ui.visuals().text_color())
+            .size().x <= width
+    };
+    if fits(&text) {
+        return text;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    let mut result = "…".to_string();
+    while low < high {
+        let keep = (low + high) / 2;
+        let prefix: String = chars[..keep.div_ceil(2)].iter().collect();
+        let suffix: String = chars[chars.len() - keep / 2..].iter().collect();
+        let candidate = format!("{prefix}…{suffix}");
+        if fits(&candidate) {
+            result = candidate;
+            low = keep + 1;
+        } else {
+            high = keep;
+        }
+    }
+    result
+}
+
 fn model_cell(ui: &mut egui::Ui, row: &LogRow) {
     ui.vertical(|ui| {
-        ui.label(&row.model);
+        ui.horizontal(|ui| {
+            ui.label(&row.model);
+            let effort = row.reasoning_effort.trim();
+            if !effort.is_empty() {
+                ui.label(egui::RichText::new(format!("({effort})")).size(11.0).color(muteds()))
+                    .on_hover_text("推理强度");
+            }
+        });
         let upstream = row.upstream_model.trim();
         if !upstream.is_empty() && upstream != row.model.trim() {
             ui.horizontal(|ui| {
@@ -948,6 +1030,30 @@ fn log_status_cell(ui: &mut egui::Ui, status: &str, loading_gif: Option<&Animate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_name_ellipsis_preserves_both_ends_and_fits_one_line() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(middle_ellipsis(ui, "渠道 A", 200.0), "渠道 A");
+                assert_eq!(middle_ellipsis(ui, "渠道\nA", 200.0), "渠道 A");
+                for name in [
+                    format!("渠道{}账号", "测试名称".repeat(30)),
+                    format!("provider-{}-account", "long-name-".repeat(30)),
+                ] {
+                    let display = middle_ellipsis(ui, &name, 200.0);
+                    assert!(display.contains('…'));
+                    assert!(display.starts_with(name.chars().next().unwrap()));
+                    assert!(display.ends_with(name.chars().last().unwrap()));
+                    let galley = ui.painter().layout_no_wrap(display,
+                        egui::TextStyle::Body.resolve(ui.style()), ui.visuals().text_color());
+                    assert!(galley.size().x <= 200.0);
+                    assert_eq!(galley.rows.len(), 1);
+                }
+            });
+        });
+    }
 
     fn insert_test_log(
         conn: &rusqlite::Connection,
@@ -1038,6 +1144,38 @@ mod tests {
         assert_eq!(rows[0].reasoning_effort, "high");
         assert_eq!(rows[1].model, "legacy-model");
         assert!(rows[1].reasoning_effort.is_empty());
+        assert_eq!(rows[1].cached_input_tokens, 0);
+        assert_eq!(cache_hit_rate(rows[1].input_tokens, rows[1].cached_input_tokens), "0.00%");
+    }
+
+    #[test]
+    fn cached_tokens_and_hit_rate_follow_filters_across_pages() {
+        let path = std::env::temp_dir().join(format!(
+            "routehub-log-cache-{}.sqlite3", uuid::Uuid::new_v4().simple()
+        ));
+        let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
+        proxy::ensure_usage_log_schema(&conn).unwrap();
+        insert_test_log(&conn, "2026-07-17 10:00:00", "key-a", "A", 100);
+        insert_test_log(&conn, "2026-07-17 11:00:00", "key-a", "A", 900);
+        insert_test_log(&conn, "2026-07-17 12:00:00", "key-b", "B", 1000);
+        insert_test_log(&conn, "2026-07-17 13:00:00", "key-a", "A", 100);
+        conn.execute_batch(
+            "UPDATE usage_logs SET cached_input_tokens = 100 WHERE id = 1;
+             UPDATE usage_logs SET cached_input_tokens = 900 WHERE id = 3;
+             UPDATE usage_logs SET status = 'error', cached_input_tokens = 50 WHERE id = 4;"
+        ).unwrap();
+        let filter = test_filter(LogRange::All, LogStatusFilter::Success, "key-a");
+        let (rows, total) = read_sqlite_log_page(path.clone(), filter, Some("A"), 1, 1).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows[0].cached_input_tokens, 100);
+        assert_eq!(cache_hit_rate(rows[0].input_tokens, rows[0].cached_input_tokens), "100.00%");
+        let totals = read_sqlite_log_totals(path.clone(), filter, Some("A")).unwrap();
+        assert_eq!(totals.input_tokens, 1000);
+        assert_eq!(totals.cached_input_tokens, 100);
+        assert_eq!(cache_hit_rate(totals.input_tokens, totals.cached_input_tokens), "10.00%");
+        let empty = read_sqlite_log_totals(path, test_filter(LogRange::All, LogStatusFilter::All, "missing"), None).unwrap();
+        assert_eq!(empty.cached_input_tokens, 0);
+        assert_eq!(cache_hit_rate(empty.input_tokens, empty.cached_input_tokens), "0.00%");
     }
 
     #[test]

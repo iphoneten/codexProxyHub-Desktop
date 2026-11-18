@@ -1040,6 +1040,7 @@ impl StreamState {
     }
 
     fn accumulate_usage(&mut self, u: &Value) {
+        self.usage.accumulate_cache(u);
         if let Some(v) = u
             .get("input_tokens")
             .or_else(|| u.get("prompt_tokens"))
@@ -1466,7 +1467,7 @@ mod tests {
             "type": "response.completed",
             "response": {
                 "status": "completed",
-                "usage": {"input_tokens": 1, "output_tokens": 1}
+                "usage": {"input_tokens": 1, "output_tokens": 1, "input_tokens_details":{"cached_tokens":1}}
             }
         });
         let bytes = Bytes::from(format!("data: {event}\n\n"));
@@ -1492,6 +1493,7 @@ mod tests {
         assert!(outcome.error.is_none());
         assert_eq!(outcome.usage.input, 1);
         assert_eq!(outcome.usage.output, 1);
+        assert_eq!(outcome.usage.cached_input, 1);
     }
 
     #[tokio::test]

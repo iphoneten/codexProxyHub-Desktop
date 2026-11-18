@@ -22,7 +22,7 @@ fn main() -> eframe::Result<()> {
     let window_title = format!("RouteHub v{}", app_version());
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1180.0, 760.0])
+        .with_inner_size([1440.0, 760.0])
         .with_min_inner_size([980.0, 640.0]);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);

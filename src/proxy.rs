@@ -503,6 +503,59 @@ fn build_http_client(connect_timeout: u64, proxy_url: Option<&str>) -> Client {
 pub(crate) struct TokenUsage {
     pub input: i64,
     pub output: i64,
+    pub cached_input: i64,
+    // Anthropic 的 input_tokens 不包含缓存读取和写入，单独保留以免改写客户端响应。
+    cache_input: i64,
+}
+
+impl TokenUsage {
+    pub(crate) fn total_input(&self) -> i64 {
+        self.input.saturating_add(self.cache_input)
+    }
+
+    pub(crate) fn accumulate(&mut self, usage: &Value) {
+        if let Some(input) = usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .or_else(|| usage.get("promptTokenCount"))
+            .and_then(Value::as_i64)
+        {
+            if input > 0 {
+                self.input = input;
+            }
+        }
+        if let Some(output) = usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .or_else(|| usage.get("candidatesTokenCount"))
+            .and_then(Value::as_i64)
+        {
+            if output > 0 {
+                self.output = output;
+            }
+        }
+        self.accumulate_cache(usage);
+    }
+
+    pub(crate) fn accumulate_cache(&mut self, usage: &Value) {
+        let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
+        let cache_creation = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+        if cache_read.is_some() || cache_creation.is_some() {
+            let creation = cache_creation
+                .unwrap_or(self.cache_input.saturating_sub(self.cached_input))
+                .max(0);
+            self.cached_input = cache_read.unwrap_or(self.cached_input).max(0);
+            self.cache_input = self.cached_input.saturating_add(creation);
+        } else if let Some(cached) = usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+            .or_else(|| usage.get("prompt_cache_hit_tokens"))
+            .or_else(|| usage.get("cachedContentTokenCount"))
+            .and_then(Value::as_i64)
+        {
+            self.cached_input = cached.max(0);
+        }
+    }
 }
 
 pub(crate) struct StreamOutcome {

@@ -511,6 +511,7 @@ mod tests {
             "",
             6,
             4,
+            0,
             "upstream_or_unknown",
             "synthetic-request",
             "",
@@ -642,7 +643,7 @@ mod tests {
         log_usage(&cfg, Instant::now(), UsageLogEvent {
             api: "messages", api_key_id: &token_id, api_key_name: "retry-test",
             provider: "A", model: "test-model", upstream_model: "test-model", status: "ok",
-            error: None, usage: TokenUsage { input: 1, output: 0 }, first_token_ms: None,
+            error: None, usage: TokenUsage { input: 1, output: 0, ..TokenUsage::default() }, first_token_ms: None,
             token_source: None, request_id: "synthetic-estimate-setup",
             reasoning_effort: "",
         });

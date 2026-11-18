@@ -553,7 +553,7 @@ impl eframe::App for HubApp {
                                 });
                         }
                         AppView::Logs => {
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     logs::logs_section(
@@ -635,7 +635,12 @@ fn top_bar(ui: &mut egui::Ui, app: &mut HubApp) {
 
                 if let Some(ref config) = app.config {
                     let enabled_providers = config.providers.iter().filter(|p| p.enabled).count();
-                    let model_count = auth::available_model_names(config).len();
+                    let model_count = auth::available_model_names(config)
+                        .iter()
+                        .map(|model| model.trim_start_matches("models/"))
+                        .filter(|model| !model.is_empty())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
                     let (auth_status, auth_color) = if config.auth.enabled {
                         ("开启", common::good())
                     } else {

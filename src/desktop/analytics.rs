@@ -1,6 +1,7 @@
 use super::common::{
     accent, format_compact_tokens, good, heading_color, muteds, section, stat_color,
 };
+use super::logs::cache_hit_rate;
 use super::*;
 use std::collections::HashMap;
 
@@ -131,6 +132,21 @@ pub(super) fn overview_analytics_section(
                     analytics.data.totals.input_tokens + analytics.data.totals.output_tokens,
                 ),
                 "输入 + 输出",
+            );
+            analytics_stat(
+                ui,
+                "缓存命中 Token",
+                &format_compact_tokens(analytics.data.totals.cached_input_tokens),
+                "当前范围缓存读取 Token",
+            );
+            analytics_stat(
+                ui,
+                "缓存命中率",
+                &cache_hit_rate(
+                    analytics.data.totals.input_tokens,
+                    analytics.data.totals.cached_input_tokens,
+                ),
+                "缓存命中 / 总输入 Token",
             );
         });
         ui.add_space(10.0);
@@ -279,11 +295,12 @@ fn read_overview_analytics(
         .map_err(|err| format!("初始化 SQLite 日志表失败: {err}"))?;
     let range_start = range.start_timestamp();
 
-    let (total_requests, avg_latency, input_tokens, output_tokens) = conn
+    let (total_requests, avg_latency, input_tokens, output_tokens, cached_input_tokens) = conn
         .query_row(
             "SELECT COALESCE(SUM(MAX(repeat_count, 1)), 0),
                     COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(CASE WHEN latency_ms > 0 THEN MAX(latency_samples, 1) ELSE 0 END), 0), 0),
-                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0)
              FROM usage_logs
              WHERE (?1 IS NULL OR ts >= ?1)",
             rusqlite::params![range_start.as_deref()],
@@ -293,6 +310,7 @@ fn read_overview_analytics(
                     row.get::<_, f64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
@@ -304,6 +322,7 @@ fn read_overview_analytics(
         totals: LogTotals {
             input_tokens,
             output_tokens,
+            cached_input_tokens,
         },
         status_counts: read_group_counts(
             &conn,
@@ -463,7 +482,7 @@ mod tests {
         let conn = proxy::open_usage_log_connection(path.clone()).unwrap();
         proxy::ensure_usage_log_schema(&conn).unwrap();
         let today = chrono::Local::now().date_naive();
-        for (days_back, tokens) in [(0, 10), (3, 20), (15, 30), (40, 40)] {
+        for (days_back, tokens, cached) in [(0, 10, 10), (3, 20, 0), (15, 30, 15), (40, 40, 5)] {
             let date = today
                 .checked_sub_signed(chrono::Duration::days(days_back))
                 .unwrap();
@@ -477,12 +496,12 @@ mod tests {
                 INSERT INTO usage_logs
                     (ts, api, status, channel, request_model, upstream_model,
                      latency_ms, first_token_ms, input_tokens, output_tokens, error,
-                     token_source, api_key_id, api_key_name)
+                     token_source, api_key_id, api_key_name, cached_input_tokens)
                 VALUES
                     (?1, 'responses', 'ok', 'test-provider', 'gpt-test', 'gpt-test',
-                     100, 50, ?2, 0, '', 'upstream', 'key-id', 'test-key')
+                     100, 50, ?2, 0, '', 'upstream', 'key-id', 'test-key', ?3)
                 "#,
-                rusqlite::params![ts, tokens],
+                rusqlite::params![ts, tokens, cached],
             )
             .unwrap();
         }
@@ -509,6 +528,18 @@ mod tests {
         let all = read_overview_analytics(path.clone(), AnalyticsRange::All).unwrap();
         assert_eq!(all.total_requests, 4);
         assert_eq!(all.channel_usage["test-provider"].requests, 4);
+
+        for (range, input, cached, rate) in [
+            (AnalyticsRange::Today, 10, 10, "100.00%"),
+            (AnalyticsRange::SevenDays, 30, 10, "33.33%"),
+            (AnalyticsRange::ThirtyDays, 60, 25, "41.67%"),
+            (AnalyticsRange::All, 100, 30, "30.00%"),
+        ] {
+            let data = read_overview_analytics(path.clone(), range).unwrap();
+            assert_eq!(data.totals.input_tokens, input);
+            assert_eq!(data.totals.cached_input_tokens, cached);
+            assert_eq!(cache_hit_rate(data.totals.input_tokens, data.totals.cached_input_tokens), rate);
+        }
 
         let _ = std::fs::remove_file(path);
     }

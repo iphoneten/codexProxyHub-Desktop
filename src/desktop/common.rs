@@ -201,18 +201,20 @@ pub fn metric_tile(
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
-            ui.set_min_width(180.0);
-            ui.horizontal(|ui| {
-                metric_icon(ui, color);
-                ui.label(egui::RichText::new(label).size(12.0).color(muteds()));
+            ui.vertical(|ui| {
+                ui.set_min_width(180.0);
+                ui.horizontal(|ui| {
+                    metric_icon(ui, color);
+                    ui.label(egui::RichText::new(label).size(12.0).color(muteds()));
+                });
+                ui.label(
+                    egui::RichText::new(value)
+                        .size(28.0)
+                        .strong()
+                        .color(stat_color()),
+                );
+                ui.label(egui::RichText::new(detail).size(12.0).color(muteds()));
             });
-            ui.label(
-                egui::RichText::new(value)
-                    .size(28.0)
-                    .strong()
-                    .color(stat_color()),
-            );
-            ui.label(egui::RichText::new(detail).size(12.0).color(muteds()));
         });
 }
 

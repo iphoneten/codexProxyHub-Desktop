@@ -151,6 +151,7 @@ pub(super) fn log_stream_started(
         "",
         0,
         0,
+        0,
         "upstream_or_unknown",
         request_id,
         reasoning_effort,
@@ -380,7 +381,7 @@ fn finish_failed_attempt_log_in_group(
         config.usage_log_sqlite_path(),
         id,
         status, "", started.elapsed().as_millis() as i64, None,
-        error, 0, 0, "upstream_or_unknown", group,
+        error, 0, 0, 0, "upstream_or_unknown", group,
     )
     .is_err()
     {
@@ -414,8 +415,9 @@ pub(super) fn update_usage_log(
         started.elapsed().as_millis() as i64,
         event.first_token_ms,
         event.error.unwrap_or(""),
-        event.usage.input,
+        event.usage.total_input(),
         event.usage.output,
+        event.usage.cached_input,
         event.token_source.unwrap_or("upstream_or_unknown"),
     )
 }
@@ -472,8 +474,9 @@ pub(super) fn log_usage(config: &AppConfig, started: Instant, event: UsageLogEve
         latency_ms,
         event.first_token_ms,
         error,
-        event.usage.input,
+        event.usage.total_input(),
         event.usage.output,
+        event.usage.cached_input,
         token_source,
         event.request_id,
         event.reasoning_effort,
@@ -532,6 +535,7 @@ pub(super) fn log_usage_sqlite(
         error,
         input_tokens,
         output_tokens,
+        0,
         token_source,
         "",
         "",
@@ -554,6 +558,7 @@ pub(super) fn log_usage_sqlite_for_key(
     error: &str,
     input_tokens: i64,
     output_tokens: i64,
+    cached_input_tokens: i64,
     token_source: &str,
     request_id: &str,
     reasoning_effort: &str,
@@ -566,10 +571,10 @@ pub(super) fn log_usage_sqlite_for_key(
             (
                 ts, api, status, channel, request_model, upstream_model,
                 latency_ms, first_token_ms, input_tokens, output_tokens, error, token_source,
-                api_key_id, api_key_name, request_id, reasoning_effort
+                api_key_id, api_key_name, request_id, reasoning_effort, cached_input_tokens
             )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         "#,
         params![
             ts,
@@ -587,7 +592,8 @@ pub(super) fn log_usage_sqlite_for_key(
             api_key_id,
             api_key_name,
             request_id,
-            reasoning_effort
+            reasoning_effort,
+            cached_input_tokens
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -604,10 +610,11 @@ pub(super) fn update_usage_log_sqlite(
     error: &str,
     input_tokens: i64,
     output_tokens: i64,
+    cached_input_tokens: i64,
     token_source: &str,
 ) -> rusqlite::Result<usize> {
     update_usage_log_sqlite_in_group(path, id, status, upstream_model, latency_ms,
-        first_token_ms, error, input_tokens, output_tokens, token_source, "")
+        first_token_ms, error, input_tokens, output_tokens, cached_input_tokens, token_source, "")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -621,6 +628,7 @@ fn update_usage_log_sqlite_in_group(
     error: &str,
     input_tokens: i64,
     output_tokens: i64,
+    cached_input_tokens: i64,
     token_source: &str,
     group: &str,
 ) -> rusqlite::Result<usize> {
@@ -633,7 +641,7 @@ fn update_usage_log_sqlite_in_group(
         UPDATE usage_logs
         SET status = ?1, upstream_model = ?2, latency_ms = ?3, first_token_ms = ?4,
             input_tokens = ?5, output_tokens = ?6, error = ?7, token_source = ?8,
-            last_ts = ?10, failure_group = ?11,
+            last_ts = ?10, failure_group = ?11, cached_input_tokens = ?12,
             latency_samples = CASE WHEN ?3 > 0 THEN 1 ELSE 0 END
         WHERE id = ?9
         "#,
@@ -649,11 +657,12 @@ fn update_usage_log_sqlite_in_group(
             id,
             last_ts,
             group,
+            cached_input_tokens,
         ],
     )?;
     // 只合并本请求新生成、无业务输出/用量的重复失败；成功、取消与旧记录不参与。
     if updated > 0 && status == "error" && !group.is_empty()
-        && first_token_ms.is_none() && input_tokens == 0 && output_tokens == 0
+        && first_token_ms.is_none() && input_tokens == 0 && output_tokens == 0 && cached_input_tokens == 0
     {
         use rusqlite::OptionalExtension;
         let current: (String, i64, i64, i64) = tx.query_row(
@@ -663,7 +672,7 @@ fn update_usage_log_sqlite_in_group(
         let previous: Option<(i64, i64, i64, i64)> = tx.query_row(
             "SELECT id, repeat_count, latency_ms, latency_samples FROM usage_logs
              WHERE failure_group = ?1 AND failure_group != '' AND status = 'error' AND id != ?2
-               AND first_token_ms IS NULL AND input_tokens = 0 AND output_tokens = 0
+               AND first_token_ms IS NULL AND input_tokens = 0 AND output_tokens = 0 AND cached_input_tokens = 0
                AND substr(ts, 1, 10) = substr(?3, 1, 10)
              ORDER BY id LIMIT 1",
             params![group, id, current.0],
@@ -829,6 +838,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
             first_token_ms INTEGER,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0,
             error TEXT NOT NULL DEFAULT '',
             token_source TEXT NOT NULL DEFAULT 'upstream_or_unknown',
             api_key_id TEXT NOT NULL DEFAULT '',
@@ -844,6 +854,7 @@ pub fn ensure_usage_log_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "first_token_ms", "INTEGER")?;
     ensure_column(conn, "input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "output_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "cached_input_tokens", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "api_key_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "api_key_name", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "request_id", "TEXT NOT NULL DEFAULT ''")?;
@@ -889,6 +900,31 @@ mod tests {
     }
 
     #[test]
+    fn cached_usage_is_persisted_for_json_and_stream_logs() {
+        let cfg = merge_config();
+        let started = Instant::now();
+        let usage = extract_token_usage(&json!({"usage":{
+            "input_tokens":10, "output_tokens":2,
+            "cache_read_input_tokens":60, "cache_creation_input_tokens":30
+        }}));
+        log_success(&cfg, "messages", "A", "client-model", "upstream-model",
+            usage, started, None, false, "", "", "json", "");
+        let id = log_stream_started(&cfg, "messages", "A", "client-model", "upstream-model",
+            started, "", "", "stream", "").unwrap();
+        update_usage_log(&cfg, id, started, &UsageLogEvent {
+            api: "messages", api_key_id: "", api_key_name: "", provider: "A",
+            model: "client-model", upstream_model: "upstream-model", status: "ok", error: None,
+            usage, first_token_ms: Some(10), token_source: None, request_id: "stream", reasoning_effort: "",
+        }).unwrap();
+        let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
+        let rows: Vec<(String, i64, i64, i64)> = conn.prepare(
+            "SELECT status, input_tokens, output_tokens, cached_input_tokens FROM usage_logs ORDER BY id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows, vec![("ok".into(), 100, 2, 60), ("ok".into(), 100, 2, 60)]);
+    }
+
+    #[test]
     fn request_logs_preserve_reasoning_effort_and_model_names() {
         let cfg = merge_config();
         let started = Instant::now();
@@ -914,7 +950,7 @@ mod tests {
             ).unwrap();
             assert_eq!(running, ("running".into(), expected.into()));
             update_usage_log_sqlite(cfg.usage_log_sqlite_path(), id, "ok", "upstream-model",
-                100, Some(10), "", 3, 2, "upstream").unwrap();
+                100, Some(10), "", 3, 2, 0, "upstream").unwrap();
             let rows: Vec<(String, String, String, String)> = conn.prepare(
                 "SELECT status, request_model, upstream_model, reasoning_effort
                  FROM usage_logs ORDER BY id DESC LIMIT 3",
@@ -944,7 +980,7 @@ mod tests {
             "upstream-model", Instant::now(), "synthetic-key", "key", "", &ctx);
         let success_id = success.take().unwrap();
         update_usage_log_sqlite(cfg.usage_log_sqlite_path(), success_id, "ok", "upstream-model",
-            100, Some(10), "", 7, 3, "upstream").unwrap();
+            100, Some(10), "", 7, 3, 0, "upstream").unwrap();
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
         let totals: (i64, i64, i64) = conn.query_row(
             "SELECT COUNT(*), SUM(repeat_count), SUM(input_tokens + output_tokens) FROM usage_logs", [],
@@ -985,7 +1021,7 @@ mod tests {
         let cfg = merge_config();
         log_usage_sqlite_for_key(cfg.usage_log_sqlite_path(), "2026-10-26 12:00:00", "responses",
             "synthetic-key", "key", "error", "A", "client-model", "", 10, None, "same error",
-            0, 0, "upstream", "same-client-request-id", "").unwrap();
+            0, 0, 0, "upstream", "same-client-request-id", "").unwrap();
         let ctx = RequestContext::detached();
         failed_attempt(&cfg, &ctx, "A", 502, "same error");
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
@@ -1009,7 +1045,7 @@ mod tests {
         }
         for (id, duration) in ids.into_iter().zip([0, 100, 300]) {
             update_usage_log_sqlite_in_group(cfg.usage_log_sqlite_path(), id, "error", "",
-                duration, None, "same error", 0, 0, "upstream", "test-scoped-group").unwrap();
+                duration, None, "same error", 0, 0, 0, "upstream", "test-scoped-group").unwrap();
         }
         let conn = open_usage_log_connection(cfg.usage_log_sqlite_path()).unwrap();
         let row: (i64, i64, i64) = conn.query_row("SELECT repeat_count, latency_ms, latency_samples FROM usage_logs", [],

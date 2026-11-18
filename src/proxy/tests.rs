@@ -1628,7 +1628,7 @@ async fn stream_usage_probe_reports_unfinished_stream_as_error() {
 #[tokio::test]
 async fn stream_usage_probe_records_first_token_and_total_usage() {
     let first = json!({"choices":[{"delta":{"content":"hi"}}]});
-    let second = json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}});
+    let second = json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}});
     let bytes = Bytes::from(format!(
         "data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n"
     ));
@@ -1650,6 +1650,7 @@ async fn stream_usage_probe_records_first_token_and_total_usage() {
     assert!(outcome.first_token_ms.is_some());
     assert_eq!(outcome.usage.input, 2);
     assert_eq!(outcome.usage.output, 3);
+    assert_eq!(outcome.usage.cached_input, 1);
 }
 
 #[tokio::test]
@@ -1658,7 +1659,7 @@ async fn responses_stream_usage_probe_counts_completed_event_usage() {
     let completed = json!({
         "type": "response.completed",
         "response": {
-            "usage": {"input_tokens": 11, "output_tokens": 7}
+            "usage": {"input_tokens": 11, "output_tokens": 7, "input_tokens_details":{"cached_tokens":8}}
         }
     });
     let bytes = Bytes::from(format!("data: {first}\n\ndata: {completed}\n\n"));
@@ -1679,6 +1680,7 @@ async fn responses_stream_usage_probe_counts_completed_event_usage() {
     assert!(outcome.error.is_none());
     assert_eq!(outcome.usage.input, 11);
     assert_eq!(outcome.usage.output, 7);
+    assert_eq!(outcome.usage.cached_input, 8);
 }
 
 #[tokio::test]
@@ -1907,6 +1909,68 @@ async fn stream_watchdog_reports_max_duration_after_first_output() {
 }
 
 #[test]
+fn token_usage_extracts_cached_input_for_supported_protocols() {
+    for (value, total, cached) in [
+        (json!({"usage":{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":60}}}), 100, 60),
+        (json!({"usage":{"input_tokens":100,"output_tokens":2,"input_tokens_details":{"cached_tokens":60}}}), 100, 60),
+        (json!({"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":60,"cache_creation_input_tokens":30}}), 100, 60),
+        (json!({"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":2,"cachedContentTokenCount":60}}), 100, 60),
+        (json!({"usage":{"prompt_tokens":100,"completion_tokens":2,"prompt_cache_hit_tokens":60}}), 100, 60),
+        (json!({"usage":{"input_tokens":100,"output_tokens":2}}), 100, 0),
+        (json!({"usage":{"input_tokens":100,"output_tokens":2,"input_tokens_details":{"cached_tokens":-1}}}), 100, 0),
+    ] {
+        let usage = extract_token_usage(&value);
+        assert_eq!(usage.total_input(), total);
+        assert_eq!(usage.cached_input, cached);
+        assert_eq!(usage.output, 2);
+    }
+    assert_eq!(extract_token_usage(&json!({})).cached_input, 0);
+}
+
+#[tokio::test]
+async fn cached_usage_survives_non_streaming_protocol_bridges() {
+    for (provider_type, payload) in [
+        ("openai", json!({"model":"gpt-test","choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":60}}})),
+        ("anthropic", json!({"model":"gpt-test","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":60,"cache_creation_input_tokens":30}})),
+        ("google_ai_studio", json!({"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":2,"cachedContentTokenCount":60}})),
+    ] {
+        let app = Router::new().fallback(move || {
+            let payload = payload.clone();
+            async move { Json(payload) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut provider = provider(provider_type, "auto", json!({}));
+        provider.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = forward_responses_as_chat(&test_state(), &provider, &HeaderMap::new(),
+            json!({"model":"gpt-test","input":"hello"}), false, Instant::now(), &RequestContext::detached())
+            .await.unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(result.usage.total_input(), 100, "{provider_type}");
+        assert_eq!(result.usage.cached_input, 60, "{provider_type}");
+        assert_eq!(result.usage.output, 2, "{provider_type}");
+        server.abort();
+    }
+}
+
+#[test]
+fn cached_usage_survives_partial_sse_updates_without_double_counting() {
+    let mut usage = TokenUsage::default();
+    let start = json!({"message":{"usage":{"input_tokens":0,"cache_read_input_tokens":60,"cache_creation_input_tokens":40}}});
+    accumulate_usage_from_sse_data(&start.to_string(), &mut usage);
+    accumulate_usage_from_sse_data(&start.to_string(), &mut usage);
+    accumulate_usage_from_sse_data(&json!({"usage":{"output_tokens":2}}).to_string(), &mut usage);
+    assert_eq!(usage.total_input(), 100);
+    assert_eq!(usage.cached_input, 60);
+    assert_eq!(usage.output, 2);
+    accumulate_usage_from_sse_data(&json!({"usage":{"cache_read_input_tokens":0}}).to_string(), &mut usage);
+    assert_eq!(usage.total_input(), 40);
+    assert_eq!(usage.cached_input, 0);
+}
+
+#[test]
 fn sqlite_usage_log_persists_first_token_ms() {
     let path = std::env::temp_dir().join(format!(
         "routehub-usage-log-{}.sqlite3",
@@ -1989,6 +2053,7 @@ fn sqlite_stream_log_updates_running_row_in_place() {
         "",
         321,
         45,
+        0,
         "upstream_or_unknown",
     )
     .unwrap();
